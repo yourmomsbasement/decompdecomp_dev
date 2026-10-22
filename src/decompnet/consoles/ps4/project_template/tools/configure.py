@@ -17,6 +17,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:  # Windows has no flock
+    fcntl = None
+
 import ninja_syntax
 
 # Settings (decompdecomp wrote these for this game; change them if the game was built differently)
@@ -66,6 +71,12 @@ def source_of(unit: str) -> str:
 
 
 def main() -> None:
+    # one generation at a time: every agent's build can trigger this rule, and two runs writing at once either
+    # interleave (a corrupt file ninja cannot rebuild, because it cannot parse it to find the rule) or finish out
+    # of order (a stale build.ninja replacing a fresh one)
+    lock = open("build.ninja.lock", "w")
+    if fcntl is not None:
+        fcntl.flock(lock, fcntl.LOCK_EX)
     units = json.loads(CONFIG.read_text(encoding="utf-8"))["units"]
     headers = [str(p) for p in files("include", (".h", ".hpp"))]
     ninja_text = io.StringIO()  # the writer goes to memory, then one atomic rename
