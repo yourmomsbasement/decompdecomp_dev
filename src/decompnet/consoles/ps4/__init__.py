@@ -1,0 +1,87 @@
+"""PlayStation 4 (Orbis) games: x86-64 ELF programs, PROJECT mode, judged by objdiff.
+
+- `elf64.py`: the game's program (an eboot, ET_SCE_EXEC) as program headers, addresses and bytes. The file has no
+  section headers, so everything is read through PT_LOAD segments.
+- `scratch.py`: a project for the user's eboot: the functions it holds (from a `functions.jsonl` map beside the game,
+  else Ghidra), each function's bytes cut into ELF64 relocatable objects at build time (tools/delink.py), and src/
+  compiled with the pinned clang.
+- `project_template/`: what that project starts as (tools/configure.py writes its ninja build and objdiff.json).
+- `guides/ps4.md`: what agents read first — the compiler pin, the flags, and the three deltas that are known.
+
+The compiler is pinned by measurement, not by the SDK's name: clang 5.0.2 with
+`-O2 -mavx -fno-omit-frame-pointer -fPIE -mllvm -x86-use-vzeroupper=0` reproduced 14 of 20 hand-transcribed
+functions of inFAMOUS Second Son byte for byte, and 18 of 20 as the same instruction set (see guides/ps4.md).
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from ...rom import RomError
+from .. import BETA, PROJECT, Compiler, Console
+
+# the EBoot's e_type: Sony's own ELF types, outside the standard ones
+ET_SCE_EXEC, ET_SCE_DYNEXEC = 0xFE10, 0xFE04
+EM_X86_64 = 62
+
+
+class PS4(Console):
+    id = "ps4"
+    name = "PlayStation 4"
+    short = "PS4"
+    aliases = ("orbis",)
+    status = BETA
+    arch = "x86_64"
+    big_endian = False
+    mode = PROJECT
+    layout = "Ghidra + objdiff"
+    compilers = (Compiler("clang-5.0.2", "Clang 5.0.2 (Orbis era)",
+                          "inFAMOUS Second Son, by fingerprint"),)
+    packs = ()
+    guides = ("ps4",)
+    compiler_guide = "ps4"
+    m2c = ""  # m2c reads MIPS only
+    ram = (0x0, 0x40000000)  # the image is linked at 0 and loaded wherever; words this low read as addresses
+    demo = ""
+    demo_tools = ()
+
+    def sniff(self, head: bytes, file) -> bool:
+        """An x86-64 ELF, of one of Sony's executable types (an eboot.elf, not a library)."""
+        return (len(head) >= 64 and head[:4] == b"\x7fELF" and head[4] == 2 and head[5] == 1
+                and int.from_bytes(head[16:18], "little") in (ET_SCE_EXEC, ET_SCE_DYNEXEC)
+                and int.from_bytes(head[18:20], "little") == EM_X86_64)
+
+    def upload_name(self, data: bytes) -> str:
+        return "eboot.elf"
+
+    def create_project(self, root: Path, game: Path, *, compiler: str | None = None, log=print) -> dict:
+        from . import scratch
+
+        return scratch.create(root, game, compiler=compiler, log=log)
+
+    def game_info(self, game: Path) -> dict:
+        from . import scratch
+
+        return scratch.game_info(game)
+
+    def tool_args(self) -> list[str]:
+        from . import scratch
+
+        clang = scratch.clang_path()
+        if clang is None:
+            raise RomError("no clang 5.0.2 for PS4 matching: point DECOMP_PS4_CLANG at one, or install the pinned "
+                           "build, then try again")
+        return ["--clang", str(clang)]
+
+    def read_data(self, fp, name: str, length: int) -> str | None:
+        from . import scratch
+
+        return scratch.read_data(fp.root, fp.manifest or {}, name, length)
+
+    def data_bytes(self, fp, addr: int, length: int) -> bytes | None:
+        from . import scratch
+
+        return scratch.data_bytes(fp.root, fp.manifest or {}, addr, length)
+
+
+PS4_CONSOLE = PS4()
