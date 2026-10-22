@@ -155,8 +155,8 @@ def read_elf(data: bytes) -> ELF:
 
 def clang_path() -> Path | None:
     """The pinned clang 5.0.2 this project builds with: DECOMP_PS4_CLANG, or one of the places it is installed."""
-    for candidate in (os.environ.get("DECOMP_PS4_CLANG"), "/opt/clang-5.0.2/bin/clang",
-                      shutil.which("clang-5.0"), shutil.which("clang-5.0.2")):
+    for candidate in (os.environ.get("DECOMP_PS4_CLANG"), "/opt/llvm-5.0.2-globalguard/bin/clang",
+                      "/opt/clang-5.0.2/bin/clang", shutil.which("clang-5.0"), shutil.which("clang-5.0.2")):
         if candidate and Path(candidate).is_file():
             return Path(candidate)
     for pattern in ("*/.hermes/cache/scratch/clangs/clang+llvm-5.0.2*/bin/clang",

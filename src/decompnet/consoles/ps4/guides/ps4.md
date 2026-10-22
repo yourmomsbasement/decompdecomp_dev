@@ -17,6 +17,24 @@ there because a whole population of the game's functions says so:
 - **`-fPIE`**: the game addresses globals with `lea rax,[rip+disp]`, as a position-independent executable does. Without
   it clang writes `mov eax,imm32` and every function that touches a global misses.
 
+## The stack protector, and the compiler this project needs
+
+24.2% of the functions (6,674) call `__stack_chk_fail`, and they are **35.5% of the game's code**. Their prologues load
+the guard through the GOT — `mov r12,[rip+disp]; mov rax,[r12]; mov [rbp-0x30],rax` — and every exit reloads it,
+`cmp`s, and jumps to `__stack_chk_fail` on mismatch. So the game was built with `-fstack-protector-strong` and the
+**global** guard model.
+
+Stock clang 5.0.2 cannot express that on a Linux triple: it puts the guard in the TLS slot (`mov %fs:0x28,%rax`), and
+`-mstack-protector-guard=global` only exists from clang ~11 on. The build therefore uses a patched 5.0.2 —
+`/opt/llvm-5.0.2-globalguard/bin/clang` — which is stock 5.0.2 with `hasStackGuardSlotTLS()` returning false for Linux,
+so the guard becomes the global `__stack_chk_guard` (GOT-loaded under -fPIE) while everything else about the codegen is
+unchanged. Verified: the 21-byte zero-idiom function still compiles byte-identically, and a stack-buffer function gets
+the game's guard shape with no `%fs:` access.
+
+Practical consequence for you: a function with a local buffer or a large frame **must** produce that canary, and if your
+C has no such buffer the target's canary has nothing to pair with — check the target's prologue first, and give the
+function the buffer the target shows (an array local, a memcpy destination) so the compiler inserts the canary.
+
 ## The three deltas left
 
 These are the SDK's LLVM fork, not the flags; expect them on functions that hit them, and expect the permuter to close

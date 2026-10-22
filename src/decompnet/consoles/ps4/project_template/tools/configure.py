@@ -9,6 +9,7 @@ decompdecomp) compares every source file's functions with the original's. Made b
 """
 
 import argparse
+import io
 import json
 import os
 import shlex
@@ -20,7 +21,7 @@ import ninja_syntax
 
 # Settings (decompdecomp wrote these for this game; change them if the game was built differently)
 CL_FLAGS = ["-O2", "-mavx", "-fno-omit-frame-pointer", "-fPIE", "-mllvm", "-x86-use-vzeroupper=0",
-            "-fno-stack-protector", "-fno-asynchronous-unwind-tables", "-w"]
+            "-fstack-protector-strong", "-fno-asynchronous-unwind-tables", "-ffunction-sections", "-w"]
 
 ROOT = Path(__file__).resolve().parent.parent
 os.chdir(ROOT)
@@ -46,6 +47,14 @@ PYTHON = str(_W.with_name("python.exe")) if _W.name.lower() == "pythonw.exe" and
 PY = q([PYTHON]).replace("$", "$$")
 
 
+def write_atomic(path: Path, text: str) -> None:
+    """Write beside the target and rename: parallel builds each run configure, and a file written in place gets
+    interleaved into a corrupt one (ninja then refuses the whole project)."""
+    tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def files(top: str, suffixes: tuple[str, ...]) -> list[Path]:
     return sorted(p for p in Path(top).rglob("*") if p.suffix.lower() in suffixes)
 
@@ -59,8 +68,9 @@ def source_of(unit: str) -> str:
 def main() -> None:
     units = json.loads(CONFIG.read_text(encoding="utf-8"))["units"]
     headers = [str(p) for p in files("include", (".h", ".hpp"))]
-    with open("build.ninja", "w", encoding="utf-8") as f:
-        n = ninja_syntax.Writer(f)
+    ninja_text = io.StringIO()  # the writer goes to memory, then one atomic rename
+    if True:
+        n = ninja_syntax.Writer(ninja_text)
         n.rule("delink", f"{PY} tools/delink.py {CONFIG} {BUILD / 'target'}", restat=True)
         compiler = [PYTHON, "tools/compile.py", "--compiler", str(CLANG), "--include", "include",
                     "--config", str(CONFIG)]
@@ -80,6 +90,7 @@ def main() -> None:
         n.build("build.ninja", "configure", ["tools/configure.py", str(CONFIG), *headers,
                                              *[str(s) for s in files("src", (".c", ".cpp"))]])
         n.default(["prepare"])
+    write_atomic(Path("build.ninja"), ninja_text.getvalue())
 
     objdiff = {
         "$schema": "https://raw.githubusercontent.com/encounter/objdiff/main/config.schema.json",
@@ -89,7 +100,7 @@ def main() -> None:
                    "base_path": str(BUILD / "src" / "auto" / f"{u}.o"),
                    "metadata": {"source_path": source_of(u), "complete": False}} for u in units],
     }
-    Path("objdiff.json").write_text(json.dumps(objdiff, indent=2), encoding="utf-8")
+    write_atomic(Path("objdiff.json"), json.dumps(objdiff, indent=2))
 
 
 if __name__ == "__main__":

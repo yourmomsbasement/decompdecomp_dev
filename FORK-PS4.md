@@ -20,8 +20,15 @@ The compiler is pinned by measurement: **clang 5.0.2** with
 byte and 18 as the same instruction set; the flag evidence (99.7% rbp prologues, 21,093/27,602 VEX functions, exactly
 one `vzeroupper`) is in `guides/ps4.md`.
 
-Where clang lives: `DECOMP_PS4_CLANG`, else `/opt/clang-5.0.2/bin/clang`, `clang-5.0` on PATH, or a
-`~/.hermes/cache/scratch/clangs/clang+llvm-5.0.2*/bin/clang` checkout.
+Where clang lives: `DECOMP_PS4_CLANG`, else `/opt/llvm-5.0.2-globalguard/bin/clang`, `/opt/clang-5.0.2/bin/clang`,
+`clang-5.0` on PATH, or a `~/.hermes/cache/scratch/clangs/clang+llvm-5.0.2*/bin/clang` checkout.
+
+**The project needs the patched build, not stock 5.0.2.** 24.2% of the functions (35.5% of the code) carry a stack
+canary, and the game's canary is the *global-guard* form (GOT load of `__stack_chk_guard`, deref, spill, reload+cmp at
+each exit). Stock 5.0.2 emits the TLS form (`%fs:0x28`) and has no flag to change it; `/opt/llvm-5.0.2-globalguard` is
+5.0.2 with `hasStackGuardSlotTLS()` forced false on Linux, so it emits the game's shape while keeping every other
+fingerprint (verified: the 21-byte zero-idiom function still matches byte for byte). Build recipe and patch: see
+`LLVM-GLOBALGUARD-BUILD.md`.
 
 ## How an import goes
 
@@ -38,6 +45,9 @@ Where clang lives: `DECOMP_PS4_CLANG`, else `/opt/clang-5.0.2/bin/clang`, `clang
 
 ## Known gaps
 
+- **`tools/configure.py` writes `build.ninja`/`objdiff.json` atomically.** Agents build in parallel, and a
+  `build.ninja` written in place while another configure ran came out interleaved and unusable — ninja refused the
+  whole project twice before the writes were made temp-file-plus-rename.
 - **32-bit absolute immediates are not relocated** (64-bit `movabs` ones are). objdiff's x86 reader refuses a
   relocation that falls on an instruction's first byte (`Unsupported inline x86 relocation`), and its decoder
   disagrees with capstone about boundaries often enough that one unit in a few hundred trips it, failing the whole
