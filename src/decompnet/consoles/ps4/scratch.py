@@ -266,12 +266,16 @@ def analyse(elf: ELF, found: list[dict]) -> list[Function]:
                     if elf.contains(target):
                         name, addend = symbol(target)
                         fn.relocs.append((at + ins.disp_offset, R_X86_64_PC32, name, addend))
-                # Absolute-address immediates (mov eax, 0x401000 / movabs rax, 0x...) are NOT relocated: objdiff's
-                # x86 reader refuses a relocation that falls on an instruction's first byte, and its own decoder
-                # disagrees with capstone about boundaries often enough that one unit in a few hundred trips it —
-                # which fails the whole report. Without the relocation those instructions compare literally and a
-                # function that loads an absolute address shows one mismatch instead of zeroing the byte.
-                #
+                elif op.type == x86.X86_OP_IMM:
+                    # a 64-bit immediate (movabs) that names a function or lands in the data segment is an address:
+                    # relocate it (its field is 2 bytes into the instruction, never at a boundary, which is what
+                    # objdiff refuses). 32-bit immediates stay literal: their field can coincide with a boundary the
+                    # way objdiff decodes a unit, and one such relocation fails the whole report.
+                    seg = elf.segment_at(op.imm)
+                    if ins.imm_size == 8 and op.imm >= 0x1000 and \
+                            (op.imm in names or (seg is not None and not seg.flags & PF_X)):
+                        name, addend = symbol(op.imm)
+                        fn.relocs.append((at + ins.imm_offset, R_X86_64_64, name, addend))
         # a relocation at an instruction's first byte reads as inline data to objdiff's x86 reader (it refuses
         # those), and those offsets are the reader's, not a field: leave the bytes as they are
         fn.relocs = [r for r in fn.relocs if r[0] not in insn_starts]

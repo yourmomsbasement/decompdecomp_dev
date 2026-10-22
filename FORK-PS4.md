@@ -38,10 +38,11 @@ Where clang lives: `DECOMP_PS4_CLANG`, else `/opt/clang-5.0.2/bin/clang`, `clang
 
 ## Known gaps
 
-- **Absolute-address immediates are not relocated.** objdiff's x86 reader refuses a relocation that falls on an
-  instruction's first byte (`Unsupported inline x86 relocation`), and its decoder disagrees with capstone about
-  boundaries often enough that one unit in a few hundred trips it, failing the whole report. A function that loads an
-  absolute address therefore shows one argument mismatch where a relocation would have masked it.
+- **32-bit absolute immediates are not relocated** (64-bit `movabs` ones are). objdiff's x86 reader refuses a
+  relocation that falls on an instruction's first byte (`Unsupported inline x86 relocation`), and its decoder
+  disagrees with capstone about boundaries often enough that one unit in a few hundred trips it, failing the whole
+  report. Effect measured on the eboot: **159 of 27,602 functions (0.6%)** contain such an immediate outside a call,
+  so the ceiling this imposes is small.
 - **No demo game.** `tests/test_consoles.py -k ps4` passes (the console is well-formed), but the console can't be
   recommended until a real game rebuilds byte for byte.
 - **No symbol renaming, no rebuild check, no per-file compiler choice** — the `rename_symbol`, `check_rebuild`,
