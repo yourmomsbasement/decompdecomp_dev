@@ -26,7 +26,8 @@ import ninja_syntax
 
 # Settings (decompdecomp wrote these for this game; change them if the game was built differently)
 CL_FLAGS = ["-O2", "-mavx", "-fno-omit-frame-pointer", "-fPIE", "-mllvm", "-x86-use-vzeroupper=0",
-            "-fstack-protector-strong", "-fno-asynchronous-unwind-tables", "-ffunction-sections", "-w"]
+            "-fstack-protector-strong", "-fno-asynchronous-unwind-tables", "-ffunction-sections",
+            "-mllvm", "-no-x86-call-frame-opt", "-w"]
 
 ROOT = Path(__file__).resolve().parent.parent
 os.chdir(ROOT)
@@ -39,6 +40,10 @@ VERSION = args.version
 CONFIG = Path("config") / VERSION / "functions.json"
 BUILD = Path("build") / VERSION
 CLANG = Path(args.clang)
+GLOBALGUARD = Path("/opt/llvm-5.0.2-globalguard/bin/clang")
+if CLANG != GLOBALGUARD and "clang+llvm-5.0.2" in str(CLANG) and GLOBALGUARD.is_file():
+    print(f"{CLANG} is stock 5.0.2, whose stack guard is the TLS slot; using {GLOBALGUARD} instead")
+    CLANG = GLOBALGUARD
 
 
 def q(argv: list[str]) -> str:
