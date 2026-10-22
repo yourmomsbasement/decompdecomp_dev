@@ -35,6 +35,15 @@ Practical consequence for you: a function with a local buffer or a large frame *
 C has no such buffer the target's canary has nothing to pair with — check the target's prologue first, and give the
 function the buffer the target shows (an array local, a memcpy destination) so the compiler inserts the canary.
 
+## Keep the build able to run
+
+- **Scratch files go outside `src/`.** `build.ninja` lists every file under `src/` as an input of the rule that
+  regenerates it, so a scratch `.c` that is created and then deleted leaves ninja unable to rebuild anything
+  ("needed by 'build.ninja', missing and no known rule to make it") until `tools/configure.py` runs again.
+- **A source that does not compile stops every unit.** One bad cast in one file makes ninja stop at that unit and the
+  project measure as if the rest did not exist. Build the unit you changed (`ninja build/<version>/src/auto/<unit>.o`)
+  before moving on.
+
 ## The three deltas left
 
 These are the SDK's LLVM fork, not the flags; expect them on functions that hit them, and expect the permuter to close
