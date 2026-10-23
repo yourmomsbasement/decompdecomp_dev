@@ -35,6 +35,17 @@ Practical consequence for you: a function with a local buffer or a large frame *
 C has no such buffer the target's canary has nothing to pair with — check the target's prologue first, and give the
 function the buffer the target shows (an array local, a memcpy destination) so the compiler inserts the canary.
 
+## Spend turns where they pay
+
+- **A function already at 94% or more is the permuter's, not yours.** Its C is right and its last few instructions are
+  scheduling or register choice; four to ten more attempts from you usually buy nothing. Take a function that is far
+  from matching and leave the near miss alone — the background permuter grinds those on spare cores, without tokens.
+- **Write the smallest edit that could be right.** `edit_file` on the one expression that differs costs a fraction of
+  the tokens of resubmitting the whole function, and the judge only cares about the result.
+- **Read the target's first ten instructions before writing anything.** They say whether the function has a stack
+  canary, whether it realigns the stack, which argument registers it keeps, and whether it is a thunk — most wrong
+  first attempts are wrong about one of those, and the brief already carries the disassembly.
+
 ## Keep the build able to run
 
 - **Scratch files go outside `src/`.** `build.ninja` lists every file under `src/` as an input of the rule that
