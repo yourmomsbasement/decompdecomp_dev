@@ -3278,9 +3278,15 @@ class ForkEngine:
                                       "ON a.id=t.agent_id WHERE t.function_id=? ORDER BY t.id", fn["id"])
         notes = self.net.store.all("SELECT n.text, n.created_at, a.name AS agent FROM notes n LEFT JOIN agents a "
                                    "ON a.id=n.agent_id WHERE n.function_id=? ORDER BY n.id DESC LIMIT 10", fn["id"])
+        draft = None
+        if fn["status"] != "matched" and not attempts and not fn["best_source"]:
+            draft = self._draft(proj, fp, cfg, fn, unit)  # made on first look, cached in functions.seed
+        worked = bool(attempts) or bool(fn["best_source"]) or fn["status"] == "matched"
         return {"name": fn["name"], "vram": fn["vram"] or 0, "rom_offset": 0, "size": fn["size"], "insns": fn["n_insns"],
                 "status": fn["status"], "best": fn["best_score"], "asm": asm, "unit": fn["unit"], **set_aside(fn),
-                "source": current or fn["best_source"], "source_kind": "matched" if fn["status"] == "matched" else
-                ("latest" if current else "best" if fn["best_source"] else None),
+                "draft": draft,
+                "source": current if worked else (draft or current),
+                "source_kind": "matched" if fn["status"] == "matched" else
+                ("latest" if current and worked else "best" if fn["best_source"] else "draft" if draft else None),
                 "match_percent": pct, "scores": [{"score": a["score"], "t": a["created_at"], "agent": a["agent"]} for a in attempts],
                 "notes": [dict(n) for n in notes], "calls": [], "called_by": []}
