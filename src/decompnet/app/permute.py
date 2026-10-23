@@ -323,7 +323,11 @@ class Permuter:
     def _score(self, agent, proj, fn, source: str, best: int, fork: str | None) -> int | None:
         """A variant's score; recorded (as the function's best attempt, or its match) only when it beats `best`."""
         if fork:
-            res = self.net.forks.attempt(agent, fork, fn["name"], source, keep=False, quiet=best)
+            try:
+                res = self.net.forks.attempt(agent, fork, fn["name"], source, keep=False, quiet=best)
+            except NetworkError:  # a variant the project won't take (a helper beside the function): try the next one
+                log.debug("permuter: %s: variant refused", fn["name"])
+                return None
             return res.get("score")
         ctx = self.net._context(proj["id"], fn["unit"])
         result = self.net._compile(proj, ctx["header"], source, fn)
