@@ -2200,7 +2200,8 @@ class ForkEngine:
                                 unit.source, compiler_hint=hint)
             text = text and "/* m2c */\n" + text
             if not text and unit.target is not None and unit.target.exists() and ghidra.available():
-                found = ghidra.decompile_object(unit.target, fp.root / STATE / "ghidra")
+                # not STATE (".decomp"): analyzeHeadless refuses a project path with an element starting with "."
+                found = ghidra.decompile_object(unit.target, fp.root / "build" / "ghidra")
                 names = [meta.get("symbol") or fn["name"], *self._names(meta, fn)]
                 body = next((found[n] for n in names if n in found), None)
                 text = body and "/* Ghidra */\n" + body.strip()
