@@ -60,6 +60,35 @@ function the buffer the target shows (an array local, a memcpy destination) so t
   canary, whether it realigns the stack, which argument registers it keeps, and whether it is a thunk — most wrong
   first attempts are wrong about one of those, and the brief already carries the disassembly.
 
+## Where the matches actually come from (measured on this project)
+
+815 functions matched so far, and they are overwhelmingly small:
+
+| instructions | functions | matched | attempted | matched / attempted |
+|---|---|---|---|---|
+| 1-10 | 5,081 | 529 | 839 | **63.1%** |
+| 11-25 | 5,809 | 210 | 1,199 | 17.5% |
+| 26-60 | 7,777 | 75 | 1,089 | 6.9% |
+| 61-150 | 5,859 | 0 | 3 | 0% |
+| 151+ | 3,076 | 0 | 2 | 0% |
+
+- **Nothing over 60 instructions has ever matched**, and no matched function is bigger than 60; the median matched
+  function is 7 instructions and 280 of them are 5 or fewer. Yield falls by an order of magnitude per band. A big
+  function is not "more work", it is a different problem - take small ones.
+- **There are still 4,121 functions of 10 instructions or fewer that nobody has touched**, and 4,610 of 11-25. At
+  the rates above that is where the next two thousand matches are; the code mass is elsewhere (61+ instructions are
+  80% of the unmatched bytes and have never converted).
+- **Matches cluster by unit**: all 815 sit in 447 units; the other 2,120 units have 1,197 attempts and zero matches.
+  Even at 1-10 instructions, 679 attempts in units that already had a match converted, while 161 attempts in units
+  without one converted none. (Partly size - median attempted in a cold unit is 24 instructions vs 16 - but not
+  enough to explain 0 of 161.) Work a unit that already has a match before opening a new one; if a unit has no match
+  after a few tries, its file or its data names are probably wrong, and that is worth a note rather than more
+  attempts.
+- **A plain `extern` byte global gives a GOT load** (`mov rax,[rip+GOT]; mov (%rax),%al`); the same declaration with
+  `__attribute__((visibility("hidden")))` gives one direct `mov al,[rip+D]`. The game also writes `lea` + deref in
+  some places - the address stayed live in its C - and neither declaration reproduces that, so don't chase it with
+  visibility; it needs the address to escape (a call taking it, a stored pointer), which changes the function's size.
+
 ## Spellings that turned near misses into matches
 
 Each of these was measured on a real function here: the first spelling is what the game's build did, the second is
