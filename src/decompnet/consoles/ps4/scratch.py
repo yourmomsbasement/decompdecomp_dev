@@ -196,8 +196,23 @@ class Function:
     relocs: list[tuple[int, int, str | None, int]] = field(default_factory=list)  # (offset, type, symbol, addend)
 
 
-def map_functions(game: Path, text: Segment) -> list[dict] | None:
-    """The game's functions from a functions.jsonl beside it (offsets in the executable segment), else None."""
+_NOP_BYTES = frozenset({0x90, 0xCC})  # one-byte nop and int3: what alignment padding is made of
+_NOP_PARTS = frozenset({0x90, 0xCC, 0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00})  # the 1..11-byte nop encodings clang emits
+
+
+def is_padding(blob: bytes) -> bool:
+    """A run that is nothing but alignment nops. Function maps list some of these as functions because a scan saw
+    a call or a boundary there; no C can be them, since even an empty function is a `ret`."""
+    if not blob or len(blob) > 64:
+        return False
+    if all(b in _NOP_BYTES for b in blob):
+        return True
+    return b"\x0f\x1f" in blob and all(b in _NOP_PARTS for b in blob)
+
+
+def map_functions(game: Path, text: Segment, data: bytes | None = None) -> list[dict] | None:
+    """The game's functions from a functions.jsonl beside it (offsets in the executable segment), else None.
+    With `data`, entries that are only alignment padding are dropped: they are not functions and no C is them."""
     candidates = [game.parent / "functions.jsonl", game.parent / "functions" / "functions.jsonl",
                   game.with_suffix(".functions.jsonl"), *sorted(game.parent.glob("*/functions.jsonl")),
                   *sorted(game.parent.glob("*/*/functions.jsonl"))]
@@ -205,6 +220,7 @@ def map_functions(game: Path, text: Segment) -> list[dict] | None:
         if not candidate.is_file():
             continue
         out = []
+        padding = 0
         for line in candidate.read_text(encoding="utf-8", errors="replace").splitlines():
             line = line.strip()
             if not line:
@@ -217,8 +233,13 @@ def map_functions(game: Path, text: Segment) -> list[dict] | None:
                 continue
             if size <= 0:
                 continue
+            if data is not None and is_padding(data[text.offset + start: text.offset + start + size]):
+                padding += 1
+                continue
             out.append({"entry": text.va + start, "end": text.va + start + size,
                         "name": row.get("n") or "", "source": "map", "imports": row.get("i") or []})
+        if padding:
+            log(f"the map lists {padding} entries that are only alignment padding: dropped, they are not functions")
         if out:
             return out
     return None
@@ -420,7 +441,7 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print) ->
     text = elf.text
     log(f"reading {game.name}: {len(elf.segments)} segments, code at 0x{text.va:X} ({text.filesz} bytes)")
 
-    found = map_functions(game, text)
+    found = map_functions(game, text, data)
     if found:
         log(f"using the function map beside the game: {len(found)} functions")
     else:
