@@ -13,7 +13,7 @@ from starlette.responses import JSONResponse, Response
 from decompnet.hostenv import NO_WINDOW
 
 from ... import agents as kinds
-from ... import toolchains
+from ... import ranking, toolchains
 from ...network import NetworkError
 from .. import agents
 from ..support import session_options, spread_sessions
@@ -127,6 +127,17 @@ def register(app: App) -> None:
             return fail(e)
         return JSONResponse({"ok": True})
 
+    @mcp.custom_route("/api/ranking", methods=["GET"])
+    async def api_ranking(request: Request) -> Response:
+        """Who is doing well in a project, and the tier each agent and model gets under the current order."""
+        if (bad := guard(request)):
+            return bad
+        slug = request.query_params.get("slug", "")
+        try:
+            return JSONResponse(net.ranking_rows(slug))
+        except NetworkError as e:
+            return fail(e)
+
     @mcp.custom_route("/api/settings", methods=["POST"])
     async def api_settings(request: Request) -> Response:
         if (bad := guard(request, write=True)):
@@ -154,6 +165,20 @@ def register(app: App) -> None:
             settings.data["check_updates"] = bool(data["check_updates"])
         if "auto_compiler" in data:
             settings.data["auto_compiler"] = net.auto_compiler = bool(data["auto_compiler"])
+        if "routing_mode" in data or "model_order" in data:  # who makes first passes, who finishes (ranking.py)
+            if "routing_mode" in data:
+                settings.data["routing_mode"] = ranking.mode(data["routing_mode"])
+            if "model_order" in data:
+                settings.data["model_order"] = ranking.order(data["model_order"])
+            net.routing = (ranking.mode(settings.data.get("routing_mode")),
+                           ranking.order(settings.data.get("model_order")))
+        if isinstance(data.get("agent_tier"), dict):  # pin specific workers over their model's place in the order
+            with net.store.tx() as db:
+                for name, tier in data["agent_tier"].items():
+                    wanted = str(tier or "").strip().lower()
+                    if wanted in ranking.TIERS or wanted == "auto":
+                        db.execute("UPDATE agents SET tier=? WHERE name=?",
+                                   (None if wanted == "auto" else wanted, str(name)))
         if "notes_cleared_to" in data:  # the notification centre's Clear all: events up to this id stay hidden
             settings.data["notes_cleared_to"] = max(0, int(data["notes_cleared_to"] or 0))
         if "bridges_removed_seen" in data:  # the notice of what the cleanup removed (cleanup.report), seen

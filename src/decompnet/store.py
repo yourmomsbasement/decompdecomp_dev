@@ -58,6 +58,7 @@ MIGRATIONS = [
     ("agents", "trusted", "INTEGER NOT NULL DEFAULT 0"),      # operator-vetted (CLI) vs. self-registered
     ("agents", "origin", "TEXT"),                              # cli | web
     ("agents", "terms_accepted_at", "REAL"),                   # evidence of accepting the terms
+    ("agents", "tier", "TEXT"),                                # first | finish | off: pins a worker, over the model order
     ("functions", "fingerprint", "TEXT"),                      # one-way match fingerprint (twins, regression checks)
     ("attempts", "via", "TEXT"),                               # agent | permuter
     ("functions", "unit", "TEXT NOT NULL DEFAULT ''"),         # source file (translation unit) it came from

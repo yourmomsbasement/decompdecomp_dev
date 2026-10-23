@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import agents, scoring
+from . import agents, ranking, scoring
 from .compiler import compile_source
 from .elfobj import FunctionObj, Reloc, extract_function
 from .project import compiler_config, compiler_for
@@ -376,6 +376,9 @@ class Network:
         self._last_diffs: dict[tuple[int, int], tuple[list, str]] = {}
         self._generation: dict[int, int] = {}  # project id -> changes compiles depend on (bump_generation)
         self._compiled: OrderedDict[str, dict] = OrderedDict()  # compile_key -> result, for repeat_of
+        # (mode, manual order of models): which agent gets first passes and which finishes (ranking.py); the app
+        # sets it from its settings, and auto is what it has always done
+        self.routing: tuple[str, list[str]] = (ranking.MODE_AUTO, [])
 
     # ------------------------------------------------------------------ agents
 
@@ -668,6 +671,8 @@ class Network:
                 self._event(db, fn["project_id"], agent.id, "claim", fn["name"])
             else:
                 route = self._route(db, proj["id"], agent, now)
+                pinned = db.execute("SELECT tier FROM agents WHERE id=?", (agent.id,)).fetchone()
+                tier = ranking.tier_of(pinned["tier"] if pinned else None, model_of(agent.name), *self.routing)
                 family = model_family(agent.name)
                 kin = [r["id"] for r in db.execute("SELECT id, name FROM agents") if model_family(r["name"]) == family]
                 tried = db.execute("SELECT SUM(status = 'matched') AS won, SUM(status = 'matched' OR attempts > 0) "
@@ -692,10 +697,15 @@ class Network:
                                  f.name IN (SELECT detail FROM events WHERE project_id=:pid AND kind='release'
                                             AND created_at > :cooled),
                                  f.id IN ({READY}) DESC, f.id IN ({WANTED}) DESC,
-                                 :strong AND f.abandons >= :escalate DESC, {STRATEGIES[strategy]} LIMIT 1""")
+                                 :strong AND f.abandons >= :escalate DESC,
+                                 :first_tier AND f.attempts > 0 DESC,
+                                 :finish_tier AND (f.best_score IS NULL) DESC,
+                                 {STRATEGIES[strategy]} LIMIT 1""")
                 args = {"pid": proj["id"], "agent": agent.id, "kin": json.dumps(kin), "cooled": now - RELEASE_COOLDOWN,
                         "overall": overall, "escalate": ESCALATE_AFTER, "weak": route == "weak", "strong": route == "strong",
-                        "mine": self._own_release_cutoff(db, agent.id, now)}
+                        "mine": self._own_release_cutoff(db, agent.id, now),
+                        "first_tier": 1 if tier == ranking.FIRST else 0,
+                        "finish_tier": 1 if tier == ranking.FINISH else 0}
                 fn = db.execute(query, args).fetchone()
                 if fn is None and route == "weak":  # only what stronger models are for is left: better tried than idle
                     fn = db.execute(query, args | {"weak": False}).fetchone()
@@ -709,6 +719,8 @@ class Network:
         return fn
 
     def _route(self, db, project_id: int, agent: Agent, now: float) -> str | None:
+        if ranking.mode(self.routing[0]) != ranking.MODE_AUTO:
+            return None  # the manual order (or nothing at all) decides the tiers; statistics stay out of it
         """"weak" for a model at work in the project well behind the strongest one at work, "strong" for that one
         while a weak one works too (see ESCALATE_AFTER), None otherwise: no routing until both are told apart by
         ROUTE_MIN_CLAIMS claims each."""
@@ -735,6 +747,43 @@ class Network:
             return "weak"
         weak = any(s < WEAK_SHARE * best for s in share.values())
         return "strong" if share[mine] == best and weak else None
+
+    def ranking_rows(self, project: str) -> dict:
+        """Who is doing well here: claims, attempts and wins per agent and per model, with the tier each would get.
+        The window shows it, and it is what a manual order is written from."""
+        proj = self._project(project)
+        names = {r["id"]: r["name"] for r in self.store.all("SELECT id, name FROM agents")}
+        tiers = {r["id"]: r["tier"] for r in self.store.all("SELECT id, tier FROM agents")}
+        claims, tried, won = collections.Counter(), collections.Counter(), collections.Counter()
+        for r in self.store.all("SELECT agent_id, COUNT(*) AS n FROM events WHERE project_id=? AND kind='claim' "
+                                "GROUP BY agent_id", proj["id"]):
+            claims[r["agent_id"]] = r["n"]
+        for r in self.store.all("SELECT agent_id, COUNT(*) AS n FROM attempts WHERE function_id IN "
+                                "(SELECT id FROM functions WHERE project_id=?) GROUP BY agent_id", proj["id"]):
+            tried[r["agent_id"]] = r["n"]
+        for r in self.store.all("SELECT matched_agent_id AS id, COUNT(*) AS n FROM functions WHERE project_id=? "
+                                "AND status='matched' GROUP BY matched_agent_id", proj["id"]):
+            won[r["id"]] = r["n"]
+        agents = []
+        for aid in set(claims) | set(won) | set(tried):
+            name = names.get(aid) or "?"
+            if name in MACHINE_AGENTS:
+                continue
+            agents.append({"agent": name, "tier": tiers.get(aid), "claims": claims[aid], "attempts": tried[aid],
+                           "matches": won[aid], "conversion": round(won[aid] / claims[aid], 3) if claims[aid] else None})
+        models: dict[str, dict] = {}
+        for row in agents:
+            m = models.setdefault(model_of(row["agent"]), {"model": model_of(row["agent"]), "claims": 0,
+                                                            "attempts": 0, "matches": 0})
+            m["claims"] += row["claims"]
+            m["attempts"] += row["attempts"]
+            m["matches"] += row["matches"]
+        for m in models.values():
+            m["conversion"] = round(m["matches"] / m["claims"], 3) if m["claims"] else None
+            m["tier"] = ranking.tier(m["model"], *self.routing)
+        return {"routing": ranking.describe(*self.routing),
+                "agents": sorted(agents, key=lambda r: (-(r["conversion"] or 0), -r["matches"])),
+                "models": sorted(models.values(), key=lambda r: (-(r["conversion"] or 0), -r["matches"]))}
 
     def release(self, agent: Agent, function: str, notes: str, project: str | None = None, not_c: bool = False) -> str:
         """An agent gives a function back: its claim ends, its notes stay for the next agent, and the function

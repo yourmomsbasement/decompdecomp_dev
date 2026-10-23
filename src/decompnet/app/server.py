@@ -22,7 +22,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from .. import agents as kinds
-from .. import hostenv
+from .. import hostenv, ranking
 from ..network import NetworkError
 from . import agents, collab, routes, saves, tools, updates, window
 from .engine import RomNetwork
@@ -61,6 +61,8 @@ def build(net: RomNetwork, home: Path, port: int, secret: str):
         settings.data.update(auto_update=False, check_updates=False)
         settings.save()
     net.auto_compiler = bool(settings.data.get("auto_compiler"))
+    net.routing = (ranking.mode(settings.data.get("routing_mode")),
+                   ranking.order(settings.data.get("model_order")))
     manager.budget = lambda: float(settings.data.get("budget_usd") or 0)
     allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
 
