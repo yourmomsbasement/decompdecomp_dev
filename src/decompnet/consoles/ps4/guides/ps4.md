@@ -60,6 +60,34 @@ function the buffer the target shows (an array local, a memcpy destination) so t
   canary, whether it realigns the stack, which argument registers it keeps, and whether it is a thunk — most wrong
   first attempts are wrong about one of those, and the brief already carries the disassembly.
 
+## Spellings that turned near misses into matches
+
+Each of these was measured on a real function here: the first spelling is what the game's build did, the second is
+what clang 5.0.2 does without it.
+
+- **Call or jump to another function**: declare the callee `__attribute__((visibility("hidden")))`. A
+  default-visibility declaration goes through `PLT32` and the judge shows `call <next instruction>` instead of the
+  symbol; hidden makes it a direct `PC32` reference. Turned `func_0078AD80` 87.1% -> 100%, `func_0016B5C0` and
+  `func_0016B5F0` 95-96% -> 100%, `func_0034FD80`'s four call/jump rows -> 100%. The same attribute on **data**
+  can be worse: it lets clang fold a test into one `cmp qword ptr [rip+sym], 0` and lose an instruction, so keep
+  plain `extern` declarations for data and use hidden on code.
+- **`fcmp ONE`** (the game's `a != b` on floats): write `__builtin_islessgreater(a, b)`. `a != b` is `fcmp UNE`,
+  which clang expands to `setp` + `or`; the builtin is the single `vucomiss; setne` the game has.
+- **A byte the game keeps in a register** (`mov al,[x]; test al,al`): read it with
+  `__atomic_load_n(&x, __ATOMIC_ACQUIRE)`. A plain or `volatile` read is folded into `cmp byte ptr [x], 0`.
+- **A redundant `add rdi,8; add rdi,-8` pair the game keeps before a call**: cast the pointer to `unsigned long`,
+  `__atomic_signal_fence(__ATOMIC_ACQ_REL)`, then call `(void *)(ref - 8)`. Pointer-only arithmetic cancels both
+  adds even with the fence.
+- **A shared exit several failure branches jump to**: write one result variable and `goto`s
+  (`u8 r = 0; ... goto out; zero: r = 0; out: return r;`). An `if/else` gets if-converted to `setne` and the value
+  rematerialised into `eax`.
+- **A loop with a call and a count reloaded after it**: hoist the count (`signed long n = *(int *)(self + off);`)
+  and write `do { ...; ++i; } while (i < n);`. In `for (...; i < *(int *)(...); i++)` clang schedules `inc` first
+  and the `movsxd` lands on the wrong side.
+- **Intra-unit calls**: a callee defined in the same source loses its relocation (`call 0x550` where the game has
+  `call func_x`) unless it stays a separate, non-inlined symbol; `weak` + `noinline` on the definition keeps the
+  `PC32` when `noinline` alone does not.
+
 ## Keep the build able to run
 
 - **Scratch files go outside `src/`.** `build.ninja` lists every file under `src/` as an input of the rule that
