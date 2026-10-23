@@ -76,6 +76,68 @@ def addressed_symbols(project: Path, unit: str) -> set[str]:
     return found
 
 
+COND_IF = re.compile(r"\bif\s*\(")
+REL = ("<=", ">=", "<", ">")
+
+
+def conditions(body: str):
+    """(start, end, condition text) for every `if (...)` in a function body, parentheses balanced."""
+    out = []
+    for m in COND_IF.finditer(body):
+        depth, i = 1, m.end()
+        while i < len(body) and depth:
+            if body[i] == "(":
+                depth += 1
+            elif body[i] == ")":
+                depth -= 1
+            i += 1
+        out.append((m.end(), i - 1, body[m.end():i - 1]))
+    return out
+
+
+def comparisons(cond: str):
+    """(index, left, op, right) for the top-level comparisons in a condition; nested ones are left alone."""
+    depth = 0
+    for i in range(len(cond)):
+        c = cond[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif depth == 0:
+            for op in REL:
+                if cond.startswith(op, i):
+                    left = cond[:i].strip()
+                    right = cond[i + len(op):].strip()
+                    if left and right:
+                        return [(i, left, op, right)]
+    return []
+
+
+def overflow_form(left: str, op: str, right: str, signed: bool) -> str | None:
+    """The same test written as an overflow check, which keeps left before right in the subtraction."""
+    fn = "__builtin_ssub_overflow" if signed else "__builtin_usub_overflow"
+    if op == "<":
+        return f"{fn}({left}, {right}, &__unused_ov)"
+    if op == ">=":
+        return f"!{fn}({left}, {right}, &__unused_ov)"
+    if op == ">":
+        return f"{fn}({right}, {left}, &__unused_ov)"
+    if op == "<=":
+        return f"!{fn}({right}, {left}, &__unused_ov)"
+    return None
+
+
+def _declare_temp(body: str, name: str) -> str:
+    """Insert the `unsigned __unused_ov;` the overflow builtins need, right after the function's opening brace."""
+    if "__unused_ov" not in body:
+        return body
+    m = re.search(DEF.format(name=re.escape(name)), body)
+    if m is None:
+        return body
+    return body[:m.end()] + " unsigned __unused_ov;" + body[m.end():]
+
+
 def variants(project: Path, unit: str, name: str, source: str) -> list[tuple[str, str, str]]:
     """(label, whole-file text, note) candidates for this function."""
     out: list[tuple[str, str, str]] = []
@@ -89,6 +151,17 @@ def variants(project: Path, unit: str, name: str, source: str) -> list[tuple[str
             rewritten = body[:m.start()] + f"__builtin_islessgreater({m.group(1)}, {m.group(2)})" + body[m.end():]
             out.append((f"float_ne_{n}", source[:span[0]] + rewritten + source[span[1]:],
                         f"'!=' #{n} ({m.group(0).strip()}) -> islessgreater"))
+    if span is not None and body:  # a comparison whose operand order the target keeps (cmp index,[count]; jae)
+        for ci, (cstart, cend, cond) in enumerate(conditions(body)):
+            for _i, left, op, right in comparisons(cond):
+                for signed in (False, True):
+                    form = overflow_form(left, op, right, signed)
+                    if form is None:
+                        continue
+                    new_body = (body[:cstart] + form + body[cend:])
+                    new_body = _declare_temp(new_body, name)
+                    out.append((f"cmp_{ci}_{'s' if signed else 'u'}", source[:span[0]] + new_body + source[span[1]:],
+                                f"'{left} {op} {right}' -> {'signed' if signed else 'unsigned'} overflow form"))
     addressed = addressed_symbols(project, unit)
     if addressed:
         def open_decl(m):
