@@ -73,6 +73,12 @@ class PS4(Console):
                            "build, then try again")
         return ["--clang", str(clang)]
 
+    def rename_symbol(self, fp, version: str, old: str, new: str) -> dict:
+        """A function's real name, in the config the delinker names the target object's symbols from."""
+        from . import scratch
+
+        return scratch.rename(fp, version, old, new)
+
     def read_data(self, fp, name: str, length: int) -> str | None:
         from . import scratch
 

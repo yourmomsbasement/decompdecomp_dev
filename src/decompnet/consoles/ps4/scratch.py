@@ -167,6 +167,13 @@ def clang_path() -> Path | None:
     return None
 
 
+def write_atomic(path: Path, text: str) -> None:
+    """Write beside the file and rename: the app and agents can act on the same project at once."""
+    tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def game_info(path: Path) -> dict:
     data = path.read_bytes()
     elf = read_elf(data)
@@ -365,6 +372,26 @@ def read_data(root: Path, manifest: dict, name: str, length: int = READ_DEFAULT_
     if len(text) >= MIN_STRING_CHARS and all(c in PRINTABLE or c in b"\t\n" for c in text):
         out.append(f"as a string: {json.dumps(text.decode('latin-1'))}")
     return "\n".join(out)
+
+
+def rename(fp, version: str, old: str, new: str) -> dict:
+    """Rename one of the game's functions in the project's config, where the delinker takes every target symbol from
+    (`func_<addr>` -> a real name). The engine renames the C and checks that every match still matches. Returns the
+    files changed, with the text they had (ForkEngine puts them back if the rename doesn't hold)."""
+    path = Path(fp.root) / "config" / version / "functions.json"
+    text = path.read_text(encoding="utf-8")
+    cfg = json.loads(text)
+    hit = False
+    for functions in cfg.get("units", {}).values():
+        for fn in functions:
+            if fn.get("name") == old:
+                fn["name"] = new
+                hit = True
+    if not hit:
+        raise ForkError(f"{old} isn't a function in config/{version}/functions.json: only the game's functions "
+                        f"(func_<address>) can be renamed for now, not its data")
+    write_atomic(path, json.dumps(cfg, indent=1))
+    return {path: text}
 
 
 # ---------------------------------------------------------------------------------------------------- the project
