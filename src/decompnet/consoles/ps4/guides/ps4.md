@@ -16,6 +16,12 @@ there because a whole population of the game's functions says so:
   form and miss it.
 - **`-fPIE`**: the game addresses globals with `lea rax,[rip+disp]`, as a position-independent executable does. Without
   it clang writes `mov eax,imm32` and every function that touches a global misses.
+- **`-mllvm -unroll-runtime=false`**: the game does not runtime-unroll its loops. `func_00508220`'s target is a plain
+  `mov / cmp / cmovge / add / dec / jne` loop; clang 5.0.2 at `-O2` emits an `and $3` / `cmp $3` / `jae` preamble,
+  four copies of the body and a `neg` tail instead. `-fno-unroll-loops` compiles identically here but also turns off
+  compile-time unrolling of constant-trip loops, which nothing says the game lacks, so the narrow flag is in. A/B on
+  a frozen snapshot of all 2,567 units: 302 matched either way, `func_00508220` 0 -> 58.33%. It does not match those
+  loops by itself: the target also duplicates the `-1` initialisation and pads the loop with 16-byte `nopw`.
 
 ## The stack protector, and the compiler this project needs
 

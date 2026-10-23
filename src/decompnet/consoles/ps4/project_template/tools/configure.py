@@ -27,7 +27,7 @@ import ninja_syntax
 # Settings (decompdecomp wrote these for this game; change them if the game was built differently)
 CL_FLAGS = ["-O2", "-mavx", "-fno-omit-frame-pointer", "-fPIE", "-mllvm", "-x86-use-vzeroupper=0",
             "-fstack-protector-strong", "-fno-asynchronous-unwind-tables", "-ffunction-sections",
-            "-mllvm", "-no-x86-call-frame-opt", "-mbmi", "-w"]
+            "-mllvm", "-no-x86-call-frame-opt", "-mbmi", "-mllvm", "-unroll-runtime=false", "-w"]
 
 ROOT = Path(__file__).resolve().parent.parent
 os.chdir(ROOT)
