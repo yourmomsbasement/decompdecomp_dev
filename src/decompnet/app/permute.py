@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .. import consoles, scoring, seeds, toolchains
+from ..forks import csource
 from ..hostenv import NO_WINDOW
 from ..network import NetworkError
 from ..permuter import mutate
@@ -75,6 +76,13 @@ def available() -> bool:
 def generator_argv() -> list[str]:
     tool = toolchains.path(TOOL)
     return [str(toolchains.venv_bin(tool / "venv", "python")), "-I", str(GENERATOR), str(tool)]
+
+
+def _own(source: str, name: str) -> str:
+    """The function's own definition from the C a turn starts on. decomp-permuter hands back whatever was handed to
+    it, and the attempt it is scored by must be one function definition plus the declarations it needs: a unit's
+    neighbours in the source come back in every variant and are refused, which burnt the turn."""
+    return csource.get(source, name) or source
 
 
 class Generator:
@@ -265,7 +273,7 @@ class Permuter:
                     gen = Generator()
                 except OSError as e:  # its environment is broken: the simple rewrites still work
                     log.info("permuter: decomp-permuter didn't start: %s", e)
-            start_src = best_src = cur_src = fn["best_source"]
+            start_src = best_src = cur_src = _own(fn["best_source"], fn["name"])
             best = cur = fn["best_score"]
             deadline = time.monotonic() + SECONDS
             batches = misses = 0
