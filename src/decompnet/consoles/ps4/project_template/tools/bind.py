@@ -20,7 +20,7 @@ from pathlib import Path
 
 GUARD_SYMBOL = "__stack_chk_guard"
 GUARD_ADDRESS = 0xD9DE00  # the GOT slot every canary prologue in the game reads its guard pointer from
-GOTPCREL, GOTPCRELX, REX_GOTPCRELX = 9, 41, 42
+GOTPCREL, GOTPCRELX, REX_GOTPCRELX, PC32 = 9, 41, 42, 2
 
 SHDR = struct.Struct("<IIQQQQIIQQ")
 SYM = struct.Struct("<IBBHQQ")
@@ -113,6 +113,56 @@ def bind(obj: Path, target: Path | None, guard: int) -> int:
     return patched
 
 
+def relax_got(obj: Path, target: Path | None) -> int:
+    """The linker's GOTPCREL relaxation, done here because nothing links these objects.
+
+    `mov reg,[rip+GOT]` against a symbol the binary defines is relaxed by the linker into `lea reg,[rip+sym]`
+    (GOTPCRELX), which is why the game's code reads `lea rax,[D]; load [rax+off]` while our object holds the
+    pre-link `mov rax,[rip+GOT]`. Those are the same 7 bytes with 8B where the lea has 8D, so this rewrites the
+    opcode and turns the relocation into R_X86_64_PC32 with the addend kept (-4) - exactly what `ld` leaves behind.
+
+    Only symbols this binary defines: `D_`/`func_` names the delinked target names, i.e. the game's own, which are
+    non-preemptible and therefore relaxable. An imported symbol (`__stack_chk_guard`, libc data) keeps its GOT load.
+    """
+    data = bytearray(obj.read_bytes())
+    if data[:4] != b"\x7fELF" or target is None or not target.exists():
+        return 0
+    tab = section_table(bytes(data))
+    secs, syms = tab["secs"], symbol_table(tab)
+    known = {name for name, _t, shndx, _v, _s in symbol_table(section_table(target.read_bytes()))
+             if name and (shndx != 0 or name.startswith(("D_", "func_")))}
+    if not known:
+        return 0
+    relaxed = 0
+    for sec in secs:
+        if sec["type"] != 4:  # SHT_RELA
+            continue
+        base = secs[sec["info"]]["off"]  # sh_info: the section these relocations apply to
+        for i in range(sec["size"] // RELA.size):
+            at = sec["off"] + i * RELA.size
+            r_offset, r_info, r_addend = RELA.unpack_from(data, at)
+            sym_index, r_type = r_info >> 32, r_info & 0xFFFFFFFF
+            if r_type not in (GOTPCREL, GOTPCRELX, REX_GOTPCRELX):
+                continue
+            name = syms[sym_index][0] if sym_index < len(syms) else ""
+            if name not in known:
+                continue
+            field = base + r_offset  # the disp32
+            start = field - 3  # REX 8B modrm disp32, or 8B modrm disp32
+            if start >= base and data[start] in (0x48, 0x49, 0x4C, 0x4D) and data[start + 1] == 0x8B \
+                    and (data[start + 2] & 0xC7) == 0x05:
+                data[start + 1] = 0x8D
+            elif field - 2 >= base and data[field - 2] == 0x8B and (data[field - 1] & 0xC7) == 0x05:
+                data[field - 2] = 0x8D
+            else:
+                continue  # not the load-of-address shape: leave the GOT access alone
+            struct.pack_into("<Q", data, at + 8, (sym_index << 32) | PC32)
+            relaxed += 1
+    if relaxed:
+        obj.write_bytes(bytes(data))
+    return relaxed
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("object")
@@ -124,8 +174,9 @@ def main() -> int:
     target = Path(args.target) if args.target else obj.parent.parent.parent / "target" / obj.name
     exists = target.exists()
     n = bind(obj, target if exists else None, args.guard)
+    relaxed = relax_got(obj, target if exists else None)
     if not args.quiet:
-        print(f"{obj}: bound {n} guard load(s) to 0x{args.guard:x}"
+        print(f"{obj}: bound {n} guard load(s) to 0x{args.guard:x}, relaxed {relaxed} GOT load(s)"
               + ("" if exists else f" (no target object at {target})"))
     return 0
 
