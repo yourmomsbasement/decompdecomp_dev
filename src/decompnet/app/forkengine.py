@@ -3278,9 +3278,14 @@ class ForkEngine:
                                       "ON a.id=t.agent_id WHERE t.function_id=? ORDER BY t.id", fn["id"])
         notes = self.net.store.all("SELECT n.text, n.created_at, a.name AS agent FROM notes n LEFT JOIN agents a "
                                    "ON a.id=n.agent_id WHERE n.function_id=? ORDER BY n.id DESC LIMIT 10", fn["id"])
-        draft = None
-        if fn["status"] != "matched" and not attempts and not fn["best_source"]:
-            draft = self._draft(proj, fp, cfg, fn, unit)  # made on first look, cached in functions.seed
+        # never made here: it runs Ghidra, which takes 15-30 s, and the panel has to answer at once with the assembly.
+        # A thread fills it in, so the draft is there the next time the function is opened.
+        draft = fn["seed"] or None
+        try:
+            if draft is None and fn["status"] != "matched" and not attempts and not fn["best_source"]:
+                threading.Thread(target=self._draft, args=(proj, fp, cfg, fn, unit), daemon=True).start()
+        except Exception:  # a draft is a convenience: the panel shows the assembly whatever happens here
+            draft = None
         worked = bool(attempts) or bool(fn["best_source"]) or fn["status"] == "matched"
         return {"name": fn["name"], "vram": fn["vram"] or 0, "rom_offset": 0, "size": fn["size"], "insns": fn["n_insns"],
                 "status": fn["status"], "best": fn["best_score"], "asm": asm, "unit": fn["unit"], **set_aside(fn),
