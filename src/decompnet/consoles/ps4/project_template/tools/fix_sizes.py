@@ -52,9 +52,17 @@ def main() -> int:
         for fn in fns:
             start, size = fn["addr"], fn["size"]
             limit = min(upper[start], start + 0x10000)
-            end = walk(md, blob, start, limit)
-            if end > start + size:
-                fn["size"] = end - start
+            # only the instruction the size lands inside: a truncated tail is 1-15 bytes, a bigger extension means
+            # the map is wrong about something else, and swallowing the next region would compare the wrong bytes
+            end = size
+            for insn in md.disasm(blob[start:limit], start):
+                if insn.address + insn.size <= start + size:
+                    continue
+                if insn.address < start + size and insn.size <= 15:  # starts inside, ends past: a cut tail
+                    end = insn.address + insn.size - start
+                break
+            if end > size:
+                fn["size"] = end
                 grown.append((fn["name"], size, fn["size"]))
     print(f"functions whose size cut an instruction: {len(grown)}")
     for name, before, after in grown[:10]:
