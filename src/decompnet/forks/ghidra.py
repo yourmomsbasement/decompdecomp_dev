@@ -47,11 +47,20 @@ def _headless() -> Path:
     return base / ("analyzeHeadless.bat" if os.name == "nt" else "analyzeHeadless")
 
 
+def _temp_base() -> Path:
+    """A directory Ghidra will make its throwaway project in. It refuses a project path with an element starting with
+    ".", and TMPDIR can be one of those (this box keeps its scratch under ~/.hermes), so /tmp when it is."""
+    base = Path(tempfile.gettempdir())
+    if any(part.startswith(".") for part in base.resolve().parts):
+        base = Path("/tmp")
+    return base
+
+
 def _run_script(binary: Path, script: str, timeout: float, *, analyse: bool = True) -> list[dict]:
     """Import `binary` into a throwaway Ghidra project, run one of our post-scripts on it and return the JSON objects
     it wrote, one per line ([] when it took longer than `timeout`). A Ghidra that didn't get to run the script says
     why (ForkError): that was "found no functions" before, which sent the user after packers and DRM."""
-    with tempfile.TemporaryDirectory(prefix="decompwtf-ghidra-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="decompwtf-ghidra-", dir=_temp_base()) as tmp:
         scripts = Path(tmp) / "scripts"
         scripts.mkdir()
         src = resources.files("decompnet.forks").joinpath("ghidra_scripts", script)

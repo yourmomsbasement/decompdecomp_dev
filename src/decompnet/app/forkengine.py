@@ -2204,7 +2204,10 @@ class ForkEngine:
                 found = ghidra.decompile_object(unit.target, fp.root / "build" / "ghidra")
                 names = [meta.get("symbol") or fn["name"], *self._names(meta, fn)]
                 body = next((found[n] for n in names if n in found), None)
-                text = body and "/* Ghidra */\n" + body.strip()
+                from .. import consoles
+
+                adapt = getattr(consoles.get(cfg.get("platform") or ""), "adapt_draft", None)
+                text = body and "/* Ghidra */\n" + (adapt(body.strip()) if adapt else body.strip())
         except OSError:
             text = None
         with self.net.store.tx() as db:

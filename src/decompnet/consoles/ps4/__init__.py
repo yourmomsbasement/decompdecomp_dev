@@ -15,6 +15,8 @@ functions of inFAMOUS Second Son byte for byte, and 18 of 20 as the same instruc
 
 from __future__ import annotations
 
+import re
+
 from pathlib import Path
 
 from ...rom import RomError
@@ -72,6 +74,15 @@ class PS4(Console):
             raise RomError("no clang 5.0.2 for PS4 matching: point DECOMP_PS4_CLANG at one, or install the pinned "
                            "build, then try again")
         return ["--clang", str(clang)]
+
+    def adapt_draft(self, text: str) -> str:
+        """Ghidra's C in this project's type names. It writes `undefined8` and `undefined4` where common.h has `u64` and
+        `u32`, and an agent handed those spends a turn translating instead of matching; its overlap warnings go too."""
+        for theirs, ours in (("undefined8", "u64"), ("undefined4", "u32"), ("undefined2", "u16"),
+                             ("undefined1", "u8"), ("undefined", "u8")):
+            text = re.sub(rf"\b{theirs}\b", ours, text)
+        return "\n".join(line for line in text.splitlines() if "WARNING: Globals starting with" not in line
+                          and "WARNING: Removing unreachable" not in line)
 
     def rename_symbol(self, fp, version: str, old: str, new: str) -> dict:
         """A function's real name, in the config the delinker names the target object's symbols from."""
