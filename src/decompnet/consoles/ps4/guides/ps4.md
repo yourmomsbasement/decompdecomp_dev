@@ -25,6 +25,14 @@ there because a whole population of the game's functions says so:
 
 ## The stack protector, and the compiler this project needs
 
+**The guard pointer is bound at build time.** The game loads it from one GOT slot at a fixed address, `0xd9de00`
+(210 of 210 sampled canary functions), while clang writes a `GOTPCREL` relocation for a linker that never runs. A
+relocation on one side of the comparison against a literal on the other never matches, so `tools/bind.py` — run by
+`tools/compile.py` after every compile — writes the game's own displacement into the object and drops that
+relocation. Measured on a frozen snapshot of the whole project: 109 functions improved, typically +2.5% (one row),
+none crossed 100% on its own because everything else in them still differs. A function with a canary can now reach
+100%; it needs the rest of its code to be exact first.
+
 24.2% of the functions (6,674) call `__stack_chk_fail`, and they are **35.5% of the game's code**. Their prologues load
 the guard through the GOT — `mov r12,[rip+disp]; mov rax,[r12]; mov [rbp-0x30],rax` — and every exit reloads it,
 `cmp`s, and jumps to `__stack_chk_fail` on mismatch. So the game was built with `-fstack-protector-strong` and the

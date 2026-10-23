@@ -21,7 +21,11 @@ def main() -> int:
     flags = args.flags[1:] if args.flags[:1] == ["--"] else args.flags
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     command = [args.compiler, *flags, f"-I{args.include}", "-I.", "-c", args.source, "-o", args.output]
-    return subprocess.run(command, timeout=COMPILE_SECONDS, creationflags=NO_WINDOW).returncode
+    code = subprocess.run(command, timeout=COMPILE_SECONDS, creationflags=NO_WINDOW).returncode
+    if code == 0:  # the stack guard's GOT slot is at a fixed address in the game: bind it, as its linker did
+        subprocess.run([sys.executable, str(Path(__file__).with_name("bind.py")), args.output, "--quiet"],
+                       timeout=COMPILE_SECONDS, creationflags=NO_WINDOW)
+    return code
 
 
 if __name__ == "__main__":
