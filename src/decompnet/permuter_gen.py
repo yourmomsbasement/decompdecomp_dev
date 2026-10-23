@@ -38,9 +38,50 @@ MAX_SEED = 10**20
 _COMMENT = re.compile(r'//[^\n]*|/\*.*?\*/|("(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\')', re.S)
 
 
+
+# pycparser, which decomp-permuter reads C with, knows neither GCC attributes nor vector types; both are stripped
+# here for the parse only. The compiler still gets the header and the source whole, and a variant pycparser prints
+# keeps the typedef names (`__m128`), so what it writes still compiles.
+PARSER_SHIM = """typedef struct { float f[4]; } __m128;
+typedef struct { double d[2]; } __m128d;
+typedef struct { long long q[2]; } __m128i;
+typedef struct { float f[8]; } __m256;
+typedef struct { double d[4]; } __m256d;
+typedef struct { long long q[4]; } __m256i;
+"""
+
+
+def strip_attributes(text: str) -> str:
+    """`text` without `__attribute__((...))`, whose parentheses are balanced out by hand: the inner ones make a
+    regular expression leave a stray `)` behind."""
+    out = []
+    i = 0
+    while True:
+        at = text.find("__attribute__", i)
+        if at < 0:
+            out.append(text[i:])
+            return "".join(out)
+        out.append(text[i:at])
+        start = text.find("(", at)
+        if start < 0:
+            out.append(text[at:])
+            return "".join(out)
+        depth, pos = 0, start
+        while pos < len(text):
+            if text[pos] == "(":
+                depth += 1
+            elif text[pos] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            pos += 1
+        i = pos + 1
+
+
 def plain_c(text: str, directives: bool = True) -> str:
     """`text` without comments and continued lines, and without preprocessor lines unless `directives`."""
     text = _COMMENT.sub(lambda m: m.group(1) or " ", text.replace("\\\n", ""))
+    text = strip_attributes(text)
     return text if directives else "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
 
 
@@ -54,7 +95,8 @@ def main() -> int:
 
     def variants(job: dict):
         name, count = job["function"], int(job["count"])
-        unit = f"{plain_c(job['header'], directives=False)}\ntypedef int {SOURCE_STARTS};\n{plain_c(job['source'])}\n"
+        unit = (f"{PARSER_SHIM}{plain_c(job['header'], directives=False)}\ntypedef int {SOURCE_STARTS};\n"
+                f"{plain_c(job['source'], directives=False)}\n")  # the source's own #include of the header is already above
         rng = random.Random(job["seed"])
         try:
             weights = get_default_randomization_weights(job.get("family") or "base")
