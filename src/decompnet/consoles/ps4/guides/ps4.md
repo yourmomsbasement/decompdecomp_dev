@@ -81,6 +81,11 @@ what clang 5.0.2 does without it.
 - **A shared exit several failure branches jump to**: write one result variable and `goto`s
   (`u8 r = 0; ... goto out; zero: r = 0; out: return r;`). An `if/else` gets if-converted to `setne` and the value
   rematerialised into `eax`.
+- **A `? :` select whose result is then dereferenced** (`lea rax,[rsi+8]; test rsi,rsi; cmove rax,rsi;
+  mov ecx,[rax]`): put the select in a **`volatile`** pointer — `volatile int *at = q ? (int *)(q + 8) : 0;` then
+  read `*at`. With a plain `int *at` clang derives `q != NULL` from the dereference and drops the select entirely
+  (`mov ecx,[rsi+8]`), and a `q ? *at : 0` form turns it into a branch. Measured on `func_00381A10`
+  (77.6% -> 92.0%) and it keeps the select in `func_00381980`'s twin block; the load itself stays a plain `mov`.
 - **A loop with a call and a count reloaded after it**: hoist the count (`signed long n = *(int *)(self + off);`)
   and write `do { ...; ++i; } while (i < n);`. In `for (...; i < *(int *)(...); i++)` clang schedules `inc` first
   and the `movsxd` lands on the wrong side.
