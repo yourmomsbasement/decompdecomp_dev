@@ -62,14 +62,39 @@ def _relocations(tab: dict) -> dict[int, list[tuple[int, int, int, int]]]:
     return out
 
 
-def _table_load(code: bytes, at: int) -> bool:
-    """Whether the displacement at `at` is a `lea reg,[rip+disp]` followed by `movsxd reg,[reg+reg*4]`."""
+HOISTED = 4096  # bytes after a table's lea where its `movsxd` may be: a loop's dispatch, its lea in the prologue
+
+
+def _scaled_load(code: bytes, nxt: int, base: int | None = None) -> bool:
+    """Whether `movsxd reg,[base+reg*4]` starts at `nxt` (REX 63 ModRM SIB: a memory operand through a SIB byte, rm
+    100, whose index is scaled by 4), through `base` (a register number, 0-15) when it's given. A base of rbp or r13
+    is encoded with a zero 8-bit displacement (mod 01), since mod 00 with that base means none."""
+    if not (nxt + 4 <= len(code) and code[nxt] & 0xF0 == 0x40 and code[nxt + 1] == MOVSXD
+            and code[nxt + 2] & 0x07 == 0x04 and code[nxt + 3] >> 6 == 2):
+        return False
+    mod, low = code[nxt + 2] >> 6, code[nxt + 3] & 7
+    if not (mod == 0 and low != 5 or mod == 1 and low == 5 and nxt + 5 <= len(code) and code[nxt + 4] == 0):
+        return False
+    return base is None or ((code[nxt] & 1) << 3 | low) == base
+
+
+def _table_load(code: bytes, at: int, end: int | None = None) -> bool:
+    """Whether the displacement at `at` is a `lea reg,[rip+disp]` whose register a `movsxd reg,[reg+reg*4]` reads: right
+    after it, or (`end`: where the function ends) later in the function. clang hoists a loop's table address out of
+    the loop: one of a PS4 game's tables is loaded into r10 in the prologue, and dispatched through 0x40 bytes on.
+    The later load is found by its bytes, not by following every instruction: the tables' contents decide what's bound
+    (every case must land where the game's does), so a load that only looks like one binds nothing."""
     start = at - 3
     if start < 0 or code[start] & 0xF0 != 0x40 or code[start + 1] != LEA or code[start + 2] & 0xC7 != 0x05:
         return False
-    nxt = at + 4  # REX 63 ModRM SIB: a memory operand through a SIB byte (rm 100) whose index is scaled by 4
-    return (nxt + 4 <= len(code) and code[nxt] & 0xF0 == 0x40 and code[nxt + 1] == MOVSXD
-            and code[nxt + 2] & 0xC7 == 0x04 and code[nxt + 3] >> 6 == 2)
+    if _scaled_load(code, at + 4):
+        return True
+    if end is None:
+        return False
+    reg = (code[start] >> 2 & 1) << 3 | code[start + 2] >> 3 & 7
+    if reg == 4:  # (rsp: never a table's)
+        return False
+    return any(_scaled_load(code, nxt, reg) for nxt in range(at + 4, min(end, at + 4 + HOISTED, len(code)) - 3))
 
 
 def target_tables(target: Path) -> dict[tuple[str, int], tuple[str, int, int]]:
@@ -84,10 +109,11 @@ def target_tables(target: Path) -> dict[tuple[str, int], tuple[str, int, int]]:
         funcs = [s for s in syms if s[1] == 2 and s[2] == shndx and s[4]]
         for offset, sym, kind, addend in rows:
             name = syms[sym][0] if sym < len(syms) else ""
-            if kind != PC32 or not name.startswith("D_") or not _table_load(code, offset):
-                continue
             owner = next((f for f in funcs if f[3] <= offset < f[3] + f[4]), None)
-            if owner and owner[0] in addresses:
+            if (kind != PC32 or not name.startswith("D_") or owner is None
+                    or not _table_load(code, offset, owner[3] + owner[4])):
+                continue
+            if owner[0] in addresses:
                 out[(owner[0], offset - owner[3])] = (name, addend, addresses[owner[0]])
     return out
 
@@ -119,8 +145,11 @@ def bind_tables(obj: Path, target: Path | None, read) -> int:
     starts: dict[int, set[int]] = {}
     for shndx, rows in relocs.items():
         code = bytes(data[secs[shndx]["off"]:secs[shndx]["off"] + secs[shndx]["size"]])
+        funcs = [s for s in syms if s[1] == 2 and s[2] == shndx and s[4]]
         for offset, sym, kind, addend in rows:
-            if kind == PC32 and sym < len(syms) and syms[sym][1] == 3 and _table_load(code, offset):
+            owner = next((f for f in funcs if f[3] <= offset < f[3] + f[4]), None)
+            if (kind == PC32 and sym < len(syms) and syms[sym][1] == 3 and owner is not None
+                    and _table_load(code, offset, owner[3] + owner[4])):
                 starts.setdefault(syms[sym][2], set()).add(addend + 4)
     bound = 0
     for shndx, rows in relocs.items():
@@ -128,7 +157,7 @@ def bind_tables(obj: Path, target: Path | None, read) -> int:
         funcs = [s for s in syms if s[1] == 2 and s[2] == shndx and s[4]]
         for offset, sym, kind, addend in rows:
             owner = next((f for f in funcs if f[3] <= offset < f[3] + f[4]), None)
-            if owner is None or kind != PC32 or not _table_load(code, offset):
+            if owner is None or kind != PC32 or not _table_load(code, offset, owner[3] + owner[4]):
                 continue
             game = wanted.get((owner[0], offset - owner[3]))
             table_sec = syms[sym][2] if sym < len(syms) else 0

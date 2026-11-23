@@ -35,6 +35,25 @@ def test_a_table_load_is_lea_then_a_scaled_movsxd():
     assert not jt._table_load(bytes.fromhex("488b0d00000000" "48630481"), 3)  # mov, not lea
 
 
+def test_a_hoisted_table_load_is_found_through_its_register_in_the_function():
+    """clang hoists a loop's table address out of the loop: lea r10 in the prologue, the dispatch's movsxd 0x40 bytes
+    on (a PS4 game's function stayed at score 4 on this alone)."""
+    jt = load()
+    lea_r10 = bytes.fromhex("4c8d1500000000")  # lea r10,[rip+T]
+    work = bytes.fromhex("ffc0" "890424" "4801d8" "31c9") * 6  # inc eax; mov [rsp],eax; add rax,rbx; xor ecx,ecx
+    dispatch = bytes.fromhex("4963048a")  # movsxd rax,[r10+rcx*4]
+    code = lea_r10 + work + dispatch
+    assert not jt._table_load(code, 3)  # (without the function's end: only right after the lea, as before)
+    assert jt._table_load(code, 3, len(code))
+    assert not jt._table_load(code, 3, len(code) - 4)  # the movsxd is past the function's end
+    other = bytes.fromhex("4863048b")  # movsxd rax,[rbx+rcx*4]: another register's table
+    assert not jt._table_load(lea_r10 + work + other, 3, 100)
+    lea_r12, lea_r13 = bytes.fromhex("4c8d2500000000"), bytes.fromhex("4c8d2d00000000")
+    assert jt._table_load(lea_r12 + work + bytes.fromhex("4963048c"), 3, 100)  # [r12+rcx*4]: a SIB base
+    assert jt._table_load(lea_r13 + work + bytes.fromhex("4963448d00"), 3, 100)  # [r13+rcx*4+0]: mod 01, disp 0
+    assert not jt._table_load(lea_r13 + work + bytes.fromhex("4963048d"), 3, 100)  # mod 00 there: no base at all
+
+
 def fake_game(path: Path, vaddr: int, payload: bytes) -> Path:
     """An ELF64 with one loaded segment holding `payload` at `vaddr`: what image_reader needs of the game."""
     header = bytearray(64)
@@ -70,9 +89,23 @@ int f(int x) {
 """
 
 
+LOOP = """int g(int);
+int f(const int *v, int n) {
+    int s = 0;
+    for (int i = 0; i < n; i++)
+        switch (v[i]) {
+        case 0: s += g(1); break; case 1: s ^= g(7); break; case 2: s -= g(3); break;
+        case 3: s += g(9) * 2; break; case 4: s |= g(5); break;
+        }
+    return s;
+}
+"""
+
+
 @pytest.mark.skipif(clang() is None, reason="needs a clang")
+@pytest.mark.parametrize("source", [SWITCH, LOOP], ids=["switch", "switch in a loop: its table load hoisted"])
 @pytest.mark.parametrize("same", [True, False])
-def test_a_table_the_game_has_is_bound_and_one_it_doesnt_isnt(tmp_path, same):
+def test_a_table_the_game_has_is_bound_and_one_it_doesnt_isnt(tmp_path, same, source):
     sys.path.insert(0, str(TOOLS))
     try:
         jt = load()
@@ -84,7 +117,7 @@ def test_a_table_the_game_has_is_bound_and_one_it_doesnt_isnt(tmp_path, same):
     finally:
         sys.path.remove(str(TOOLS))
     src = tmp_path / "text_00002000.c"
-    src.write_text(SWITCH)
+    src.write_text(source)
     built = tmp_path / "build/v/src/text_00002000.o"
     built.parent.mkdir(parents=True)
     subprocess.run([str(clang()), "-O2", "-fPIE", "-ffunction-sections", "-c", str(src), "-o", str(built)], check=True)
@@ -92,7 +125,7 @@ def test_a_table_the_game_has_is_bound_and_one_it_doesnt_isnt(tmp_path, same):
     syms, relocs = symbol_table(tab), jt._relocations(tab)
     f = next(s for s in syms if s[0] == "f")
     code = tab["data"][tab["secs"][f[2]]["off"]:][:f[4]]
-    load_at = next(o for o, s, t, a in relocs[f[2]] if syms[s][1] == 3 and jt._table_load(code, o))
+    load_at = next(o for o, s, t, a in relocs[f[2]] if syms[s][1] == 3 and jt._table_load(code, o, len(code)))
     table_sec = next(syms[s][2] for o, s, t, a in relocs[f[2]] if o == load_at)
     cases = [syms[s][3] + a - 4 * k for k, (o, s, t, a) in enumerate(sorted(relocs[table_sec]))]
     assert len(cases) == 5

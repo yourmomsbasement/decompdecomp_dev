@@ -3368,7 +3368,10 @@ class ForkEngine:
                                     kept = c
                                     return (f"{c}: {trial['text']}\n{unit.source} is built with {c} from now on "
                                             f"(its reason and evidence: {console.settings_doc(fp) or 'the settings'}).")
-                                tried.append(f"{c}: {trial['text']}. {verdict}")
+                                lost = sorted(n for n, p in (base_scores or {}).items() if (p or 0) >= 100
+                                              and ((trial.get("unit_scores") or {}).get(n) or 0) < 100)
+                                tried.append(f"{c}: {trial['text']}. {verdict}"
+                                             + self._lost_with(proj, fp, unit, c, lost))
                                 continue
                             res = trial
                         else:
@@ -3384,7 +3387,8 @@ class ForkEngine:
                             return f"{c}: {res['text']}\n{unit.source} is built with {c} from now on."
                         if res.get("broken"):  # the file's other functions need its own compiler
                             res["text"] = (f"the file's matched {', '.join(res['broken'][:8])} no longer match with it. "
-                                           f"If {fn['name']} needs it, give it a file of its own first (split_file)")
+                                           f"If {fn['name']} needs it, give it a file of its own first (split_file)"
+                                           + (self._lost_with(proj, fp, unit, c, res["broken"]) if c != own else ""))
                         if len(wanted) == 1 and c != own and res.get("rows") and not res["matched"]:
                             # a preview's text is its score alone: the rows are what to act on (agents asked for them)
                             res["text"] += f"\nIts diff with {c}:\n" + render_rows(res["rows"], legend=objdiff.LEGEND)
@@ -3403,6 +3407,24 @@ class ForkEngine:
         left = wanted[len(tried):]
         return (f"No compiler matches {fn['name']}; {unit.source} stays with {own}.\n" + "\n".join(tried)
                 + (f"\nNot tried yet (time ran out): {', '.join(left)}. Try them by name." if left else ""))
+
+    LOST_ROWS = 30  # rows of a lost match's diff a refused switch shows
+
+    def _lost_with(self, proj, fp: ForkProject, unit, c: str, lost: list[str]) -> str:
+        """What the first function a switch to `c` would lose looks like built with `c`: try_compiler holds the file
+        with `c` set, so building it once more shows that function's diff (its C is the file's, unchanged). Agents
+        whose match was refused saw only the lost function's name and asked for this; "" when it can't be shown."""
+        if not lost:
+            return ""
+        try:
+            ok, _ = self._build_unit(proj, fp, unit)
+            rows = list(getattr(fp.diff(unit, lost[0]), "rows", []) or []) if ok else []
+        except (ObjdiffError, ForkError, OSError):
+            rows = []
+        if not rows:
+            return ""
+        return (f"\n{lost[0]}'s diff with {c} (it matches with the file's own compiler; this is what the switch would "
+                f"break):\n" + render_rows(rows, max_rows=self.LOST_ROWS, legend=objdiff.LEGEND, more_hint=False))
 
     def _evidence_switch(self, agent: Agent, slug: str, proj, fp: ForkProject, console, unit, fn, own: str, c: str,
                          source: str, base: dict, now: dict) -> str | None:

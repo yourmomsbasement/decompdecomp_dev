@@ -18,7 +18,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-TOOL_VERSION = 2  # decompdecomp brings a project's copy up to date when the template's is newer (consoles/ps4/units.py)
+TOOL_VERSION = 3  # decompdecomp brings a project's copy up to date when the template's is newer (consoles/ps4/units.py)
 COMPILE_SECONDS = 300
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 HERE = Path(__file__).resolve().parent

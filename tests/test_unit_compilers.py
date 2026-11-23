@@ -329,3 +329,56 @@ def test_another_compilers_try_shows_its_diff_rows(tmp_path, monkeypatch):
     engine._attempt = lambda *a, **kw: {"text": "99.3% (score 13)", "score": 13, "matched": False, "rows": rows}
     said = engine.try_compiler(SimpleNamespace(id=7, name="codex-2"), "demo", "f", "clang-3.8.1")
     assert "Its diff with clang-3.8.1:" in said and "mov eax, 0x2" in said and "stays with clang-5.0.2" in said
+
+
+@pytest.mark.parametrize("evidence", [2, 1], ids=["evidence console (PS4)", "one match enough (DS)"])
+def test_a_switch_refused_for_a_lost_match_shows_that_functions_diff_with_the_compiler(tmp_path, monkeypatch,
+                                                                                         evidence):
+    """An agent's exact clang 3.8.1 match was refused because a matched neighbour regressed, and all it saw was the
+    neighbour's name: the refusal shows the neighbour's diff with that compiler, from the file built with it."""
+    from collections import defaultdict
+    from contextlib import nullcontext
+    from threading import Lock
+
+    from decompnet import consoles
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src/u.c").write_text("int f(void){return 1;}\nint g(void){return 2;}\n")
+    unit = SimpleNamespace(name="u", source="src/u.c", complete=False)
+    compiler = {"now": "clang-5.0.2"}
+    builds, diffed = [], []
+
+    def diff(unit, symbol):
+        diffed.append((symbol, compiler["now"]))
+        return SimpleNamespace(rows=[(" ", "push rbp", "push rbp"), ("~", "mov al, bl", "mov eax, ebx")])
+
+    fp = SimpleNamespace(root=tmp_path, unit=lambda name: unit, linkable=lambda: False, diff=diff)
+
+    def set_compiler(fp, src, c, *a):
+        compiler["now"] = c
+        return "tools/compiler_units.json"
+    console = SimpleNamespace(compilers=[SimpleNamespace(id="clang-5.0.2"), SimpleNamespace(id="clang-3.8.1")],
+                              project_compilers=lambda fp: console.compilers, compiler_evidence=evidence,
+                              file_compiler=lambda fp, src: "clang-5.0.2", set_file_compiler=set_compiler)
+    monkeypatch.setattr(consoles, "get", lambda platform: console)
+    engine = ForkEngine.__new__(ForkEngine)
+    engine.net = SimpleNamespace(links={}, _source_of=lambda fn: "int f(void){return 1;}")
+    engine.get = lambda slug: ({"id": 1}, fp, {"platform": "ps4"})
+    engine._fn = lambda slug, name: {"id": 1, "name": "f", "status": "open", "unit": "u"}
+    engine._hold_for_try = lambda slug, function, agent: None
+    engine._tree = lambda proj: SimpleNamespace(shared=nullcontext, exclusive=nullcontext)
+    engine._unit_lock = lambda proj, name: nullcontext()
+    engine._baseline = lambda proj, fp, unit, text: ({"f": 60.0, "g": 100.0}, True)
+    engine._build_locks = defaultdict(Lock)
+    engine._build_unit = lambda proj, fp, unit: builds.append(compiler["now"]) or (True, "")
+    if evidence > 1:
+        engine._attempt = lambda *a, **kw: {"text": "100%", "score": 0, "matched": True,
+                                            "unit_scores": {"f": 100.0, "g": 97.5}}
+        engine._evidence_switch = lambda *a: "the file's g no longer match with clang-3.8.1"
+    else:
+        engine._attempt = lambda *a, **kw: {"text": "Rejected: breaks existing matches", "score": None,
+                                            "matched": False, "broken": ["g"]}
+    said = engine.try_compiler(SimpleNamespace(id=7, name="codex-1"), "demo", "f", "clang-3.8.1")
+    assert "g's diff with clang-3.8.1" in said and "mov al, bl" in said and "stays with clang-5.0.2" in said
+    assert diffed == [("g", "clang-3.8.1")]  # measured while the file was built with the candidate compiler
+    assert compiler["now"] == "clang-5.0.2" and builds[-1] == "clang-5.0.2"  # and put back afterwards
