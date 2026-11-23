@@ -22,7 +22,8 @@
 - A unit can be built with another compiler (clang 3.8.1 or 3.9.1) where its functions show it: if C that looks
   right stalls on register choice or instruction order, try_compiler(function, "all"). One match is kept as evidence;
   the unit switches once a second of its functions matches only with that compiler and none of its matches is lost.
-  Each unit's settings and why are in docs/build-settings.md (the brief quotes its file's).
+  When the refusal names matches the unit would lose, more evidence won't move it: split the function into a unit
+  of its own (split_file, below) and run try_compiler there. Each unit's settings and why are in docs/build-settings.md (the brief quotes its file's).
 - A switch's jump table is bound to the game's by the build (tools/jump_tables.py) when every case lands where the
   game's does: a remaining `lea reg,[D_...]` against `[.rodata...]` row means some case's code or order differs, not
   a tool limit. Fix the cases; don't release the function for it.

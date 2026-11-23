@@ -205,6 +205,9 @@ def test_the_second_function_completes_the_evidence_and_the_file_switches_docume
 def test_a_lost_match_never_switches_a_file(evidence_rig):
     said = switch(evidence_rig, "f", {"f": 97.0, "g": 100.0}, {"f": 100.0, "g": 98.0})
     assert "no longer match" in said and not evidence_rig.calls.switches
+    # more evidence can't move it, so the refusal says what can: the function in a file of its own
+    assert "won't change that" in said and 'split_file("src/u.c", "f")' in said
+    assert 'try_compiler("f", "clang-3.8.1")' in said
 
 
 # ---------------------------------------------------------------------------- an older project's build tools

@@ -3419,8 +3419,15 @@ class ForkEngine:
         if lost or len(shown) < needed:
             count = unit_compilers.keep(self.net, proj, unit.source, c, fn, source, base.get(symbol), agent)
             if lost:
+                # More evidence can't change this: the file switches only if none of its matches is lost. Agents read
+                # the bare refusal as "needs a second function" and kept gathering matches (25 units of a PS4 game
+                # held two or three older-clang matches each, every one with clang-5 matches the switch would lose)
                 return (f"the file's {', '.join(lost[:6])} no longer match with {c}, so {unit.source} stays with {own} "
-                        f"(this match is kept as evidence)")
+                        f"(this match is kept as evidence). More matches with {c} won't change that: a file switches "
+                        f"only if none of its matches is lost. If {fn['name']} needs {c}, give it a file of its own: "
+                        f"split_file(\"{unit.source}\", \"{fn['name']}\") moves it and the functions after it to a new "
+                        f"file (split again at the next one to leave it alone), then try_compiler(\"{fn['name']}\", "
+                        f"\"{c}\") there")
             return (f"Kept as evidence: {count} of the {needed} functions of {unit.source} that must match only with {c} "
                     f"before it's built with it (one match could be luck). {unit.source} stays with {own} for now: "
                     f"try_compiler(\"<another of its functions>\", \"{c}\") on another of its functions, with C that "
