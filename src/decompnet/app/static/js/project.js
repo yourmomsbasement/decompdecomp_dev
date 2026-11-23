@@ -20,6 +20,7 @@ async function openProject(slug, tab = "overview") {
     location.hash = "#/";
     return;
   }
+  if (S.ov.missing) { renderMissingProject(S.ov); return; }
   document.querySelectorAll("#ptabs [data-ptab]").forEach((a) => { a.href = `#/p/${slug}/${a.dataset.ptab}`; });
   const fork = S.ov.kind === "fork";
   $("mapTitle").textContent = fork ? "Function map" : "ROM map";
@@ -28,6 +29,7 @@ async function openProject(slug, tab = "overview") {
   groups.clear(); S.claimSig = "";
   L.q = ""; L.filter = "all"; L.limit = FUNCTION_ROWS; $("fnSearch").value = "";
   $("instrEdit").value = S.ov.instructions || "";
+  renderClaimOrder(S.ov);
   renderHeader(S.ov);
   markNav();
   const setup = fork && !S.ov.ready;
@@ -50,6 +52,22 @@ function stopPolling() {
   if (S.timer) clearInterval(S.timer);
   if (S.statsTimer) clearInterval(S.statsTimer);
   S.timer = null; S.statsTimer = null;
+}
+
+/* The project's folder was deleted: show why instead of a page whose polls and maps need it, with the way to remove
+   its database records (the only thing left). */
+function renderMissingProject(ov) {
+  renderHeader(ov);
+  markNav();
+  $("ptabs").hidden = true;
+  $("forkSetup").hidden = true;
+  $("phStart").hidden = $("phExport").hidden = $("phTogether").hidden = true;
+  document.querySelectorAll("[data-pane]").forEach((p) => { p.hidden = true; });
+  const notice = $("compilerNotice");
+  notice.hidden = false;
+  notice.className = "notice bad";
+  setHtml(notice, `<span><b>This project's folder is missing.</b> ${esc(ov.missing)}</span><span class="grow"></span><button class="primary small-btn" id="missingRemove" type="button">Remove project…</button>`);
+  $("missingRemove").onclick = () => removeMissingProject(ov);
 }
 
 function setTab(tab) {
@@ -108,7 +126,7 @@ async function refreshMap(force = true) {
    matches on the map. */
 let pollingGen = -1;
 async function poll() {
-  if (pollingGen === S.gen || !S.slug) return;
+  if (pollingGen === S.gen || !S.slug || (document.hidden && S.primed)) return;  // (minimised: nobody sees it)
   const gen = pollingGen = S.gen, slug = S.slug, first = !S.primed;
   try {
     const live = await api(`/api/live?slug=${slug}&e=${S.lastEvent}&a=${S.lastAttempt}&s=${encodeURIComponent(JSON.stringify(S.seq))}`);
@@ -138,6 +156,7 @@ async function poll() {
     renderNow(live.claims);
     renderStats(live.overview);
     const claimSig = live.claims.map((c) => c.name + "\u0000" + c.agent).join("\n");
+    if (live.cut && !first) mapDirty = true;  // (attempts it didn't send: the map's counts come again)
     if (mapDirty || Date.now() - S.lastMapFetch > MAP_EVERY_MS) await refreshMap(mapDirty);
     else {
       applyClaims();
@@ -154,10 +173,15 @@ async function poll() {
   }
 }
 
+let statsLoading = null;
 async function loadStats() {
   // the overview's charts and the Agents tab's "N matched" per agent both come from these
-  if (!S.slug || (S.tab !== "overview" && S.tab !== "agents")) return;
-  try { S.stats = await api(`/api/stats?slug=${S.slug}`); } catch { return; }
+  if (!S.slug || (S.tab !== "overview" && S.tab !== "agents") || statsLoading === S.slug || document.hidden) return;
+  const slug = statsLoading = S.slug;
+  let stats;
+  try { stats = await api(`/api/stats?slug=${slug}`); } catch { return; } finally { if (statsLoading === slug) statsLoading = null; }
+  if (slug !== S.slug) return;  // (another project opened meanwhile)
+  S.stats = stats;
   if (S.tab === "overview") renderOverview();
   else renderSessions(S.sessions || []);
 }
@@ -166,14 +190,15 @@ async function loadStats() {
 function workingAgents() {
   const running = S.sessions.filter((s) => ["starting", "working", "waiting"].includes(s.state));
   const own = new Set(S.sessions.map((s) => s.agent));
-  const outside = [...new Set(S.claims.filter((c) => !own.has(c.agent) && c.agent !== AUTO).map((c) => c.agent))];
+  const outside = [...new Set(S.claims.filter((c) => c.agent && !own.has(c.agent)
+    && !APP_WORKERS.has(c.agent.replace(/^@/, ""))).map((c) => c.agent))];
   return { running, outside, n: running.length + outside.length };
 }
 
 /* A console (consoles/ in the app: its name, status, layout, compilers), by the id or an old id a project or the
    browser's look at a file names it with. */
 function consoleOf(p) {
-  const key = { gcwii: "gc", playstation: "ps2" }[p] || p;  // (a PlayStation disc: both are ROM consoles)
+  const key = { gcwii: "gc", playstation: "ps2" }[p] || p;  // (a PlayStation disc not read yet: all are ROM consoles)
   return ((S.st && S.st.consoles) || []).find((c) => c.id === key || c.aliases.includes(key));
 }
 /* recommended | beta | "" for a platform key. */
@@ -309,26 +334,40 @@ function renderStats(ov) {
 
 function renderCompilerNotice(ov) {
   const n = $("compilerNotice");
+  if (n._working) return;
   const unc = ov.kind === "fork" && ov.ready ? ov.uncovered : null;
   if (unc && unc.functions) {
     n.hidden = false;
     n.className = "notice";
-    n.innerHTML = `<span><b>${unc.functions.toLocaleString()} functions</b> are in code no source file covers yet, so agents can't decompile them. decompdecomp can give each stretch of code a file (checked against the game's checksum, committed to git).</span><span class="grow"></span><button class="primary small-btn" id="startFiles" type="button"${S.startingFiles ? " disabled" : ""}>${S.startingFiles ? "Splitting the game…" : "Give them source files"}</button>`;
+    setHtml(n, `<span><b>${unc.functions.toLocaleString()} functions</b> are in code no source file covers yet, so agents can't decompile them. decompdecomp can give each stretch of code a file (checked against the game's checksum, committed to git).</span><span class="grow"></span><button class="primary small-btn" id="startFiles" type="button">Give them source files</button><div class="job-feedback"><pre class="joblog" id="startFilesLog" hidden></pre></div>`);
     $("startFiles").onclick = async () => {
-      S.startingFiles = true;
-      renderCompilerNotice(ov);
+      n._working = true;
+      const log = $("startFilesLog");
+      const button = $("startFiles"), label = button.textContent;
+      button.textContent = "Splitting the game…";
+      showJobError(log, "");
+      const finish = beginWork(log, "Giving code source files", [button], "Source files created.");
       try {
         const { job } = await api("/api/fork/start-files", { method: "POST", body: { slug: S.slug } });
-        const res = await followJob(job);
+        const res = await followJob(job, log);
         toast(`${(res && res.functions || 0).toLocaleString()} more functions can be decompiled now.`, "match");
         await refreshMap();
-      } catch (e) { toast(esc(e.message), "err"); }
-      S.startingFiles = false;
+      } catch (e) { showJobError(log, e.message); } finally { finish(); button.textContent = label; n._working = false; }
     };
     return;
   }
-  if (ov.kind === "fork" || ov.compiler.installed) { n.hidden = true; return; }
+  n._html = null;
+  // the console's other compilers too, until the project has matches: the compiler test tries every one installed
+  const missing = ov.compiler.missing || [];
+  if (ov.kind === "fork" || (ov.compiler.installed && (!missing.length || ov.matched))) { n.hidden = true; return; }
   n.hidden = false;
+  // #118: the project came from another tool and names a compiler decompdecomp doesn't have: it opens, and says so
+  // here instead of pretending the compiler has no build for this computer
+  if (ov.compiler.known === false) {
+    n.className = "notice bad";
+    setHtml(n, `<span><b>${esc(ov.compiler.name)}</b> isn't a compiler decompdecomp has (this project was made with another tool). Pick one in this project's Settings.</span>`);
+    return;
+  }
   if (!ov.compiler.supported) {
     n.className = "notice bad";
     n.innerHTML = ov.compiler.why
@@ -337,6 +376,14 @@ function renderCompilerNotice(ov) {
     return;
   }
   n.className = "notice";
+  if (missing.length) {
+    const owned = missing.filter((c) => c.proprietary).map((c) => c.name);
+    const lead = ov.compiler.installed ? `${plural(missing.length, `${ov.platform_short} compiler`)} ${missing.length > 1 ? "aren't" : "isn't"} installed`
+      : `<b>${esc(ov.compiler.name)}</b> isn't installed yet`;
+    n.innerHTML = `<span>${lead}. Install all of them and decompdecomp tests which one built this game.${owned.length ? ` ${esc(owned.join(", "))} ${owned.length > 1 ? "are" : "is"} proprietary software (recompiled by the decomp community): install only if you accept that.` : ""}</span><span class="grow"></span><button class="primary small-btn" id="tcInstall" type="button">Install all…</button>`;
+    $("tcInstall").onclick = () => installAllCompilers(owned);
+    return;
+  }
   n.innerHTML = ov.compiler.proprietary
     ? `<span><b>${esc(ov.compiler.name)}</b> isn't installed. It's proprietary software (recompiled by the decomp community); install it only if you accept that.</span><span class="grow"></span><button class="primary small-btn" id="tcInstall" type="button">Install…</button>`
     : `<span><b>${esc(ov.compiler.name)}</b> isn't installed yet.</span><span class="grow"></span><button class="primary small-btn" id="tcInstall" type="button">Install now</button>`;
@@ -357,7 +404,7 @@ function renderOverview() {
   $("fnStack").innerHTML = seg("matched", "s-match") + seg("working", "s-work") + seg("tried", "s-tried") + seg("asm", "s-asm") + seg("open", "s-open");
   setWidths($("fnStack"));
   const togo = cFunctions(S.ov) - S.ov.matched;
-  $("fnSub").textContent = `${togo.toLocaleString()} to go${c.tried ? ` · ${c.tried.toLocaleString()} tried` : ""}${c.working ? ` · ${c.working} in progress` : ""}${c.asm ? ` · ${c.asm} set aside (no C makes them)` : ""}${S.ov.readable ? ` · ${S.ov.readable.toLocaleString()} readable (renamed, typed and commented, still matching)` : ""}${S.ov.left_out ? ` · ${plural(S.ov.left_out, "function")} left out: library code (see Settings)` : ""}`;
+  $("fnSub").textContent = `${togo.toLocaleString()} to go${c.tried ? ` · ${c.tried.toLocaleString()} tried` : ""}${c.working ? ` · ${c.working} in progress` : ""}${c.asm ? ` · ${c.asm} set aside (no C makes them)` : ""}${S.ov.readable ? ` · ${S.ov.readable.toLocaleString()} readable (renamed, typed and commented, still matching)` : ""}${bigText(S.ov.big)}${S.ov.left_out ? ` · ${plural(S.ov.left_out, "function")} left out: library code (see Settings)` : ""}`;
   const st = S.stats;
   if (st) {
     const ph = st.matches_per_hour, max = Math.max(1, ...ph);
@@ -422,12 +469,14 @@ function renderNext(ov) {
   }
   if (ov.kind === "fork" && ov.ready && !ov.functions) {
     box.hidden = false;
-    setHtml(box, `<div class="next-text"><b>Not measured yet</b><span class="muted small">objdiff compares every unit of the project with your game: it takes a moment.</span></div><button class="primary" id="nextMeasure" type="button">Measure now</button>`);
+    setHtml(box, `<div class="next-text"><b>Not measured yet</b><span class="muted small">objdiff compares every unit of the project with your game: it takes a moment.</span></div><button class="primary" id="nextMeasure" type="button">Measure now</button><div class="job-feedback"><pre class="joblog" id="nextMeasureLog" hidden></pre></div>`);
     $("nextMeasure").onclick = async () => {
-      $("nextMeasure").disabled = true;
+      const log = $("nextMeasureLog");
+      showJobError(log, "");
+      const finish = beginWork(log, "Measuring project", [$("nextMeasure")], "Project measurement finished.");
       toast("Measuring the whole project with objdiff…");
-      try { const { job } = await api("/api/fork/check", { method: "POST", body: { slug: S.slug } }); await followJob(job); toast("Measured.", "match"); await refreshMap(); }
-      catch (e) { toast(esc(e.message), "err"); $("nextMeasure").disabled = false; }
+      try { const { job } = await api("/api/fork/check", { method: "POST", body: { slug: S.slug } }); await followJob(job, log); toast("Measured.", "match"); await refreshMap(); }
+      catch (e) { showJobError(log, e.message); } finally { finish(); }
     };
     return;
   }
@@ -492,6 +541,7 @@ function renderGuest(box, room) {
 }
 
 function renderHost(box, info) {
+  if (box._working) return;
   const intro = `<p class="muted">Your team works on this game from their own computers, each with <b>their own copy of exactly this game</b> (decompdecomp checks it's identical) and their own agents. This computer is the room's host: it keeps the shared work and checks every match against your copy.${S.ov.kind === "fork" ? " Members get this project's source tree from you (only what git tracks: never your game or its extracted files) and follow every commit made here." : ""} Only the work travels, never ROM data. You host the room and decide who's in.</p>`;
   const opts = (inf) => `<div class="setup-group"><h3>Who can join</h3>
       <div class="seg" id="visSeg"><button type="button" data-vis="private" class="${inf.settings.visibility !== "public" ? "on" : ""}">Private: invite link</button><button type="button" data-vis="public" class="${inf.settings.visibility === "public" ? "on" : ""}">Public: anyone with the address</button></div>
@@ -514,14 +564,19 @@ function renderHost(box, info) {
       const mode = box.querySelector('[name="mode"]:checked')?.value || "tunnel";
       const visibility = box.querySelector("[data-vis].on")?.dataset.vis || "private";
       showJobError(box.querySelector("#shareLog"), "");
-      box.querySelector("#startShare").disabled = true;
+      const log = box.querySelector("#shareLog");
+      box._working = true;
+      const finish = beginWork(log, "Starting room sharing", [box.querySelector("#startShare")], "Room sharing started.");
       try {
         const { job } = await api("/api/collab/start", { method: "POST", body: { slug: S.slug, mode, visibility,
           approve: box.querySelector("#apprChk").checked, address: box.querySelector("#addrIn")?.value || "",
           port: Number(box.querySelector("#addrPort")?.value) || ROOM_PORT, keep: info.was_sharing } });
-        await followJob(job, box.querySelector("#shareLog"));
-        renderHost(box, await api(`/api/collab?slug=${S.slug}`));
-      } catch (e) { showJobError(box.querySelector("#shareLog"), e.message); box.querySelector("#startShare").disabled = false; }
+        await followJob(job, log);
+        const shared = await api(`/api/collab?slug=${S.slug}`);
+        box._working = false;
+        renderHost(box, shared);
+        toast("Room sharing started.", "match");
+      } catch (e) { showJobError(log, e.message); } finally { finish(); box._working = false; }
     };
     return;
   }
@@ -562,14 +617,15 @@ function openReconnect() {
   const check = () => { const why = inviteProblem($("rLink").value); $("rGo").disabled = !!why; $("rWhy").textContent = $("rLink").value.trim() ? why : ""; };
   body.querySelector("#rLink").oninput = check;
   body.querySelector("#rGo").onclick = async () => {
-    showJobError($("rLog"), "");
-    $("rGo").disabled = true;
+    const log = body.querySelector("#rLog");
+    showJobError(log, "");
+    const finish = beginWork(log, "Reconnecting to room", [...body.querySelectorAll("input"), $("rGo")], "Reconnected to the room.");
     try {
       const { job } = await api("/api/collab/reconnect", { method: "POST", body: { slug: S.slug, link: $("rLink").value.trim() } });
-      await followJob(job, $("rLog"));
-      closeDialog();
+      await followJob(job, log);
+      if ($("rLog") === log) closeDialog();
       toast("Back in the room.", "match");
-    } catch (e) { if ($("rLog")) { showJobError($("rLog"), e.message); check(); } }
+    } catch (e) { showJobError(log, e.message); } finally { finish(); if ($("rLog") === log) check(); }
   };
 }
 
@@ -605,32 +661,53 @@ function openJoin() {
   body.querySelector("#jGo").onclick = async () => {
     const path = $("jPath").value.trim();
     if (joinProblem(fields())) return check();
-    showJobError($("jLog"), "");
-    $("jGo").disabled = true;
+    const log = body.querySelector("#jLog");
+    showJobError(log, "");
+    const finish = beginWork(log, "Joining room", [...body.querySelectorAll("input"), $("jGo")], "Joined the room.");
     try {
       // by its path, never through the page: a GameCube disc picked as a file turned the window black on Join
       const q = `link=${encodeURIComponent($("jLink").value.trim())}&name=${encodeURIComponent($("jName").value)}`
         + `&confirmed=1&path=${encodeURIComponent(path)}`;
       const { job } = await api(`/api/collab/join?${q}`, { method: "POST", raw: new Blob([]) });
-      const res = await followJob(job, $("jLog"));
-      closeDialog();
+      const res = await followJob(job, log);
+      if ($("jLog") === log) closeDialog();
       loadNav();
       location.hash = `#/p/${res.slug}`;
-    } catch (e) { if ($("jLog")) { showJobError($("jLog"), e.message); check(); } }
+      toast("Joined the room.", "match");
+    } catch (e) { showJobError(log, e.message); } finally { finish(); if ($("jLog") === log) check(); }
   };
 }
 
-async function installToolchain(id, proprietary) {
-  if (proprietary && !confirm("This downloads a proprietary compiler, kept by the decomp community. Install it only if you accept that. Continue?")) return;
+/* Every compiler of the project's console, then the compiler test again with all of them (install_compilers). */
+async function installAllCompilers(owned) {
+  if (owned.length && !confirm(`${owned.join(", ")} ${owned.length > 1 ? "are" : "is"} proprietary software, kept by the decomp community. Install only if you accept that. Continue?`)) return;
   toast("Installing…");
   try {
-    const { job } = await api("/api/toolchain", { method: "POST", body: { id, accept_license: proprietary } });
-    await followJob(job);
-    toast("Installed.", "match");
+    const { job } = await api("/api/toolchain/all", { method: "POST", body: { slug: S.slug, accept_license: owned.length > 0 } });
+    const res = await followJob(job);
+    const test = Object.entries(res?.test || {}).map(([id, n]) => `${id} ${n}`).join(", ");
+    toast(test ? `Installed. The compiler test: ${esc(test)} drafts matched.` : "Installed.", "match");
     await loadState();
     if (S.slug) renderStats(await api(`/api/project?slug=${S.slug}`));
     if (!$("toolsPage").hidden) renderTools();
   } catch (e) { toast(esc(e.message), "err"); }
+}
+
+async function installToolchain(id, proprietary) {
+  const tc = (S.st?.toolchains || []).find((t) => t.id === id);  // (each names where it comes from: its source)
+  const what = `${tc ? tc.name : "a compiler"}, proprietary software${tc?.source ? `, from ${tc.source}` : ""}`;
+  if (proprietary && !confirm(`This downloads ${what}. Install it only if you accept that. Continue?`)) return;
+  const body = dialog("Install compiler or tool", `<pre class="joblog tall" id="toolLog"></pre>`);
+  const log = body.querySelector("#toolLog");
+  const finish = beginWork(log, "Installing compiler or tool", [], "Compiler or tool installed.");
+  try {
+    const { job } = await api("/api/toolchain", { method: "POST", body: { id, accept_license: proprietary } });
+    await followJob(job, log);
+    toast("Installed.", "match");
+    await loadState();
+    if (S.slug) renderStats(await api(`/api/project?slug=${S.slug}`));
+    if (!$("toolsPage").hidden) renderTools();
+  } catch (e) { showJobError(log, e.message); } finally { finish(); }
 }
 
 /* ------------------------------------------------------------------ public decomps */
@@ -728,12 +805,16 @@ async function renderForkSetup() {
   let n;
   try { n = await api(`/api/fork/needs?slug=${S.slug}`); } catch (e) { box.innerHTML = `<p class="muted">${esc(e.message)}</p>`; return; }
   const kinds = { manifest: "decompdecomp manifest", dtk: "dtk-template (configure.py + ninja)", configure: "configure.py + ninja", splat: "splat + make", objdiff: "objdiff project", custom: "its own setup" };
-  const facts = `<dl class="facts one">${[["Repository", (S.ov.repo_url || "").replace(/^https?:\/\//, "") || "made by decompdecomp"], ["Layout", kinds[n.kind] || n.kind], ["Version", n.version || "—"], ["Game goes to", n.path || "see the README"]]
+  const versions = Array.isArray(n.rom_versions) ? n.rom_versions.filter((v) => /^[0-9a-f]{40}$/i.test(v.sha1 || "")) : [];
+  const facts = `<dl class="facts one">${[["Repository", (S.ov.repo_url || "").replace(/^https?:\/\//, "") || "made by decompdecomp"], ["Layout", kinds[n.kind] || n.kind], ["Version", n.version || "—"], ["Game goes to", n.path || "see the README"],
+    ...versions.map((v) => [`Original ROM SHA-1 (${v.version})`, v.sha1])]
     .map(([k, v]) => `<div><dt>${k}</dt><dd>${esc(v)}</dd></div>`).join("")}</dl>
     <div class="row"><button class="ghost small-btn" id="fsFolder" type="button">Open project folder</button></div>`;
+  let usingGame = false;
   const run = async (start) => {
+    usingGame = true;
     showJobError($("fsLog"), "");
-    const work = box.querySelector(".workbar");
+    const work = box.querySelector('[aria-label="Building project"]');
     if (work) work.hidden = false;
     box.querySelectorAll("button, input").forEach((b) => { b.disabled = true; });
     try {
@@ -748,6 +829,7 @@ async function renderForkSetup() {
       showJobError($("fsLog"), e.message);
       box.querySelectorAll("button, input").forEach((b) => { b.disabled = false; });
       if ($("fsOwn")) $("fsGo").disabled = !$("fsOwn").checked;
+      usingGame = false;
     }
   };
   if (n.auto) {
@@ -758,6 +840,7 @@ async function renderForkSetup() {
         <label class="check"><input type="checkbox" id="fsOwn"><span>This is my own copy of this game, obtained legally (for example, dumped from my console). The results stay with me for my own use.</span></label>
         <div class="row"><button class="primary" id="fsGo" type="button" disabled>Choose the game file…</button>
           <span class="muted small">or</span><input id="fsPath" class="mono grow" placeholder="paste its path on this computer"><button class="ghost" id="fsPathGo" type="button">Use path</button></div>
+        <div class="row"><button class="ghost small-btn" id="fsFind" type="button">Search ROM library</button><p class="muted small" id="fsFound"></p></div><pre class="joblog" id="fsFindLog" hidden></pre>
         <div class="workbar" role="progressbar" aria-label="Building project" hidden><i></i></div>
         <pre class="joblog tall" id="fsLog" hidden></pre>
         <p class="muted small">Then decompdecomp runs the project's setup and build, which can download the project's own tools and take a few minutes. Put the game in place yourself? <button class="link-btn" id="fsBuild" type="button">Just build</button></p>
@@ -779,6 +862,25 @@ async function renderForkSetup() {
     };
     $("fsPathGo").onclick = usePath;
     $("fsBuild").onclick = () => run(() => api("/api/fork/setup", { method: "POST", body: { slug: S.slug } }));
+    const setupSlug = S.slug, searchToken = Symbol();
+    box._romSearch = searchToken;
+    $("fsFind").onclick = async () => {
+      const logEl = $("fsFindLog"), statusEl = $("fsFound"), input = $("fsPath");
+      const finish = beginWork(logEl, "Looking for your ROM", [$("fsFind")], "ROM search finished.");
+      try {
+        const { job } = await api("/api/fork/find-rom", { method: "POST", body: { slug: setupSlug } });
+        const found = await followJob(job, logEl);
+        if (S.slug !== setupSlug || box._romSearch !== searchToken || usingGame) return;
+        if (found.path) {
+          if (found.in_project) input.value = "";
+          else if (!input.value.trim()) input.value = found.path;
+          statusEl.textContent = found.in_project ? "Your verified ROM is already in the project. Retry setup without choosing it again." : `Found the ${found.version ? found.version + " version" : "expected version"} by SHA-1. Confirm ownership above, then click Use path.`;
+          if (found.in_project) { $("fsBuild").textContent = "Retry setup"; $("fsBuild").className = "primary"; }
+        } else statusEl.textContent = found.reason || "No matching ROM found.";
+      } catch (e) {
+        if (S.slug === setupSlug && box._romSearch === searchToken) showJobError(logEl, e.message);
+      } finally { finish(); }
+    };
   } else {
     box.innerHTML = `<div class="fs-main">
         <p class="eyebrow">Last step</p>
@@ -796,4 +898,12 @@ async function renderForkSetup() {
     $("fsCheck").onclick = () => run(() => api("/api/fork/check", { method: "POST", body: { slug: S.slug } }));
   }
   $("fsFolder").onclick = () => openFolder();
+}
+
+/* The open functions of 400+ instructions, for the progress line: how many were ever tried, and the parts of them
+   helpers hold beside their owners (big ones are worked a part at a time: function_parts.py) */
+function bigText(big) {
+  if (!big || !big.open) return "";
+  return ` · ${big.open.toLocaleString()} big (${big.insns}+ instructions), ${big.tried.toLocaleString()} tried`
+    + (big.parts_held ? `, ${plural(big.parts_held, "part")} held` : "");
 }

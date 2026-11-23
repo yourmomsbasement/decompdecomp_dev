@@ -5,9 +5,11 @@ decompiled src/), for Demo Quest 64. The test clones it like a repository from d
 builds it and has an agent work through the guarded tools.
 """
 
+import hashlib
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -33,6 +35,55 @@ def _git(cwd: Path, *args: str) -> str:
                                "GIT_COMMITTER_EMAIL": "t@t", "PATH": "/usr/bin:/bin", "HOME": str(cwd)}).stdout
 
 
+@pytest.mark.parametrize("byte_order,width", [("z64", 1), ("v64", 2), ("n64", 4)])
+def test_splat_setup_accepts_n64_rom_byte_orders(tmp_path, byte_order, width):
+    from decompnet.app.forkroom import game_identity
+    from decompnet.forks.project import ForkError, ForkProject
+
+    original = b"\x80\x37\x12\x40" + bytes(range(256)) * 4097
+    expected = hashlib.sha1(original).hexdigest()
+    (tmp_path / "Makefile").write_text("all:\n\t@true\n")
+    (tmp_path / "game.yaml").write_text(
+        f"options:\n  target_path: baserom.z64\nsha1: '{expected}'\nsegments: []\n")
+    supplied = b"".join(original[i:i + width][::-1] for i in range(0, len(original), width))
+    source = tmp_path / f"my-copy.{byte_order}"
+    source.write_bytes(supplied)
+    assert game_identity(source) == expected  # rooms agree even when members supply different byte orders
+
+    project = ForkProject(tmp_path)
+    assert project.kind() == "splat"
+    assert ".v64 or .n64" in project.needs()["help"]
+    assert project.place_game(source, source.name).read_bytes() == original
+    assert source.read_bytes() == supplied
+    assert not list(tmp_path.glob(".rom-*"))
+
+    wrong = tmp_path / f"other-copy.{byte_order}"
+    wrong.write_bytes(supplied[:-4] + b"\0" * 4)
+    with pytest.raises(ForkError, match="sha1 doesn't match"):
+        project.place_game(wrong, wrong.name)
+
+    incomplete = tmp_path / f"incomplete.{byte_order}"
+    incomplete.write_bytes(supplied[:-1])
+    with pytest.raises(ForkError, match="truncated"):
+        project.place_game(incomplete, incomplete.name)
+
+
+@pytest.mark.parametrize("byte_order,width", [("v64", 2), ("n64", 4)])
+def test_splat_setup_normalizes_without_a_hash_and_removes_converted_upload(tmp_path, byte_order, width):
+    from decompnet.forks.project import ForkProject
+
+    original = b"\x80\x37\x12\x40" + bytes(range(256)) * 8
+    supplied = b"".join(original[i:i + width][::-1] for i in range(0, len(original), width))
+    (tmp_path / "Makefile").write_text("all:\n\t@true\n")
+    (tmp_path / "game.yaml").write_text("options:\n  target_path: baserom.z64\nsegments: []\n")
+    upload = tmp_path / ".decomp-wtf" / "upload.tmp"
+    project = ForkProject(tmp_path)
+    upload.write_bytes(supplied)
+    assert "project's build" in project.needs()["help"]
+    assert project.place_game(upload, upload.name, move=True).read_bytes() == original
+    assert not upload.exists()
+
+
 @pytest.fixture(scope="module")
 def fork(tmp_path_factory):
     base = tmp_path_factory.mktemp("fork")
@@ -56,6 +107,38 @@ def fork(tmp_path_factory):
 
 def _ref(name: str) -> str:
     return csource.get(REFERENCE, name).strip()
+
+
+def test_the_comment_above_a_definition_is_its_own_up_to_a_blank_line_or_a_marker():
+    """A polished function's comment (what it does) goes into its file with it: the lines right above it, never the
+    file's comment past a blank line or a reccmp annotation (`// FUNCTION: 0x...`, the project's own marker)."""
+    text = ("/* the file */\n\n// FUNCTION: 0x00401000\n// Adds them.\n/* Both\n   ints. */\nint add(int a, int b)\n"
+            "{\n    return a + b;\n}\n\n/* not this one's */\n\nint sub(int a, int b) { return a - b; }\n")
+    add, sub = csource.find(text, "add")[0], csource.find(text, "sub")[0]
+    assert text[csource.comment_above(text, add):add] == "// Adds them.\n/* Both\n   ints. */\n"
+    assert csource.comment_above(text, sub) == sub
+    assert csource.comment_above("int f(void) { return 0; }\n", 0) == 0
+    # only reccmp's words are markers: a comment with `// NOTE:` in it was dropped
+    text = "// Sums them.\n// NOTE: wraps at 65521.\nint f(void) { return 0; }\n"
+    assert csource.comment_above(text, text.index("int")) == 0
+    # the annotation right above the comment (a parked definition's, carried with it: ForkEngine._attempt)
+    text = "int g;\n// FUNCTION: 0x00401000 (NONMATCHING: frame size)\n// Adds.\nint add(int a, int b) { return a + b; }\n"
+    lo = csource.comment_above(text, text.index("int add"))
+    assert text[csource.marker_above(text, lo):lo].startswith("// FUNCTION: 0x00401000")
+    assert csource.marker_above(text, text.index("// FUNCTION")) == text.index("// FUNCTION")  # none above it
+
+
+def test_a_wrapper_is_taken_with_the_comment_inside_it():
+    """A polish writes `#pragma push`, the comment, then the definition: the next rewrite's wrapper stopped at the
+    comment and left the file's push behind, never popped."""
+    from decompnet.app.forkengine import _pragmas_around
+
+    text = "int g;\n#pragma push\n#pragma opt 0\n// Adds.\nint f(void) { return 1; }\n#pragma pop\nint h;\n"
+    lo, hi = csource.find(text, "f")
+    assert text[slice(*_pragmas_around(text, lo, hi))] == text[text.index("#pragma push"):text.index("int h")]
+    plain = "int g;\n// Adds.\nint f(void) { return 1; }\n"
+    lo, hi = csource.find(plain, "f")
+    assert _pragmas_around(plain, lo, hi)[0] == lo  # no wrapper: the comment isn't taken
 
 
 @needs_tools
@@ -184,6 +267,47 @@ def test_search_globs_as_agents_write_them():
         list(Path(".").glob(want))  # pathlib takes it (it raised ValueError for the given form)
 
 
+def test_file_scope_is_outside_every_block_but_a_namespace_or_extern_c():
+    """A definition past a parked one is taken only at file scope: find() reads a call followed by a block as one."""
+    text = 'namespace a {\nextern "C" {\nint f(void) {\n    if (x) {\n        g();\n    }\n}\n}\n}\nint h;\n'
+    assert csource.at_file_scope(text, text.index("int f"))
+    assert not csource.at_file_scope(text, text.index("g();"))
+    assert not csource.at_file_scope(text, text.index("    }\n}"))
+    assert csource.at_file_scope(text, text.index("int h"))
+    call = "int t(int x) {\n    y = scale(x) * 2.0;\n    if (y) {\n        y = 1;\n    }\n}\n"
+    assert csource.find(call, "scale") is not None  # (why the check is needed)
+    assert not csource.at_file_scope(call, csource.find(call, "scale")[0])
+
+
+def test_the_definition_the_build_sees_beside_a_parked_one_is_at_file_scope():
+    from types import SimpleNamespace
+
+    from decompnet.app.forkengine import ForkEngine
+
+    fp = SimpleNamespace(never_defined=lambda names: set(names))  # (no build defines PARKED)
+    text = "#ifdef PARKED\nint f(void) {\n    return 2;\n}\n#else\nint f(void) {\n    return 1;\n}\n#endif\n"
+    seen = ForkEngine._seen_beside(fp, text, csource.find(text, "f"), "f", ["f"])
+    assert seen is not None and text[seen[0]:seen[1]] == "int f(void) {\n    return 1;\n}\n"
+    # past the parked copy, a call in g followed by a block isn't the build's definition
+    text = "#ifdef PARKED\nint f(void) {\n    return 2;\n}\n#endif\nint g(void) {\n    x = f() * 2;\n    if (x) {\n    }\n}\n"
+    assert ForkEngine._seen_beside(fp, text, csource.find(text, "f"), "f", ["f"]) is None
+    # nor one at file scope, a C++ initialiser's (find() read `* 2.0;` as K&R declarations, up to twice's `{`): a
+    # try on scale matched, and the file lost both bias and twice
+    text = ('#ifdef PARKED_DRAFTS\nextern "C" double scale(double x) { return x * 1.2; }\n#endif\n'
+            'extern "C" double scale(double x);\nstatic double bias = scale(2.0) * 2.0;\n'
+            'extern "C" double twice(double x) { double y = 0.0; y = scale(x) * 2.0; if (y > 1.0) { y = 1.0; } '
+            'return y; }\n')
+    assert ForkEngine._seen_beside(fp, text, csource.find(text, "scale"), "scale", ["scale"]) is None
+    # and of an #ifdef _WIN32 / #else pair (a macro the app can't tell), neither is surely the build's: the try went
+    # into the _WIN32 copy, maybe the one the build leaves out, and its #else kept being judged
+    text = ("#ifdef PARKED\nint f(void) {\n    return 2;\n}\n#endif\n#ifdef _WIN32\nint f(void) {\n    return 3;\n}\n"
+            "#else\nint f(void) {\n    return 1;\n}\n#endif\n")
+    assert ForkEngine._seen_beside(fp, text, csource.find(text, "f"), "f", ["f"]) is None
+    # a K&R definition isn't taken either (what's between its parameters and its body reads like a call's)
+    assert csource.opens_body("int f(a)\nint a;\n{\n}\n", (0, 20), "f") is False
+    assert csource.opens_body("int Car::f(int a) const throw() {\n}\n", (0, 35), "Car::f")
+
+
 def test_csource_finds_definitions_and_stubs():
     src = ('s32 f(s32 a) {\n    return a; /* } */\n}\nINCLUDE_ASM("asm/nonmatchings/x", g);\n'
            'uLong h(a)\n    uLong a;\n{\n    return a;\n}\nvoid C::m(int x) {\n}\n')
@@ -193,6 +317,45 @@ def test_csource_finds_definitions_and_stubs():
     assert csource.get(src, "C::m").startswith("void C::m")
     assert csource.get(src, "missing") is None
     assert "return 1" in csource.replace(src, "g", "int g(void) { return 1; }")
+
+
+def test_not_in_your_build_names_the_symbol_not_the_rows_unique_name():
+    """A function whose row name was made unique with a trailing "'" (a re-sync after a split) was reported as "its
+    object doesn't define _f@4'": agents spent days saying no C makes a name with a quote, and never looked further."""
+    from types import SimpleNamespace
+
+    from decompnet.app.forkengine import ForkEngine
+
+    fn = {"name": "_f@4'", "meta": json.dumps({"symbol": "_f@4"}), "vram": None}
+    note = ForkEngine._missing_note(SimpleNamespace(name="u", base=None), fn)
+    assert "doesn't define _f@4," in note and "_f@4'" not in note
+
+
+def test_a_cpp_constructor_or_destructor_is_found_as_the_function_it_stands_for():
+    """A PC game's function written as a class named after it: its constructor was found, its destructor wasn't (an
+    agent's func_004D9DD0::~func_004D9DD0 was refused: "send the complete definition of _func_004D9DD0"). C files
+    (every other console's) find what they found before."""
+    from decompnet.app.forkengine import ForkEngine
+
+    names = ForkEngine._names({"symbol": "_func_004D9DD0"}, {"name": "_func_004D9DD0"})
+    dtor = "struct func_004D9DD0 { ~func_004D9DD0(); };\nfunc_004D9DD0::~func_004D9DD0() {\n    func_005F10E0();\n}\n"
+    assert ForkEngine._find(None, dtor, names)[0] == "func_004D9DD0::~func_004D9DD0"
+    ctor = "func_004D9DD0::func_004D9DD0(int x) {\n}\n"
+    assert ForkEngine._find(None, ctor, names)[1] == (0, len(ctor))
+    # a function with a C++ name (a fork's) is found by it, not by a destructor of the same plain name
+    names = ForkEngine._names({"symbol": "??0Foo@@QAE@XZ", "demangled": "Foo::Foo(void)"}, {"name": "??0Foo@@QAE@XZ"})
+    assert not any("~" in n for n in names)
+    assert ForkEngine._find(None, "Foo::~Foo() {\n}\n", names) == (None, None)
+    # C: a definition, not a call or a prototype, and nothing of C reads as a destructor
+    c = "int g(void);\nint f(int a) {\n    return ~g() + a;\n}\n"
+    names = ForkEngine._names({"symbol": "f"}, {"name": "f"})
+    assert names == ["f", "f::~f"] and ForkEngine._find(None, c, names) == ("f", (13, len(c)))
+    assert csource.find(c, "g") is None
+    # the one constructor or destructor a source defines names an unnamed PC function (ForkEngine._attempt)
+    assert csource.structor("struct CFoo { CFoo(); ~CFoo(); };\nCFoo::~CFoo() {\n}\n") == "CFoo::~CFoo"
+    assert csource.structor("A::CFoo::CFoo(int x) : y(x) {\n}\n") == "A::CFoo::CFoo"
+    assert csource.structor("CFoo::CFoo() {}\nCFoo::~CFoo() {}\n") is None  # two: which one is the function?
+    assert csource.structor("void CFoo::Update() {}\nCFoo::CFoo();\n" + c) is None
 
 
 def test_clone_rejects_odd_sources(tmp_path):
@@ -209,6 +372,33 @@ def test_find_similar(fork):
     assert "index covers" in out or "Functions that look like" in out
 
 
+@needs_tools
+def test_the_look_alike_index_is_written_only_when_something_new_is_indexed(fork):
+    # every sync ends an indexing pass; a GameCube game's 11 MB index.json rewritten on each one wrote 50 MB/s
+    from decompnet.forks.project import STATE
+    net, slug, _ = fork
+    proj, fp, _ = net.forks.get(slug)
+    for unit in fp.units():
+        net.forks._unit_index(proj, fp, unit, save=False)
+    net.forks._save_index(proj, fp)
+    path = fp.root / STATE / "index.json"
+    assert json.loads(path.read_text())
+    net.forks._index.pop(proj["id"])  # as after a restart: the index comes back from index.json
+    net.forks._index_of(proj, fp)
+    path.unlink()
+    for unit in fp.units():  # all known already: nothing to write
+        net.forks._unit_index(proj, fp, unit)
+    net.forks._save_index(proj, fp)
+    assert not path.exists()
+    # a compile measures its unit again (the same target): nothing new either
+    from decompnet.app.forkengine import objdiff_diff
+    unit = next(u for u in fp.units() if net.forks._unit_index(proj, fp, u, save=False))
+    symbol = net.forks._unit_index(proj, fp, unit, save=False)["order"][0]
+    net.forks._remember(proj, fp, unit, objdiff_diff(fp, unit, symbol, target_only=True))
+    net.forks._save_index(proj, fp)
+    assert not path.exists()
+
+
 def test_similarity_ranks_copies_first():
     from decompnet import similarity
 
@@ -216,6 +406,52 @@ def test_similarity_ranks_copies_first():
     cands = {"copy": list(a), "tweaked": a[:4] + ["sltu"] + a[5:], "other": ["lui", "ori", "jal", "nop"] * 3}
     ranked = similarity.rank(a, cands, top=3)
     assert [n for n, _ in ranked][:2] == ["copy", "tweaked"] and ranked[0][1] == 1.0
+
+
+def test_a_source_is_rewritten_from_its_first_change_only(tmp_path, monkeypatch):
+    # a compile writes the agent's version of a dtk unit (up to a megabyte) and an undo writes the original back
+    import os
+
+    from decompnet.app import forkengine
+    head = "".join(f"void f{i}(void) {{ }}\n" for i in range(2000))  # ~40 KB the edit doesn't touch
+    before, after = head + "int g(void) { return 1; }\n", head + "int g(void) { return 2; }\nint h;\n"
+    written = []
+
+    class Spy:
+        def __init__(self, f):
+            self.f = f
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.f.close()
+
+        def __getattr__(self, name):
+            return getattr(self.f, name)
+
+        def write(self, data):
+            written.append(len(data))
+            return self.f.write(data)
+    monkeypatch.setattr(forkengine, "open", lambda *a, **k: Spy(open(*a, **k)), raising=False)
+    for linesep in ("\n", "\r\n"):  # what text mode writes on Linux and macOS, and on Windows
+        monkeypatch.setattr(os, "linesep", linesep)
+        p = tmp_path / f"unit{len(linesep)}.c"
+        p.write_bytes(before.replace("\n", linesep).encode())
+        for text in (after, before, before[:100], "", before):  # an edit, its undo, shorter, empty, longer again
+            written.clear()
+            forkengine._rewrite(p, text)
+            assert p.read_bytes() == text.replace("\n", linesep).encode()
+        written.clear()
+        forkengine._rewrite(p, after)
+        assert p.read_bytes() == after.replace("\n", linesep).encode()
+        assert 0 < sum(written) < 8192 < len(head)  # only the block with the change, and what follows it
+        os.utime(p, (1, 1))
+        written.clear()
+        forkengine._rewrite(p, after)  # the same text: nothing written, but a build still sees it as new
+        assert not written and p.stat().st_mtime > 1
+    forkengine._rewrite(tmp_path / "new.c", "int x;\n")
+    assert (tmp_path / "new.c").read_text() == "int x;\n"
 
 
 @pytest.mark.skipif(toolchains.installed("m2c") is None, reason="needs m2c")
@@ -271,6 +507,52 @@ def _dtk_project(root: Path, version: str, config: str) -> None:
     (root / "config" / version / "config.yml").write_text(config)
     (root / "configure.py").write_text("# dtk-template\n")
     (root / "orig" / version).mkdir(parents=True)
+
+
+@pytest.mark.parametrize(("obj", "expected", "got"), [
+    ("main.dol", "9619ba57...", "8fe64b0a..."),
+    ("files/dll/a.rel", "0123456789abcdef0123456789abcdef01234567", "89abcdef0123456789abcdef0123456789abcdef"),
+])
+def test_a_dtk_hash_mismatch_says_the_project_was_built_from_another_copy(tmp_path, monkeypatch, obj, expected, got):
+    """#97: dtk's hash mismatch is correct, but the user's dump is likely fine: some public projects build a main.dol
+    from an ELF or use a .rel module the retail disc doesn't contain. Say that instead of only the ninja output."""
+    from decompnet.forks.project import ForkError, ForkProject
+
+    _dtk_project(tmp_path, "GOWE69", "object: sys/main.dol\nmodules:\n- object: files/dll/a.rel\n")
+    fp = ForkProject(tmp_path)
+    tail = ("[1/2] SPLIT config\\GOWE69\\config.yml\n"
+            "FAILED: [code=1] build/GOWE69/config.json\n"
+            "build\\tools\\dtk.exe dol split config\\GOWE69\\config.yml build\\GOWE69\n"
+            " INFO Loading config\\GOWE69\\config.yml\n"
+            " INFO Loading and analyzing 1 module (using 1 thread)\n"
+            f"Failed: While loading object '{obj}'\n\nCaused by:\n"
+            f"    Hash mismatch: expected {expected}, but was {got}\n"
+            "ninja: error: rebuilding 'build.ninja': subcommand failed")
+    monkeypatch.setattr(fp, "unpack_disc", lambda version, log=print: 0)
+    monkeypatch.setattr(fp, "setup_commands", lambda version=None: [["configure.py"], ["ninja"]])
+    monkeypatch.setattr(fp, "run", lambda cmd, log=print: (False, tail))
+    with pytest.raises(ForkError) as err:
+        fp.setup("GOWE69", log=lambda *_: None)
+    text = str(err.value)
+    assert f"your copy's {obj} isn't the one this project was built against" in text
+    assert f"expects hash {expected[:8]}..." in text and f"yours is {got[:8]}..." in text
+    assert "dump is likely fine" in text and "README" in text
+    assert "your own copy" in text and "New project → Open a game file" in text
+    assert tail in text
+
+
+def test_a_setup_failure_that_isnt_a_dtk_hash_mismatch_keeps_the_plain_message(tmp_path, monkeypatch):
+    from decompnet.forks.project import ForkError, ForkProject
+
+    _dtk_project(tmp_path, "GOWE69", "object: sys/main.dol\n")
+    fp = ForkProject(tmp_path)
+    tail = "configure.py: error: unrecognized arguments: --version GOWE69"
+    monkeypatch.setattr(fp, "unpack_disc", lambda version, log=print: 0)
+    monkeypatch.setattr(fp, "setup_commands", lambda version=None: [["configure.py"], ["ninja"]])
+    monkeypatch.setattr(fp, "run", lambda cmd, log=print: (False, tail))
+    with pytest.raises(ForkError) as err:
+        fp.setup("GOWE69", log=lambda *_: None)
+    assert str(err.value) == f"setup step failed: configure.py\n{tail}"
 
 
 def test_a_project_that_reads_an_extracted_disc_gets_its_files_from_the_disc_image(tmp_path, monkeypatch):
@@ -331,7 +613,7 @@ def test_a_project_made_from_scratch_builds_with_this_computers_tools(tmp_path, 
     (tmp_path / ".decomp.wtf.json").write_text(json.dumps({
         "created": "from scratch", "platform": "win32", "version": "game",
         "setup": [["python", "tools/configure.py", "game", "--msvc", "/elsewhere/msvc"], ["ninja", "prepare"]]}))
-    monkeypatch.setattr(scratch_pe, "tool_args", lambda: ["--msvc", "/here/msvc", "--wibo", "/here/wibo"])
+    monkeypatch.setattr(scratch_pe, "tool_args", lambda kit_ids=(): ["--msvc", "/here/msvc", "--wibo", "/here/wibo"])
     cmds = ForkProject(tmp_path).setup_commands("game")
     assert cmds[0][1:] == ["tools/configure.py", "game", "--msvc", "/here/msvc", "--wibo", "/here/wibo"]
     assert cmds[1] == ["ninja", "prepare"]
@@ -631,3 +913,511 @@ def test_a_match_that_is_lost_gets_its_score_back_so_the_queue_doesnt_say_it_is_
     # and the reopen is in the events, with what measured it and how much it scored
     events = [(r["kind"], r["detail"]) for r in store.all("SELECT kind, detail FROM events")]
     assert events == [("reopen", "F (unit diff before a compile: 52.70%)")]
+
+
+@pytest.mark.parametrize("old_unit,new_unit,kept", [
+    ("text_00443210", "text_00443AE0", True),
+    ("main/old", "main/new", True),
+    ("main/old", "overlay/new", False),
+])
+def test_split_sync_preserves_function_identity(tmp_path, monkeypatch, old_unit, new_unit, kept):
+    from decompnet.forks.project import ForkProject
+
+    net = RomNetwork(tmp_path / "decomp.db", tmp_path / "ws")
+    root = tmp_path / "ws" / "p"
+    root.mkdir(parents=True)
+    (root / "objdiff.json").write_text(json.dumps({"units": []}))
+    net.forks._register("p", "P", "fork", root,
+                        {"kind": "fork", "version": "X", "fork_kind": "objdiff", "ready": False}, "x")
+    report = {"measures": {}, "units": [{"name": old_unit, "functions": [
+        {"name": "func_00443AE0", "size": "190", "fuzzy_match_percent": 100,
+         "metadata": {"virtual_address": "4471520"}}]}]}
+    monkeypatch.setattr(ForkProject, "report", lambda self: report)
+    monkeypatch.setattr(ForkProject, "units", lambda self: [])
+    net.forks.sync("p", log=lambda *_: None)
+    before = net.store.one("SELECT * FROM functions")
+    with net.store.tx() as db:
+        db.execute("INSERT INTO attempts(function_id, agent_id, score, created_at) VALUES(?,NULL,0,0)",
+                   (before["id"],))
+        db.execute("INSERT INTO notes(project_id,function_id,text,created_at) VALUES(?,?,?,0)",
+                   (before["project_id"], before["id"], "retain evidence"))
+    report["units"][0]["name"] = new_unit
+    net.forks.sync("p", log=lambda *_: None)
+    current = net.store.one("SELECT * FROM functions WHERE unit=?", new_unit)
+    assert (current["id"] == before["id"]) is kept
+    if kept:
+        assert current["name"] == before["name"] and current["status"] == "matched"
+        assert len(net.store.all("SELECT * FROM functions")) == 1
+        assert net.store.one("SELECT function_id FROM notes")["function_id"] == current["id"]
+        assert net.store.one("SELECT function_id FROM attempts")["function_id"] == current["id"]
+
+
+
+
+
+def test_a_unit_whose_build_step_fails_counts_as_not_building(tmp_path):
+    """A unit built in steps (here a part compiled, then linked into the unit's object) reports only the step that
+    failed: ninja never tries the object. Counted by the object alone, an x86 game's header edits that broke a step
+    were kept as breaking nothing, and the next compile there was told the file had been broken before it came."""
+    import sys
+
+    from decompnet.forks.project import ForkProject, _tool
+
+    if _tool("ninja") is None:
+        pytest.skip("needs ninja")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "step.py").write_text(
+        "import shutil, sys\n"
+        "if 'BROKEN' in open(sys.argv[1]).read():\n    sys.exit('error: a broken step')\n"
+        "shutil.copy(sys.argv[1], sys.argv[2])\n")
+    for name, text in (("a", "fine\n"), ("b", "BROKEN\n"), ("c", "fine\n")):
+        (tmp_path / "src" / f"{name}.c").write_text(text)
+    py = sys.executable.replace("\\", "/")
+    rules = f'rule step\n  command = "{py}" step.py $in $out\n'
+    for name in "abc":
+        rules += f"build build/{name}/part.o: step src/{name}.c\nbuild build/{name}.o: step build/{name}/part.o\n"
+    rules += "build all_source: phony build/a.o build/b.o build/c.o\n"
+    (tmp_path / "build.ninja").write_text(rules)
+    (tmp_path / "objdiff.json").write_text(json.dumps({"custom_make": "ninja", "units": [
+        {"name": n, "target_path": f"expected/{n}.o", "base_path": f"build/{n}.o",
+         "metadata": {"source_path": f"src/{n}.c"}} for n in "abc"]}))
+    fp = ForkProject(tmp_path)
+    failed: list[str] = []
+    ok, _ = fp.build_all(failed=failed)
+    assert not ok and [Path(t).as_posix() for t in failed] == ["build/b/part.o"]  # the step, not the object
+    assert fp.failed_units(failed) == {"b"}
+    assert fp.failed_units([]) == set()
+    # the build file custom_args names is the one queried (the query ran on build.ninja: no unit failed)
+    (tmp_path / "build.ninja").rename(tmp_path / "other.ninja")
+    cfg = json.loads((tmp_path / "objdiff.json").read_text())
+    (tmp_path / "objdiff.json").write_text(json.dumps({**cfg, "custom_args": ["-f", "other.ninja"]}))
+    shutil.rmtree(tmp_path / "build", ignore_errors=True)
+    fp = ForkProject(tmp_path)
+    failed = []
+    ok, _ = fp.build_all(failed=failed)
+    assert not ok and fp.failed_units(failed) == {"b"}
+    # a build run in a folder of its own (`-C sub`) names its targets from there: b/part.o for sub/b/part.o, which
+    # matched no unit's object; and `ninja -C sub sub/a.o` was an unknown target
+    (tmp_path / "other.ninja").unlink()
+    (tmp_path / "sub").mkdir()
+    rules = f'rule step\n  command = "{py}" ../step.py $in $out\n'
+    for name in "abc":
+        rules += f"build {name}/part.o: step ../src/{name}.c\nbuild {name}.o: step {name}/part.o\n"
+    (tmp_path / "sub" / "build.ninja").write_text(rules + "build all_source: phony a.o b.o c.o\n")
+    (tmp_path / "objdiff.json").write_text(json.dumps({**cfg, "custom_args": ["-C", "sub"], "units": [
+        {**u, "base_path": f"sub/{u['name']}.o"} for u in cfg["units"]]}))
+    fp = ForkProject(tmp_path)
+    failed = []
+    ok, _ = fp.build_all(failed=failed)
+    assert not ok and [Path(t).as_posix() for t in failed] == ["b/part.o"] and fp.failed_units(failed) == {"b"}
+    assert fp.build_unit(fp.unit("a"))[0] and (tmp_path / "sub" / "a.o").exists()
+
+
+
+def test_which_if_branch_leaves_code_out_is_told_only_when_certain():
+    """An x86 game's agents parked drafts in `#if defined(SOME_FLAG)` blocks no build defines; the brief showed them as
+    current and every compile wrote into them, judged on other code. A test of a macro that may be defined (the
+    compiler's own, one the build passes) hides nothing: only what is certain is said."""
+    text = ("int a(void) { return 0; }\n"
+            "#if defined(DRAFTS) || defined(MORE_DRAFTS) // parked\n"
+            "int b(void) { return 1; }\n"
+            "#elif defined(_M_IX86)\n"
+            "int c(void) { return 2; }\n"
+            "#else\n"
+            "int d(void) { return 3; }\n"
+            "#endif\n"
+            "#ifndef DRAFTS\n"
+            "int e(void) { return 4; }\n"
+            "#endif\n"
+            "#if 0\n"
+            "/* #endif */ int f(void) { return 5; }\n"
+            "#endif\n"
+            "#if VERSION >= 2\n"
+            "int g(void) { return 6; }\n"
+            "#endif\n")
+    at = {n: text.index(f"int {n}(") for n in "abcdefg"}
+    undefined = {"DRAFTS", "MORE_DRAFTS"}
+    assert csource.condition_names(text, at["d"]) == {"DRAFTS", "MORE_DRAFTS", "_M_IX86"}
+    hidden = {n: csource.hidden_by(text, at[n], undefined) for n in at}
+    assert hidden["b"] == (2, "#if defined(DRAFTS) || defined(MORE_DRAFTS) // parked")
+    assert hidden["a"] is None and hidden["e"] is None
+    assert hidden["c"] is None and hidden["d"] is None  # _M_IX86 may be defined: either branch may be built
+    assert hidden["f"] == (12, "#if 0")  # an #endif in a comment ends nothing
+    assert hidden["g"] is None  # a comparison can't be told
+    assert csource.hidden_by(text, at["b"], {"DRAFTS"}) is None  # MORE_DRAFTS may be defined
+    # with every macro known, each branch is told: the #elif's is out, the #else's is built
+    assert csource.hidden_by(text, at["c"], undefined | {"_M_IX86"}) == (4, "#elif defined(_M_IX86)")
+    assert csource.hidden_by(text, at["d"], undefined | {"_M_IX86"}) is None
+
+
+
+def test_a_macro_counts_as_never_defined_only_when_nothing_could_define_it(tmp_path):
+    from decompnet.app.forkengine import ForkEngine
+    from decompnet.forks.project import ForkProject
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "include").mkdir()
+    (tmp_path / "build").mkdir()
+    (tmp_path / "src" / "a.c").write_text("#ifdef PARKED\nint f(void) { return 1; }\n#endif\n#if HAS_SOUND\n#endif\n")
+    (tmp_path / "include" / "cfg.h").write_text("#define HAS_SOUND 1\n")
+    (tmp_path / "build.ninja").write_text("cflags = -DFROM_BUILD /DFROM_MSVC\n")
+    (tmp_path / "build" / "flags.txt").write_text("#define PARKED\n")  # build output isn't the project's
+    fp = ForkProject(tmp_path)
+    names = {"PARKED", "HAS_SOUND", "FROM_BUILD", "FROM_MSVC", "_WIN32", "mips", "WIN32"}
+    assert fp.never_defined(names) == {"PARKED"}
+    text = (tmp_path / "src" / "a.c").read_text()
+    assert ForkEngine._hidden(fp, text, text.index("int f")) == (1, "#ifdef PARKED")
+    (tmp_path / "include" / "cfg.h").write_text("#define PARKED\n")
+    assert ForkEngine._hidden(fp, text, text.index("int f")) is None
+    # a header the build generates (build/config.h, which a source includes) can define one: it was taken for never
+    # defined, and code the build compiles for hidden
+    (tmp_path / "build" / "gen").mkdir()
+    (tmp_path / "build" / "gen" / "config.h").write_text("#define HAS_FEATURE 1\n")
+    assert fp.never_defined({"HAS_FEATURE", "NOWHERE"}) == {"NOWHERE"}
+
+
+
+@pytest.mark.parametrize("macro", ["MACH", "R5900"])
+def test_code_under_a_macro_the_compiler_defines_isnt_hidden(tmp_path, macro):
+    """The pinned KMC GCC 2.7.2 defines MACH and EE-GCC 2.96 R5900 (their `-dM -E`): code under `#ifdef MACH` was
+    said to be left out of the build, though it's compiled."""
+    from decompnet.app.forkengine import ForkEngine
+    from decompnet.forks.project import ForkProject
+
+    (tmp_path / "src").mkdir()
+    text = f"#ifdef {macro}\nint f(void) {{ return 1; }}\n#endif\n"
+    (tmp_path / "src" / "a.c").write_text(text)
+    assert ForkEngine._hidden(ForkProject(tmp_path), text, text.index("int f")) is None
+
+
+
+
+
+
+def test_units_built_in_one_run_each_hear_only_their_own_failure(tmp_path, monkeypatch):
+    """A project's unit builds asked for together go in one run of ninja (half a unit's build is the run's own
+    cost), and each unit gets what building it alone would say: a unit ninja says is built is built, and one that
+    isn't is built alone, so a unit whose step failed sees that failure (and buildhelp's hints), never another
+    unit's."""
+    fp = _steps_project(tmp_path, broken="bd")
+    runs = []
+    execute = fp._execute
+    monkeypatch.setattr(fp, "_execute", lambda cmd, *a, **k: runs.append(cmd) or execute(cmd, *a, **k))
+    results = fp.build_units([fp.unit(n) for n in "abcd"])
+    assert len([c for c in runs if "-k" in c]) == 1  # one run, going on past a failure
+    assert len([c for c in runs if "-n" in c]) == 4  # (ninja asked which units are built)
+    assert results == [(True, ""), results[1], (True, ""), results[3]] and not results[1][0] and not results[3][0]
+    assert results[1] == fp.build_unit(fp.unit("b")) and results[3] == fp.build_unit(fp.unit("d"))
+    assert "src/b.c:1: error: a broken step" in results[1][1] and "d.c" not in results[1][1]
+    assert "src/d.c:1: error: a broken step" in results[3][1] and "b.c" not in results[3][1]
+    assert results[1][1].count("error: a broken step") == 1
+    assert (tmp_path / "build/a.o").is_file() and (tmp_path / "build/c.o").is_file()
+    # one unit builds alone, as it always did
+    runs.clear()
+    assert fp.build_units([fp.unit("b")]) == [fp.build_unit(fp.unit("b"))] and len(runs) == 2
+
+
+
+
+def test_a_unit_without_a_failure_of_its_own_is_built_only_when_ninja_says_so(tmp_path, monkeypatch):
+    """A run can stop short of a unit without a failure that names it (the memory cap ends the whole run, a
+    dependency walk cut short): reported built, its old object was judged as its new file's. Ninja is asked; a
+    unit it would still build is built alone, and says what it says."""
+    import sys
+
+    fp = _steps_project(tmp_path, broken="b")
+    py = sys.executable.replace("\\", "/")
+    rules = (f'rule step\n  command = "{py}" step.py $in $out\n'
+             "build build/a/part.o: step src/a.c\nbuild build/a.o: step build/a/part.o\n"
+             "build build/b.o: step src/b.c\n"
+             "build build/c/part.o: step src/c.c\nbuild build/c.o: step build/c/part.o | build/b.o\n")
+    (tmp_path / "build.ninja").write_text(rules)
+    monkeypatch.setattr(fp, "_made_from", lambda targets: set())  # (a walk that found nothing above the step)
+    alone = []
+    build_unit = fp.build_unit
+    monkeypatch.setattr(fp, "build_unit", lambda u, **k: alone.append(u.name) or build_unit(u, **k))
+    results = fp.build_units([fp.unit(n) for n in "abc"])
+    assert results[0] == (True, "")  # a is built, ninja says: it isn't built again
+    assert not results[1][0] and "src/b.c:1: error: a broken step" in results[1][1]
+    assert not results[2][0] and alone == ["b", "c"]  # c needs b's object: ninja didn't build it, so it isn't built
+    # ninja's progress lines as a user set them, or none (a project's --quiet), don't make a unit built
+    from decompnet.forks.project import _tool
+
+    ninja = [_tool("ninja") or "ninja"]
+    monkeypatch.setenv("NINJA_STATUS", "")
+    assert not fp._no_work([*ninja, "--quiet"], ["build/c.o"])
+    assert fp._no_work(ninja, ["build/a.o"])
+
+
+
+
+def test_a_run_ended_by_the_memory_cap_says_nothing_of_its_units(tmp_path, monkeypatch):
+    """The memory cap covers the whole run of several units and kills whichever step is biggest: that step's
+    failure isn't its unit's own. A unit ninja says is built is; the one it killed is built alone (and gets its own
+    verdict there); and a unit whose own build then raises gets the exception alone."""
+    from decompnet.forks import project
+
+    fp = _steps_project(tmp_path, broken="bc")
+    monkeypatch.setattr(project, "killed_for_memory", lambda code: code not in (0, None))
+    build_unit = fp.build_unit
+
+    def alone(u, **k):
+        if u.name == "c":
+            raise PermissionError("ninja.exe is in use")
+        return build_unit(u, **k)
+
+    monkeypatch.setattr(fp, "build_unit", alone)
+    results = fp.build_units([fp.unit(n) for n in "abc"])
+    assert results[0] == (True, "") and not results[1][0] and isinstance(results[2], PermissionError)
+    assert "more memory than decompdecomp allows" in results[1][1]
+
+
+
+
+def test_a_unit_build_that_hangs_with_its_output_open_is_stopped_with_its_compiler(tmp_path, monkeypatch):
+    """A compiler stuck under wibo kept a unit's build, and the project's build lock, forever: its output was read
+    to the end before the time limit was looked at. Stopped, ninja alone went: the compiler it started ran on."""
+    import sys
+    import time
+
+    from decompnet.forks import project
+
+    fp = _steps_project(tmp_path, broken="")
+    py = sys.executable.replace("\\", "/")
+    pid_file = tmp_path / "compiler.pid"
+    (tmp_path / "hang.py").write_text(f"import os, time\nopen({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+                                      "print('compiling', flush=True)\ntime.sleep(60)\n")
+    (tmp_path / "build.ninja").write_text(f'rule hang\n  command = "{py}" hang.py\nbuild build/a.o: hang src/a.c\n'
+                                          "build build/b.o: hang src/b.c\n")
+    monkeypatch.setattr(project, "UNIT_SECONDS", 2)
+    started = time.monotonic()
+    ok, said = fp.build_unit(fp.unit("a"))
+    assert not ok and "didn't finish in 2 seconds" in said  # (ninja holds a step's output until it ends)
+    assert time.monotonic() - started < 20
+    assert not _running(int(pid_file.read_text()))
+    # a run of builds out of time: which unit hung isn't known, so each is built alone, with the whole limit
+    alone = []
+    build_unit = fp.build_unit
+    monkeypatch.setattr(fp, "build_unit", lambda u, **k: alone.append(u.name) or build_unit(u, **k))
+    results = fp.build_units([fp.unit("a"), fp.unit("b")])
+    assert alone == ["a", "b"] and all(not ok and "didn't finish" in said for ok, said in results)
+    assert not _running(int(pid_file.read_text()))
+
+
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows stops the whole tree by force (taskkill /T /F)")
+def test_a_compiler_that_ignores_being_asked_to_stop_is_killed_at_the_time_limit(tmp_path, monkeypatch):
+    """ninja runs each command in a process group of its own: the step's group was killed, and a compiler that
+    ignored SIGTERM outlived its build."""
+    import sys
+    import time
+
+    from decompnet.forks import project
+
+    fp = _steps_project(tmp_path, broken="")
+    pid_file = tmp_path / "compiler.pid"
+    (tmp_path / "stubborn.py").write_text(f"import os, signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                                          f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\ntime.sleep(60)\n")
+    (tmp_path / "build.ninja").write_text(f'rule hang\n  command = "{sys.executable}" stubborn.py\n'
+                                          "build build/a.o: hang src/a.c\n")
+    monkeypatch.setattr(project, "UNIT_SECONDS", 2)
+    started = time.monotonic()
+    ok, said = fp.build_unit(fp.unit("a"))
+    assert not ok and "didn't finish in 2 seconds" in said and time.monotonic() - started < 20
+    pid = int(pid_file.read_text())
+    for _ in range(20):  # (killed, it's gone once its new parent reaps it)
+        if not _running(pid):
+            break
+        time.sleep(0.1)
+    assert not _running(pid)
+
+
+
+
+def test_a_step_that_prints_another_units_failure_doesnt_fail_that_unit(tmp_path):
+    """Each unit's verdict was read from what the run printed: a step's own output saying `FAILED: build/a.o`
+    failed unit a, which builds alone."""
+    import sys
+
+    fp = _steps_project(tmp_path, broken="b")
+    py = sys.executable.replace("\\", "/")
+    (tmp_path / "liar.py").write_text("import shutil, sys\nif 'BROKEN' in open(sys.argv[1]).read():\n"
+                                      "    print('FAILED: build/a.o')\n    sys.exit(1)\nshutil.copy(sys.argv[1], sys.argv[2])\n")
+    (tmp_path / "build.ninja").write_text(f'rule step\n  command = "{py}" liar.py $in $out\n'
+                                          "build build/a.o: step src/a.c\nbuild build/b.o: step src/b.c\n")
+    assert fp.build_unit(fp.unit("a"))[0]
+    results = fp.build_units([fp.unit("a"), fp.unit("b")])
+    assert results[0] == (True, "") and not results[1][0]
+
+
+
+
+def test_a_failed_step_that_makes_two_files_is_one_failure_in_the_log(tmp_path):
+    import sys
+
+    fp = _steps_project(tmp_path, broken="b")
+    py = sys.executable.replace("\\", "/")
+    rules = (f'rule step\n  command = "{py}" step.py $in $out\n'
+             "build build/a/part.o: step src/a.c\nbuild build/a.o: step build/a/part.o\n"
+             "build build/b/part.o build/b/part.map: step src/b.c\n"
+             "build build/b.o: step build/b/part.o | build/b/part.map\n")
+    (tmp_path / "build.ninja").write_text(rules)
+    results = fp.build_units([fp.unit(n) for n in "ab"])
+    assert results[0] == (True, "") and not results[1][0]
+    assert results[1][1].count("error: a broken step") == 1
+
+
+
+
+def test_a_run_that_stops_before_building_builds_each_unit_alone(tmp_path):
+    """ninja stops before it builds anything when the build file can't be brought up to date (configure failing)
+    or a target has no rule: no failure says whose it is, so each unit is built alone and says what it says."""
+    import os
+    import sys
+    import time
+
+    fp = _steps_project(tmp_path, broken="")
+    py = sys.executable.replace("\\", "/")
+    (tmp_path / "regen.py").write_text("import sys\nprint('configure: a driver it cannot read')\nsys.exit(1)\n")
+    text = (tmp_path / "build.ninja").read_text()
+    (tmp_path / "build.ninja").write_text(
+        f'rule regen\n  command = "{py}" regen.py\n  generator = 1\nbuild build.ninja: regen facts.txt\n{text}')
+    (tmp_path / "facts.txt").write_text("changed\n")
+    os.utime(tmp_path / "facts.txt", (time.time() + 5, time.time() + 5))  # newer than build.ninja
+    results = fp.build_units([fp.unit("a"), fp.unit("b")])
+    assert [ok for ok, _ in results] == [False, False]
+    assert all("configure: a driver it cannot read" in log for _, log in results)
+
+
+
+
+def test_builds_asked_for_during_a_run_go_together_in_the_next():
+    """The permuter's four workers and the agents took turns one unit at a time. A build asked for while a run
+    goes waits for the next run (this one may be building an older copy of its file), together with the others
+    asked for meanwhile; an error reaches each of its run, and the next run goes on."""
+    import threading
+    import time
+
+    from decompnet.app.forkengine import _UnitBuilds
+
+    # a unit whose own build raised (build_units puts the exception in its place): its caller alone hears it
+    own = _UnitBuilds()
+    assert own.build("a", lambda units: [(True, "")] if units == ["a"] else None) == (True, "")
+    try:
+        _UnitBuilds().build("b", lambda units: [OSError("b's own")])
+        raise AssertionError("b's error was lost")
+    except OSError as e:
+        assert str(e) == "b's own" and e.__cause__ is None
+
+    builds, runs = _UnitBuilds(), []
+    first, release = threading.Event(), threading.Event()
+
+    def run(units):
+        runs.append(list(units))
+        if units == ["a"]:
+            first.set()
+            assert release.wait(10)
+        if "boom" in units:
+            raise OSError("the build stopped")
+        return [(True, f"built {u}") for u in units]
+
+    got = {}
+
+    def ask(u):
+        try:
+            got[u] = builds.build(u, run)
+        except OSError as e:
+            got[u] = e
+
+    threads = [threading.Thread(target=ask, args=("a",))]
+    threads[0].start()
+    assert first.wait(10)
+    for u in "bcd":  # while a's run goes
+        threads.append(threading.Thread(target=ask, args=(u,)))
+        threads[-1].start()
+    deadline = time.monotonic() + 10
+    while len(builds._queue) < 3 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    release.set()
+    for t in threads:
+        t.join(10)
+    assert runs[0] == ["a"] and sorted(runs[1]) == ["b", "c", "d"] and len(runs) == 2
+    assert got == {u: (True, f"built {u}") for u in "abcd"}
+    t = threading.Thread(target=ask, args=("boom",))
+    t.start()
+    t.join(10)
+    assert isinstance(got["boom"], OSError) and builds.build("e", run) == (True, "built e")
+    # every unit of a run that raised hears it, each thread with an exception of its own
+    first.clear()
+    release.clear()
+
+    def slow_boom(units):
+        if not first.is_set():
+            first.set()
+            assert release.wait(10)
+            return [(True, "")] * len(units)
+        raise OSError("the build stopped")
+
+    errors = {}
+
+    def ask_boom(u):
+        try:
+            builds.build(u, slow_boom)
+        except OSError as e:
+            errors[u] = e
+
+    threads = [threading.Thread(target=ask_boom, args=(u,)) for u in ("x", "y", "z")]
+    threads[0].start()
+    assert first.wait(10)
+    for t in threads[1:]:
+        t.start()
+    deadline = time.monotonic() + 10
+    while len(builds._queue) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    release.set()
+    for t in threads:
+        t.join(10)
+    assert set(errors) == {"y", "z"} and errors["y"] is not errors["z"]
+    assert errors["y"].__cause__ is errors["z"].__cause__ and str(errors["y"]) == "the build stopped"
+
+
+def _steps_project(tmp_path: Path, broken: str = "b"):
+    """Units a, b, c, d, each built in two steps (a part, then its object); the step of the units in `broken` fails
+    with an error naming its file."""
+    import sys
+
+    from decompnet.forks.project import ForkProject
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "step.py").write_text(
+        "import shutil, sys\n"
+        "if 'BROKEN' in open(sys.argv[1]).read():\n    print(sys.argv[1] + ':1: error: a broken step')\n"
+        "    sys.exit(1)\n"
+        "shutil.copy(sys.argv[1], sys.argv[2])\n")
+    for name in "abcd":
+        (tmp_path / "src" / f"{name}.c").write_text("BROKEN\n" if name in broken else "fine\n")
+    py = sys.executable.replace("\\", "/")
+    rules = f'rule step\n  command = "{py}" step.py $in $out\n'
+    for name in "abcd":
+        rules += f"build build/{name}/part.o: step src/{name}.c\nbuild build/{name}.o: step build/{name}/part.o\n"
+    (tmp_path / "build.ninja").write_text(rules)
+    (tmp_path / "objdiff.json").write_text(json.dumps({"custom_make": "ninja", "units": [
+        {"name": n, "target_path": f"expected/{n}.o", "base_path": f"build/{n}.o",
+         "metadata": {"source_path": f"src/{n}.c"}} for n in "abcd"]}))
+    return ForkProject(tmp_path)
+
+
+
+
+def _running(pid: int) -> bool:
+    import os
+
+    if os.name == "nt":
+        listed = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True).stdout
+        return f" {pid} " in listed
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True

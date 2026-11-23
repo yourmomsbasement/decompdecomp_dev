@@ -4,37 +4,38 @@
 
 from __future__ import annotations
 
-import json
 import threading
 import time
 from pathlib import Path
 
-from ... import scoring
+from ... import consoles, scoring
 from ...network import MACHINE_AGENTS, WAITING, Agent, Network, NetworkError, stall_line
-from ...rom import match, split
 from ...rom.symbols import SymbolTable
 from .common import _AUTO_TOKEN, BATCH_INSNS
 
 
 class JudgeMixin:
-    def _rom_target(self, fn) -> match.RomTarget:
+    def _rom_target(self, fn):
         cfg = self.cfg(self.store.one("SELECT config FROM projects WHERE id=?", fn["project_id"]))
-        return match.RomTarget(fn["name"], fn["vram"], fn["target"], match.RomTarget.relocs_from_json(json.loads(fn["relocs"])),
-                               cfg.get("big_endian", True), cfg.get("gp", 0))
+        return consoles.of(cfg).target_from_row(fn, cfg)
 
-    def _make_target(self, proj, rf: split.RomFunction, syms: SymbolTable) -> match.RomTarget:
+    def _make_target(self, proj, rf, syms: SymbolTable):
         cfg = self.cfg(proj)
-        return match.target_from_split(rf, syms.resolve, cfg.get("big_endian", True), cfg.get("gp", 0))
+        return self.console(proj).target_from_split(rf, syms.resolve, cfg.get("big_endian", True), cfg.get("gp", 0))
 
     def _target_obj(self, fn, proj):
         if not self.is_rom(proj):
-            return super()._target_obj(fn, proj)
-        return match.canonical_target(self._rom_target(fn), self.symbols(proj["id"]))
+            obj = super()._target_obj(fn, proj)
+        else:
+            obj = self.console(proj).target_object(fn, self.cfg(proj), self.symbols(proj["id"]))
+        obj.cpu = self.console(proj).cpu_variant  # the diff reads a PSP's VFPU with its own reader (arch/)
+        return obj
 
     def _evaluate(self, fn, proj, obj: bytes):
         if not self.is_rom(proj):
             return super()._evaluate(fn, proj, obj)
-        res = match.link(obj, fn["name"], self._rom_target(fn), self.symbols(proj["id"]), self.reader(proj))
+        console = self.console(proj)
+        res = console.link_function(obj, fn["name"], self._rom_target(fn), self.symbols(proj["id"]), self.reader(proj, fn))
         return res.candidate, res.exact if res.candidate is not None else None, res.problems
 
     def rename_tokens(self, proj, text: str) -> str:
@@ -50,9 +51,9 @@ class JudgeMixin:
             return super().claim(agent, project, function, strategy)
         if function:
             function = self._function(function, project)["name"]
-        name = link.claim(agent, function, strategy)
-        if name is None:
-            return "Nothing left to claim in this room — every open function is matched or someone is on it. 🎉"
+        name, why = link.claim(agent, function, strategy)
+        if name is None:  # (the host's word: what's left and why, as its own agents hear it)
+            return why or "Nothing left to claim in this room — every open function is matched or someone is on it. 🎉"
         link.sync()
         fn = self.claim_row(agent, project, name, strategy)
         return self._brief(fn, agent, header="CLAIMED")
@@ -133,6 +134,22 @@ class JudgeMixin:
             time.sleep(0.2)
 
     def attempt(self, agent: Agent, function: str, source: str, project: str | None = None) -> dict:
+        fn = self._function(function, project)
+        slug = self.store.one("SELECT slug FROM projects WHERE id=?", fn["project_id"])["slug"]
+        with self.progress.judging(slug):
+            return self._attempt(agent, function, source, project)
+
+    def _record(self, fn, *args, **kwargs):
+        slug = self.store.one("SELECT slug FROM projects WHERE id=?", fn["project_id"])["slug"]
+        with self.progress._project_lock(slug):
+            # attempt()'s judging block already read progress just before this record; a second full read here made
+            # every compile check the folder twice before and once after.
+            if not self.progress.applying and not getattr(self.progress.local, "judging", None):
+                self.progress.sync(slug, force=True)
+            self.progress.check_result()
+            return super()._record(fn, *args, **kwargs)
+
+    def _attempt(self, agent: Agent, function: str, source: str, project: str | None = None) -> dict:
         self._yield_autopilot(function, project)
         if (fork := self.fork_slug(project)):
             return self.forks.attempt(agent, fork, function, source)
@@ -268,8 +285,12 @@ class JudgeMixin:
             return None  # compile_and_diff said to move on
         pushed = self.store.one("SELECT 1 FROM events WHERE agent_id=? AND kind='release_pushed' AND detail=? AND "
                                 "created_at >= ?", agent.id, fn["name"], progress["claimed_at"])
-        if n and pushed is not None:
-            return None  # asked again after the push-back, having tried it: it goes through
+        from ..function_parts import release_owed
+
+        slug = self.store.one("SELECT slug FROM projects WHERE id=?", fn["project_id"])["slug"]
+        owed = release_owed(self, slug, fn, agent, progress) if n else None
+        if n and pushed is not None and owed is None:
+            return None  # asked again after the push-back, having tried it: it goes through (a big one: see owed)
         fork = self.fork_slug(project)
         try:
             exempt = self.forks.release_exempt(fork, fn) if fork else self._rom_release_exempt(fn)
@@ -293,8 +314,8 @@ class JudgeMixin:
                  + "; fix structure and calls first, registers last.",
                  *hints,
                  ("Compile it (a release with no compile isn't taken)." if not n else
-                  f"release_function goes through at {after} compiles in a row without a better score, or if you "
-                  "ask again now with notes saying why it can't get closer.")
+                  f"release_function goes through at {after} compiles in a row without a better score, or " +
+                  (owed if owed else "if you ask again now with notes saying why it can't get closer."))
                  + " If it needs another function done first, release_function(..., needs=\"<that function>\") "
                  "records that, puts that one first in the queue and hands it to you."]
         return "\n".join(lines)

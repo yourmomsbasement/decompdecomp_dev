@@ -1,14 +1,17 @@
 """The connector: how decompdecomp talks to a helper agent. Every agent the app can start is a module in this folder
-(agents/claude.py, codex.py, antigravity.py, opencode.py, api.py) that makes an `Agent` below and fills in its parts;
-the list at the end of this file registers them. The rest of the app (the helpers' manager in app/agents.py, the
-routes, the GUI) asks the agent of a helper, `agents.get(kind)`, and never compares agent names. A person or an agent
-adding support for another agent reads its module and this file, nothing else.
+(agents/claude.py, codex.py, cursor.py, kimi.py, antigravity.py, opencode.py, zcode.py, ohmy.py, api.py) that makes
+an `Agent` below and fills in its parts; the list at the end of this file registers them. The rest of the app (the
+helpers' manager in
+app/agents.py, the routes, the GUI) asks the agent of a helper, `agents.get(kind)`, and never compares agent names.
+A person or an agent adding support for another agent reads its module and this file, nothing else.
 
 An agent is one of two sorts:
-- A program the user installs and signs in to (Claude Code, Codex, Antigravity CLI, opencode). The app runs it
-  headless, once per session, in a private working folder, connected only to the app's own MCP endpoint on 127.0.0.1
-  with a token of its own (`session_command`): MCP is the app's private wiring to it. The prompt goes in on stdin
-  (`stdin`); what it prints, one JSON object a line, is read into the helper's feed (`parse`).
+- A program the user installs and signs in to (Claude Code, Codex, Antigravity CLI, opencode, ZCode CLI, Oh My Pi). The
+  app runs it headless, once per session, in a private working folder, connected only to the app's own MCP endpoint on
+  127.0.0.1 with a token of its own (`session_command`): MCP is the app's private wiring to it. The prompt goes in
+  on stdin (`stdin`), or in a file the agent is given by path when its CLI has no stdin prompt (`prompt_file`,
+  zcode's `--attach`), never as text on the command line; what it prints, one JSON object a line, is read into the
+  helper's feed (`parse`).
 - An agent built into the app (the API helper): no program, a loop in the app that talks to a model's API itself and
   calls the tools directly (`run`).
 
@@ -63,8 +66,20 @@ def _node() -> str | None:
 
 def cli_argv(argv: list[str]) -> list[str]:
     """Run npm's Windows shim through Node directly: cmd.exe would reinterpret quoted MCP config and shell symbols."""
+    if os.name == "nt" and sys.platform != "win32":
+        return argv  # a POSIX test simulating Windows must not construct WindowsPath
     shim = Path(argv[0])
-    if sys.platform != "win32" or shim.suffix.lower() != ".cmd":
+    if sys.platform != "win32":
+        node = shim.parent / "node"
+        if node.is_file() and os.access(node, os.X_OK):
+            try:
+                with shim.open("rb") as script:
+                    if script.readline(256).strip() == b"#!/usr/bin/env node":
+                        return [str(node), *argv]
+            except OSError:
+                pass
+        return argv
+    if shim.suffix.lower() != ".cmd":
         return argv
     try:
         text = shim.read_text(encoding="utf-8")
@@ -100,6 +115,7 @@ class Agent:
     tool_meta: dict = {}  # what it reads on the definition of each of decompdecomp's MCP tools (tools.ALWAYS_LOAD)
     recommended = False  # the launcher lists it first, and starts on it until the user picks another
     uses_endpoints = False  # its model and key come from the API endpoints saved in Agents & models, not a sign-in
+    uses_accounts = False  # named sign-ins in separate configuration directories
     takes_effort = False  # the launcher offers a reasoning effort: with the model's name ("provider/model#high"), or
     # for an agent whose model is an endpoint's, as the helper's `effort` option
     efforts: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")  # the efforts it offers, when it takes one
@@ -111,7 +127,7 @@ class Agent:
         """What the GUI shows about it, before what app/agents.py `detect` finds out (installed, version, models)."""
         return {"id": self.id, "name": self.name, "vendor": self.vendor, "signin": self.signin, "docs": self.docs,
                 "install": self.install_text(), "recommended": self.recommended, "uses_endpoints": self.uses_endpoints,
-                "takes_effort": self.takes_effort, "efforts": list(self.efforts)}
+                "uses_accounts": self.uses_accounts, "takes_effort": self.takes_effort, "efforts": list(self.efforts)}
 
     def install_text(self) -> str:
         return (self.windows_install or self.install) if sys.platform == "win32" else self.install
@@ -170,10 +186,31 @@ class Agent:
         """The models in what `<path> <models_args>` printed, a line each: [{"id", "name", "note"}]."""
         return []
 
+    def session_environment(self, options: dict, env: dict) -> dict:
+        """The child's environment after applying this helper's saved account, if this agent supports accounts."""
+        return env
+
+    def account_signin(self, config_dir: str) -> str:
+        """A terminal command to sign in to one isolated account; credentials stay with the agent CLI."""
+        return ""
+
+    def default_model(self, options: dict) -> str | None:
+        return self.config_model()
+
+    def signin_for(self, options: dict) -> str:
+        return self.signin
+
     def config_model(self) -> str | None:
         """The model the user set as default in the agent's own settings, if any: a helper started without a model
-        is named after it."""
+        starts on it, as resolve_model makes it an id its CLI takes, and records it so that a later change of that
+        default doesn't switch the helper (#204)."""
         return None
+
+    def resolve_model(self, model: str, path: str | None) -> str:
+        """`model`, a name the agent's own settings hold, as the model id its own command line takes; "" when that
+        can't be told without running its program. Then a helper started on that default isn't pinned to it: it
+        starts on the CLI's own default, as before (#204)."""
+        return model
 
     # ------------------------------------------------------------------ one session of a program the app runs
 
@@ -188,6 +225,15 @@ class Agent:
         """What goes in on stdin: the prompt, as the agent reads it. Never on the command line: no length limit, and
         nothing in it is parsed."""
         return prompt
+
+    def launch_command(self, cmd: list[str]) -> list[str]:
+        """Adapt a resolved CLI launcher before the helper process starts."""
+        return cmd
+
+    def prompt_file(self, workdir: Path, prompt: str) -> Path | None:
+        """The file holding the prompt for an agent that reads it by path (zcode's `--attach`), or None: the prompt
+        goes in on stdin, as it does for every other agent. The prompt's text never goes on the command line."""
+        return None
 
     def parse_line(self, line: str, state: dict | None = None) -> list[tuple[str, str]]:
         """(type, text) items for the helper's feed from one line the agent printed: the same for every agent (a line
@@ -230,7 +276,8 @@ class Agent:
 # ---------------------------------------------------------------------------------- what the agents' modules share
 # Reading what an agent prints (`parse`), and its own settings file (`config_model`).
 
-_TOOL_PREFIXES = ("mcp__decomp__", "mcp_decomp_", "decomp_agent.", "decomp_agent__", "decomp__", "decomp_", "decomp.")
+_TOOL_PREFIXES = ("mcp__decomp__", "mcp__decomp_", "mcp_decomp_", "decomp_agent.", "decomp_agent__", "decomp__",
+                  "decomp_", "decomp.")
 ARG_CHARS = 40  # an argument longer than this is cut in the feed
 
 
@@ -298,10 +345,14 @@ def _registry() -> list[Agent]:
     from .api import API
     from .claude import CLAUDE
     from .codex import CODEX
+    from .cursor import CURSOR
+    from .kimi import KIMI
+    from .ohmy import OMP
     from .opencode import OPENCODE
+    from .zcode import ZCODE
 
     # the order the Agents page lists them in (the launcher puts the recommended one first)
-    return [CLAUDE, CODEX, ANTIGRAVITY, OPENCODE, API]
+    return [CLAUDE, CODEX, CURSOR, KIMI, ANTIGRAVITY, OPENCODE, ZCODE, OMP, API]
 
 
 AGENTS: list[Agent] = _registry()

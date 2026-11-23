@@ -38,7 +38,8 @@ window.addEventListener("pywebviewready", () => {
    presses one of its buttons swallows the click (Dismiss on a suggestion did nothing while 8 agents worked). */
 const setHtml = (el, html) => { if (el._html !== html) { el.innerHTML = html; el._html = html; } };
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
-const hex8 = (n) => "0x" + (n >>> 0).toString(16).toUpperCase().padStart(8, "0");
+// (an address above 4 GB, a 64-bit PC game's, keeps its digits: 0x140001000)
+const hex8 = (n) => "0x" + (n > 0xffffffff ? n.toString(16) : (n >>> 0).toString(16)).toUpperCase().padStart(8, "0");
 const clock = (t) => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
 const pctOf = (best, insns) => (best == null ? null : Math.max(0, 1 - best / Math.max(1, insns * 100)));
 /* A match percentage that never reads 100% before the function really matches (99.6% stays 99.6%). */
@@ -99,13 +100,44 @@ function toast(html, kind = "") {
 }
 
 const JOB_POLL_MS = 500;
+/* Keep the indicator and controls tied to this panel's elements: a dialog can be closed or replaced while its
+   request is pending. Call the returned cleanup in finally, including when starting the job fails. */
+function beginWork(log, label, controls = [], completed = "Finished.") {
+  let status = log._workStatus;
+  if (!status) {
+    status = document.createElement("p");
+    status.className = "muted small";
+    status.setAttribute("role", "status");
+    log.before(status);
+    log._workStatus = status;
+  }
+  status.textContent = `${label}…`;
+  status.dataset.state = "running";
+  const bar = document.createElement("div");
+  bar.className = "workbar";
+  bar.setAttribute("role", "progressbar");
+  bar.setAttribute("aria-label", label);
+  bar.append(document.createElement("i"));
+  log.before(bar);
+  const disabled = controls.map((control) => control.disabled);
+  controls.forEach((control) => { control.disabled = true; });
+  return () => {
+    bar.remove();
+    if (status.dataset.state === "running") {
+      status.textContent = completed;
+      status.dataset.state = "done";
+    }
+    controls.forEach((control, index) => { control.disabled = disabled[index]; });
+  };
+}
+
 async function followJob(id, logEl, onUpdate) {
   for (;;) {
     const job = await api(`/api/job?id=${id}`);
     if (logEl) { logEl.textContent = job.log.join("\n"); logEl.scrollTop = logEl.scrollHeight; }
-    if (onUpdate) onUpdate(job.log);
+    if (onUpdate) onUpdate(job.log, job);
     if (job.state === "done") return job.result;
-    if (job.state === "error") { const err = new Error(job.error); err.job = job; throw err; }
+    if (job.state === "error" || job.state === "cancelled") { const err = new Error(job.error || "Cancelled."); err.job = job; throw err; }
     await sleep(JOB_POLL_MS);
   }
 }
@@ -114,24 +146,59 @@ async function followJob(id, logEl, onUpdate) {
    (`message` ""): a toast is gone before it's read. A fork of a repository that doesn't exist sat on "cloning …"
    for good, and a join with a wrong link showed an empty box. */
 function showJobError(logEl, message) {
-  let box = logEl.previousElementSibling;
-  if (!box || !box.classList.contains("err-msg")) {
+  const summary = (message || "").split("\n")[0];
+  if (message && logEl._workStatus) {
+    logEl._workStatus.textContent = summary;
+    logEl._workStatus.dataset.state = "error";
+  }
+  let box = logEl._errorBox;
+  if (!box) {
     box = document.createElement("p");
     box.className = "err-msg";
     box.setAttribute("role", "alert");
     logEl.before(box);
+    logEl._errorBox = box;
   }
   box.hidden = !message;
-  box.textContent = message || "";
-  if (message) logEl.hidden = !logEl.textContent.trim();
-  else { logEl.textContent = ""; logEl.hidden = false; }
+  box.textContent = summary;
+  if (message) {
+    // The exception may repeat the streamed tail. Keep any new detail after the existing lines.
+    const current = logEl.textContent.trim();
+    const extra = message.split("\n").slice(1).filter((line) => line.trim() && !current.includes(line));
+    logEl.textContent = [current, extra.join("\n")].filter(Boolean).join("\n\n");
+    logEl.hidden = !logEl.textContent;
+    if (logEl.textContent && !logEl._copyToolbar) {
+      const toolbar = document.createElement("div");
+      toolbar.className = "row joblog-toolbar";
+      const label = document.createElement("b");
+      label.textContent = "Job log";
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "ghost small-btn";
+      button.textContent = "Copy log";
+      button.onclick = async () => {
+        if (await copyText(logEl.textContent)) toast("Log copied.");
+        else toast("Could not copy the log. Select the log text and copy it manually.", "err");
+      };
+      toolbar.append(label); toolbar.append(button);
+      logEl.before(toolbar);
+      logEl._copyToolbar = toolbar;
+    }
+    if (logEl._copyToolbar) logEl._copyToolbar.hidden = !logEl.textContent;
+  } else {
+    logEl.textContent = "";
+    logEl.hidden = false;
+    if (logEl._copyToolbar) logEl._copyToolbar.hidden = true;
+  }
 }
 
 /* The map's still cells are drawn once into `base` (again only when one of them changes); a frame copies it and
    draws just what moves on top: the functions being worked on, fresh matches, the selection. A big game is tens of
-   thousands of cells, and redrawing them all 60 times a second while agents or autopilot work made the app lag. */
-let base = null, baseDirty = true, moving = [];
-function mapChanged() { baseDirty = true; }
+   thousands of cells, and redrawing them all 60 times a second while agents or autopilot work made the app lag.
+   `mapChanged(i)`: only cell i changed (a claim, a better score), redrawn alone: all 28,900 of a big game were
+   redrawn after each poll that brought one. */
+let base = null, baseDirty = true, moving = [], dirtyCells = new Set();
+function mapChanged(i) { if (i == null) baseDirty = true; else dirtyCells.add(i); }
 
 /* ------------------------------------------------------------------ theme */
 const THEME_KEY = "decomp-wtf-theme";

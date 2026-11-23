@@ -17,7 +17,6 @@ import argparse
 import json
 import re
 import shutil
-import sqlite3
 import subprocess
 import sys
 from pathlib import Path

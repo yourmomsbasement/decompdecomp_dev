@@ -66,3 +66,36 @@ def test_a_variant_that_reproduces_an_earlier_score_says_which_compile_it_equals
     note = net.same_score_note(fn["id"], a.id, 1001, "int f(){return 3;}")
     assert "Same score as your compile #1 of this claim (1001)" in note
     assert net.same_score_note(fn["id"], a.id, 900, "int f(){return 2;}") == ""  # its own row only
+
+
+def test_an_edit_of_one_units_source_doesnt_clear_every_repeat(tmp_path):
+    """A fork compile's key holds its unit's whole text, so an edit of a unit's own source changes only that unit's
+    keys. Clearing every agent's repeats on it (a PS4 game: once every 39 s) built 4,657 of an agent's own repeats
+    again, 12% of all compiles. A header still starts a new generation."""
+    net, pid = _game(tmp_path, [("f", 10, "open")])
+    fn = net.store.one("SELECT * FROM functions WHERE name='f'")
+    key = net.compile_key(fn, "unit text")
+    with net.store.tx() as db:
+        net._event(db, pid, None, "source", "src/other.c: an agent's edit")
+    assert net.compile_key(fn, "unit text") == key
+    with net.store.tx() as db:
+        net._event(db, pid, None, "context", "include/common.h: a struct")
+    assert net.compile_key(fn, "unit text") != key
+
+
+def test_edit_file_starts_a_new_generation_for_shared_files_only(tmp_path):
+    from types import SimpleNamespace
+
+    from decompnet.app.forkengine import ForkEngine
+
+    bumps = []
+    engine = ForkEngine.__new__(ForkEngine)
+    engine.net = SimpleNamespace(links={}, bump_generation=bumps.append)
+    unit = SimpleNamespace(base=tmp_path / "a.o")
+    fp = SimpleNamespace(root=tmp_path, safe_path=lambda rel, write=False: tmp_path / rel,
+                         units_for=lambda rel: [unit] if rel.endswith(".c") else [])
+    engine.get = lambda slug: (dict(id=3), fp, {})
+    engine._edit_source = lambda *a: "source edited"
+    engine._edit_shared = lambda *a: "header edited"
+    assert engine.edit_file(SimpleNamespace(), "demo", "src/a.c", "x", "y") == "source edited" and bumps == []
+    assert engine.edit_file(SimpleNamespace(), "demo", "include/a.h", "x", "y") == "header edited" and bumps == [3]

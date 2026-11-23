@@ -25,15 +25,18 @@ import json
 import logging
 import queue
 import random
+import re
 import subprocess
+import tempfile
 import threading
 import time
 from concurrent.futures import wait
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .. import consoles, scoring, seeds, toolchains
-from ..forks import csource
+from .. import consoles, permuter_gen, scoring, seeds, toolchains
+from ..forks import csource, objdiff
 from ..hostenv import NO_WINDOW
 from ..network import NetworkError
 from ..permuter import mutate
@@ -55,10 +58,16 @@ REWRITE_MISSES = 200  # simple rewrites in a row that change nothing: none appli
 MAX_INSNS = 400  # bigger near misses are left to agents: one variant takes too long to judge
 IDLE_SECONDS = 180  # with no near misses, how long until the permuter looks again
 IDLE_LOOKS = 20  # looks in a row with nothing to do (an hour) and it's done until agents start again
-HOLD_SPARE_SECONDS = 120  # a turn's hold on a function lasts this much longer than the turn, in case it runs over
+_NAME = re.compile(r"[A-Za-z_]\w*")
+_CXX = re.compile(r"::|\btemplate\s*<|\b(?:class|operator|static_cast|reinterpret_cast|this)\b")
+_COMMENT_OR_STRING = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'', re.S)
+HOLD_SPARE_SECONDS = 120
+PREVIEW_FAILED = -1  # a variant whose scratch build failed (permute._preview)
+PREVIEW_TRIES = 3  # a turn's first previews that all fail to build: previews off for that turn (the build, not the C)  # a turn's hold on a function lasts this much longer than the turn, in case it runs over
 _EOF = object()
 # decomp-permuter's weights per compiler (its default_weights.toml), by the start of a toolchain's id
-FAMILIES = (("ido", "ido"), ("gcc", "gcc"), ("ee-gcc", "gcc"), ("mwc", "mwcc"))
+FAMILIES = (("ido", "ido"), ("gcc", "gcc"), ("ee-gcc", "gcc"), ("psp-gcc", "gcc"), ("ps3", "gcc"), ("agbcc", "gcc"),
+            ("mwc", "mwcc"))
 
 
 def weight_family(cfg: dict, vram: int | None, fork: bool) -> str:
@@ -71,6 +80,22 @@ def weight_family(cfg: dict, vram: int | None, fork: bool) -> str:
 
 def available() -> bool:
     return toolchains.installed(TOOL) is not None
+
+
+def permuter_header(header: str, source: str) -> str:
+    """The part of `header` the function's C uses (seeds.HeaderIndex), which is all decomp-permuter has to read.
+    One construct pycparser can't read anywhere in the header stopped it on every function: an x86 game's headers
+    are C++ with MSVC's words, thousands of lines of them, where one function needs a few dozen declarations.
+    MSVC's words go first (permuter_gen.msvc_as_c): `struct __declspec(align(16)) CVec4` was a struct named
+    `__declspec` to the reader, so the vector type every near miss used was left out."""
+    index = seeds.HeaderIndex(permuter_gen.msvc_as_c(header))
+    return "\n".join(d.text for d in index.used(_NAME.findall(source)))
+
+
+def is_cxx(source: str) -> bool:
+    """A function written in C++: a method or a scoped name, a template, a class, an operator, a C++ cast, `this`;
+    in its code, not in a comment or a string (`/* this adds one */` is C's)."""
+    return bool(_CXX.search(_COMMENT_OR_STRING.sub(" ", source)))
 
 
 def generator_argv() -> list[str]:
@@ -183,6 +208,7 @@ class Permuter:
     def __init__(self, net):
         self.net = net
         self.jobs: dict[str, State] = {}
+        self._previews: dict[str, list[int]] = {}  # a turn's scratch folder -> [scratch builds that built, that failed]
 
     def status(self, slug: str) -> dict | None:
         st = self.jobs.get(slug)
@@ -241,15 +267,29 @@ class Permuter:
         except Exception as e:  # one odd function must not stop the rest
             log.info("permuter: %s: %s", fn["name"], e, exc_info=True)
 
-    def _hold(self, agent, fn) -> bool:
+    def _hold(self, agent, fn, *, count_turn: bool = True) -> bool:
         now = time.time()
         with self.net.store.tx() as db:
             self.net._expire_claims(db)
             if db.execute("SELECT 1 FROM claims WHERE function_id=?", (fn["id"],)).fetchone():
                 return False
             db.execute("INSERT INTO claims VALUES(?,?,?,?)", (fn["id"], agent.id, now, now + SECONDS + HOLD_SPARE_SECONDS))
-            db.execute("UPDATE functions SET permuted = permuted + 1 WHERE id=?", (fn["id"],))
+            if count_turn:
+                db.execute("UPDATE functions SET permuted = permuted + 1 WHERE id=?", (fn["id"],))
         return True
+
+    def _renew(self, agent, fn) -> bool:
+        """The turn's hold counted from now; False when it's no longer this turn's."""
+        now = time.time()
+        with self.net.store.tx() as db:
+            return db.execute("UPDATE claims SET expires_at=? WHERE function_id=? AND agent_id=? AND expires_at>?",
+                              (now + SECONDS + HOLD_SPARE_SECONDS, fn["id"], agent.id, now)).rowcount > 0
+
+    def _random_seed(self, fn):
+        return f"{fn['id']}-{fn['permuted']}"
+
+    def _turn_deadline(self):
+        return time.monotonic() + SECONDS
 
     def _let_go(self, agent, fn) -> None:
         with self.net.store.tx() as db:
@@ -261,22 +301,35 @@ class Permuter:
         st.add(tried=1)
         st.holding(fn["name"], True)
         fork = self.net.fork_slug(proj["slug"])
-        rng = random.Random(f"{fn['id']}-{fn['permuted']}")
+        rng = random.Random(self._random_seed(fn))
         gen = None
+        held = ExitStack()
         try:
+            if fork:  # its unit is held for the turn and built once at its end, not after every variant (trial_run)
+                held.enter_context(self.net.forks.trial_run(proj, fn["unit"]))
+                # (waiting for another turn on the unit can take most of the hold: it's counted from here, and a hold
+                # that ran out meanwhile, the function an agent's now, ends the turn)
+                if not self._renew(agent, fn):
+                    return
             if available():
-                # (as m2c reads it: what's only for C++ made pycparser refuse GTA San Andreas's whole header)
-                header = seeds.c_only(self.net.forks.permuter_header(fork, fn["name"]) if fork else
-                                      self.net._context(proj["id"], fn["unit"])["header"])
+                # (a C function's as m2c reads it: what's only for C++ made pycparser refuse a PC game's whole
+                # header; a C++ function's with its C++ branch, where its classes are)
+                header = permuter_header(seeds.c_only(self.net.forks.permuter_header(fork, fn["name"]) if fork else
+                                                      self.net._context(proj["id"], fn["unit"])["header"],
+                                                      cxx=is_cxx(fn["best_source"])), fn["best_source"])
                 family = weight_family(self.net.cfg(proj), fn["vram"], bool(fork))
+                name = self.net.forks.permuter_name(fork, fn["name"], fn["best_source"]) if fork else fn["name"]
                 try:
                     gen = Generator()
                 except OSError as e:  # its environment is broken: the simple rewrites still work
                     log.info("permuter: decomp-permuter didn't start: %s", e)
             start_src = best_src = cur_src = _own(fn["best_source"], fn["name"])
             best = cur = fn["best_score"]
-            deadline = time.monotonic() + SECONDS
+            deadline = self._turn_deadline()
+            # a scratch copy of the unit's build for this turn's previews (fork: Console.build_unit_with)
+            scratch = tempfile.TemporaryDirectory(prefix="decompdecomp-permute-") if fork else None
             batches = misses = 0
+            refused, taken = None, 0
             while time.monotonic() < deadline and best > 0 and not st.stop.is_set():
                 if gen is not None:
                     # a batch of decomp-permuter's variants, of the C the turn started from and of the best so far in
@@ -284,7 +337,7 @@ class Permuter:
                     # the demo ROM (at 45); taking turns, every one matched within 12 s
                     base = best_src if batches % 2 else start_src
                     batches += 1
-                    batch = gen.batch({"header": header, "source": base, "function": fn["name"], "family": family,
+                    batch = gen.batch({"header": header, "source": base, "function": name, "family": family,
                                        "seed": rng.randrange(MAX_SEED), "count": BATCH})
                     if batch is None:  # C it can't read: the simple rewrites can still try
                         gen.close()
@@ -302,7 +355,16 @@ class Permuter:
                     if cand is None or time.monotonic() >= deadline or st.stop.is_set():
                         break
                     st.add(variants=1)
-                    score = self._score(agent, proj, fn, cand, best, fork)
+                    try:
+                        score = self._score(agent, proj, fn, cand, best, fork, Path(scratch.name) if scratch else None)
+                    except NetworkError as e:
+                        # A variant the project won't take: decomp-permuter's inlining writes a helper function
+                        # beside the function, which compile_and_diff refuses in a fork. It's skipped like one that
+                        # doesn't compile; the refusal used to end the function's permuting for good (_turn) within
+                        # seconds of its first turn: 2 of 3 of an Xbox game's near misses
+                        refused = e
+                        continue
+                    taken += 1
                     if score is None:
                         continue
                     if score < best:
@@ -314,31 +376,91 @@ class Permuter:
                             break
                     if score <= cur or rng.random() < 0.02:  # mostly downhill, now and then sideways off a plateau
                         cur, cur_src = score, cand
+            if refused is not None and not taken:
+                raise refused
         finally:
-            if gen is not None:
-                gen.close()
-            st.holding(fn["name"], False)
-            self._let_go(agent, fn)
-
-    def _score(self, agent, proj, fn, source: str, best: int, fork: str | None) -> int | None:
-        """A variant's score; recorded (as the function's best attempt, or its match) only when it beats `best`."""
-        if fork:
             try:
-                res = self.net.forks.attempt(agent, fork, fn["name"], source, keep=False, quiet=best)
-            except NetworkError:  # a variant the project won't take (a helper beside the function): try the next one
-                log.debug("permuter: %s: variant refused", fn["name"])
+                if gen is not None:
+                    gen.close()
+                if "scratch" in locals() and scratch is not None:
+                    self._previews.pop(scratch.name, None)
+                    scratch.cleanup()
+                held.close()
+            finally:
+                st.holding(fn["name"], False)
+                self._let_go(agent, fn)
+
+    def _score(self, agent, proj, fn, source: str, best: int, fork: str | None, scratch: Path | None = None) -> int | None:
+        """A variant's score; recorded (as the function's best attempt, or its match) only when it beats `best`. In a
+        fork, a preview from a scratch build of the unit first (`_preview`): only a variant that beats `best` there
+        goes through the project's judge, which builds in the project's tree, protects the unit's matches and records
+        it. Judged in the tree, each variant cost three builds of its unit beside the helpers' (its baseline, the
+        variant, the file put back): on a PS4 game a 60-second turn judged about 5 variants."""
+        with self.net.progress.judging(proj["slug"]):
+            if fork:
+                quick = self._preview(proj, fn, source, scratch) if scratch is not None else None
+                if quick == PREVIEW_FAILED:
+                    return None  # it doesn't build: nothing to judge
+                if quick is not None and quick >= best:
+                    return quick  # no better: the project's tree is never touched for it
+                try:
+                    res = self.net.forks.attempt(agent, fork, fn["name"], source, keep=False, quiet=best)
+                except NetworkError as e:  # a variant the project won't take (a helper beside the function): the next one
+                    # (and why: 54 refusals on a PS4 game said only "refused", so nobody could tell what stopped them)
+                    log.debug("permuter: %s: variant refused: %s", fn["name"], str(e).splitlines()[0][:200])
+                    return None
+                return res.get("score")
+            ctx = self.net._context(proj["id"], fn["unit"])
+            result = self.net._compile(proj, ctx["header"], source, fn)
+            if not result.ok:
                 return None
-            return res.get("score")
-        ctx = self.net._context(proj["id"], fn["unit"])
-        result = self.net._compile(proj, ctx["header"], source, fn)
-        if not result.ok:
+            cand, verdict, _ = self.net._evaluate(fn, proj, result.obj)
+            if cand is None:
+                return None
+            d = scoring.diff(self.net._target_obj(fn, proj), cand)
+            if verdict is not None:
+                d = scoring.DiffResult(0 if verdict else max(1, d.score), d.max_score, d.rows, verdict)
+            if d.score < best:
+                self.net._record(fn, agent, d.score, source, ctx["version"], matched=d.bytes_match, via="permuter")
+            return 0 if d.bytes_match else max(1, d.score)
+
+    def _preview(self, proj, fn, source: str, scratch: Path) -> int | None:
+        """The variant's score from a build of its unit outside the project's tree, its definition in place of the
+        function's (Console.build_unit_with, the unit's own command); PREVIEW_FAILED: it doesn't build; None: no
+        preview here (a console that can't, a variant with more than its definition: the project's judge places those)."""
+        from .forkengine import scaled
+
+        engine = self.net.forks
+        try:
+            _, fp, cfg = engine.get(proj["slug"])
+            unit = fp.unit(fn["unit"])
+            if not unit.source or unit.target is None or not unit.target.exists():
+                return None
+            names = engine._names(engine._meta(fn), fn)
+            _, span = engine._find(source, names)
+            if span is None or source[:span[0]].strip() or source[span[1]:].strip():
+                return None
+            text = (fp.root / unit.source).read_text(errors="replace", encoding="utf-8")
+            _, there = engine._find(text, names)
+            if there is None:
+                return None
+            console = consoles.get(cfg.get("platform"))
+            if type(console).build_unit_with is consoles.Console.build_unit_with:
+                return None  # this console builds only in its tree
+            tally = self._previews.setdefault(str(scratch), [0, 0])  # (built, failed) this turn
+            if tally[1] >= PREVIEW_TRIES and not tally[0]:
+                return None  # its scratch builds fail whatever the variant: the project's judge decides each
+            # (placed as the project's judge places a definition: ForkEngine._attempt)
+            obj = console.build_unit_with(fp, unit, None, scratch, text[:there[0]] + source[span[0]:span[1]].rstrip("\n")
+                                          + "\n" + text[there[1]:])
+            tally[0 if obj is not None else 1] += 1
+            if obj is None:
+                return PREVIEW_FAILED
+            d = objdiff.diff(unit.target, obj, engine._meta(fn).get("symbol") or fn["name"], cwd=fp.root,
+                             options=fp.diff_options(unit))
+        except Exception:  # (a preview is only a shortcut: the project's judge is the fallback)
+            log.debug("permuter: %s: no preview", fn["name"], exc_info=True)
             return None
-        cand, verdict, _ = self.net._evaluate(fn, proj, result.obj)
-        if cand is None:
-            return None
-        d = scoring.diff(self.net._target_obj(fn, proj), cand)
-        if verdict is not None:
-            d = scoring.DiffResult(0 if verdict else max(1, d.score), d.max_score, d.rows, verdict)
-        if d.score < best:
-            self.net._record(fn, agent, d.score, source, ctx["version"], matched=d.bytes_match, via="permuter")
-        return 0 if d.bytes_match else max(1, d.score)
+        if d.match_percent is None:
+            return PREVIEW_FAILED
+        return max(1, len(d.literals)) if d.literals else scaled(d.match_percent, fn["n_insns"])

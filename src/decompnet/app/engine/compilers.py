@@ -17,12 +17,14 @@ from ...project import compiler_for
 from .common import parse_ranges
 
 # Flag search (search_flags): the flags of each compiler family worth trying, at most MAX_FLAG_VARIANTS compiles
-FLAG_FAMILIES = (("ido", "ido"), ("mwcps2", "mwcps2"), ("ee-gcc", "ee"), ("gcc", "gcc"))
+FLAG_FAMILIES = (("ido", "ido"), ("mwcps2", "mwcps2"), ("mwccpsp", "mwcps2"), ("ee-gcc", "ee"), ("gcc", "gcc"),
+                 ("psp-gcc", "gcc"), ("pspsnc", "snc"))
 FLAG_LEVELS = {"gcc": ("-O1", "-O2", "-O3", "-Os"), "ee": ("-O1", "-O2", "-O3", "-Os"),
-               "ido": ("-O1", "-O2", "-O3", "-g"), "mwcps2": ("-O1", "-O2", "-O3", "-O4")}
+               "ido": ("-O1", "-O2", "-O3", "-g"), "mwcps2": ("-O1", "-O2", "-O3", "-O4"),
+               "snc": ("-O0", "-O1", "-O2", "-O4")}  # SNC: -O3 builds as -O2 and -O5 as -O4; it has no -Os
 FLAG_EXTRAS = {"gcc": ("-fno-strength-reduce", "-fno-schedule-insns"),
                "ee": ("-fno-strength-reduce", "-fno-schedule-insns", "-fno-common"),
-               "ido": (), "mwcps2": ()}
+               "ido": (), "mwcps2": (), "snc": ("-Xsched=0",)}  # SNC's instruction scheduling off
 SMALL_DATA_SIZES = (0, 8)
 MAX_FLAG_VARIANTS = 12
 FLAGS_SHOWN = 6
@@ -100,8 +102,12 @@ class CompilerMixin:
         return f"{consoles.compiler_name(lab[0])} {' '.join(lab[1])}".strip()
 
     def compiler_map_text(self, slug: str, survey: bool = False, check_ranges: bool = False) -> str:
-        """The map for agents: where it differs from the compiler the game builds with today, and why."""
-        self._rom_only(slug, "compiler_map")
+        """The map for agents: where it differs from the compiler the game builds with today, and why. A project
+        whose source files each have a compiler (PC, DS) has it over its files (app/filecompilers.py)."""
+        if self.filecompilers.applies(slug):
+            return self.filecompilers.text(slug, survey, check_ranges)
+        if self.fork_slug(slug):
+            raise NetworkError("this project's own build sets its compilers: there's no compiler map to read")
         proj = self._project(slug)
         cmap = self.compiler_map(proj, fresh=True)  # an agent asked: what the evidence says now
         if cmap is None:
@@ -288,12 +294,13 @@ class CompilerMixin:
         proj = self._project(slug)
         cfg = self.cfg(proj)
         tc, flag_list, check = None, [], None
+        if compiler and self.filecompilers.applies(slug):  # its files each have one: a range is checked on files
+            return self.filecompilers.suggest(agent, slug, text, compiler, function, ranges)
         if compiler:
             if self.fork_slug(slug):
-                raise NetworkError("a fork builds with its project's own compilers: suggest the change in words only "
-                                   "(where its files can have their own, try_compiler keeps the one that matches)")
+                raise NetworkError("a fork builds with its project's own compilers: suggest the change in words only")
             tc = self._toolchain_named(cfg, compiler)
-            flag_list = flags.split() or consoles.of(cfg).default_flags(tc, cfg.get("gp"))
+            flag_list = flags.split() or consoles.default_flags(cfg, tc)
             if not spans and (tc, flag_list) == (cfg["compiler"]["toolchain"], cfg["compiler"]["flags"]):
                 raise NetworkError("that's already the project's compiler and flags")
             if function:
@@ -345,7 +352,15 @@ class CompilerMixin:
         it's older than SURVEY_AGAIN_SECONDS, and every applied range gets looked at again once. "Survey again" and
         "Check the applied ranges" were buttons nobody could say when to press, the owner and their author included.
         `check_now`: both at once, whatever their age."""
-        if self.fork_slug(slug):  # a project whose source files each have a compiler (DS): the files are its parts
+        if self.fork_slug(slug):  # a project whose source files each have a compiler (PC, DS): the files are its parts
+            files = self.filecompilers
+            if files.applies(slug):  # the survey and the checks, as below, over its files (app/filecompilers.py)
+                last = self.cfg(self._project(slug)).get("file_survey") or {}
+                if len(files.candidates(slug)) > 1 and (check_now or time.time() - (last.get("t") or 0) >
+                                                         self.SURVEY_AGAIN_SECONDS):
+                    files.start_survey(slug)
+                if check_now:
+                    files.recheck(slug)
             return self.forks.compiler_answer(slug)
         self._rom_only(slug, "the compiler answer")
         proj = self._project(slug)
@@ -372,8 +387,11 @@ class CompilerMixin:
                           "flags": " ".join(r["flags"]),
                           "check": c.get("status", ""), "said": c.get("said", "")})
         elsewhere = sorted((r for r in (cmap.runs if cmap else []) if r.differs()), key=lambda r: -r.functions)
+        has_map = cmap is not None
         # the compiler's name and its flags apart: "built with KMC GCC 2.7.2" reads at a glance, the flags are details
-        return {"compiler": consoles.compiler_name(main[0]), "flags": " ".join(main[1]), "parts": parts, "mips": cmap is not None,
+        # (`mips` is what older pages called this fact: a map now also covers a project's source files, PC and DS)
+        return {"compiler": consoles.compiler_name(main[0]), "flags": " ".join(main[1]), "parts": parts,
+                "compiler_map": has_map, "mips": has_map,
                 "elsewhere": [{"start": r.start, "end": r.end, "compiler": self._short(r.label), "functions": r.functions,
                                "confirmed": r.confirmed} for r in elsewhere[:self.ANSWER_STRETCHES]],
                 "elsewhere_count": len(elsewhere),
@@ -383,6 +401,29 @@ class CompilerMixin:
                            "running_tried": state.get("tried", 0), "t": (cfg.get("compiler_survey") or {}).get("t")},
                 "checks": [{"id": c["id"], "audit": bool(c.get("audit")), "status": c["status"], "said": c.get("said") or "",
                             "ranges": c["spans"], "compiler": self._short((c["toolchain"], tuple(c["flags"])))} for c in checks]}
+
+    def install_compilers(self, slug: str, accept_license: bool, retest: bool = True, log=print) -> dict:
+        """Every compiler of the project's console the app installs and this computer lacks (a proprietary one only
+        with the user's consent), then, unless the user picked the compiler (`retest`), the compiler test again with
+        all of them: the import's test could only try what was installed, and a guess from the program alone can
+        miss (a game linked by CodeWarrior was GCC's code). Returns what was installed, left out, and the test's
+        counts."""
+        proj = self._project(slug)
+        console = self.console(proj)
+        installed, left_out = [], []
+        for tid in console.installable_compilers():
+            if toolchains.installed(tid) is not None:
+                continue
+            if toolchains.get(tid).proprietary and not accept_license:
+                left_out.append(tid)
+                continue
+            log(f"installing {consoles.compiler_name(tid)}")
+            toolchains.install(tid, accept_license=accept_license, log=log)
+            installed.append(tid)
+        if left_out:
+            log(f"left out, as proprietary: {', '.join(consoles.compiler_name(t) for t in left_out)}")
+        counts = self.test_compilers(slug, console.installable_compilers(), log=log) if retest and self.is_rom(proj) else {}
+        return {"installed": installed, "left_out": left_out, "test": counts}
 
     def set_auto_adjust(self, slug: str, on: bool) -> None:
         self._update_cfg(slug, lambda cfg: cfg.__setitem__("auto_compiler", bool(on)))
@@ -418,7 +459,7 @@ class CompilerMixin:
         proj = self._project(slug)
         cfg = self.cfg(proj)
         tc = self._toolchain_named(cfg, compiler)
-        flag_list = flags.split() or consoles.of(cfg).default_flags(tc, cfg.get("gp"))
+        flag_list = flags.split() or consoles.default_flags(cfg, tc)
         fn = self._function(function, slug)
         source = source.strip() or self._source_of(fn)
         if not source:
@@ -433,18 +474,19 @@ class CompilerMixin:
                     f"function=\"{fn['name']}\", ranges=<the address range it built>, source=<this C>)")
         return f"{what}: score {d.score} ({d.percent:.1f}%), not a match\n{d.render(context=1, max_rows=40)}"
 
-    def flag_variants(self, toolchain: str, base: list[str]) -> list[list[str]]:
+    def flag_variants(self, toolchain: str, base: list[str], more: tuple[str, ...] = ()) -> list[list[str]]:
         """The flags worth trying for a function on this compiler: its optimisation levels, small data on and off
         (MIPS GCC's -G; CodeWarrior's -sdatathreshold), and the few options that change the shape of code most.
-        Each variant changes the project's flags in one place, so what matches says which flag it was."""
+        Each variant changes the project's flags in one place, so what matches says which flag it was. `more`: the
+        console's own (Console.flag_extras)."""
         family = next((f for prefix, f in FLAG_FAMILIES if toolchain.startswith(prefix)), "gcc")
-        levels, extras = FLAG_LEVELS[family], FLAG_EXTRAS[family]
+        levels, extras = FLAG_LEVELS[family], FLAG_EXTRAS[family] + tuple(more)
         current = next((f for f in base if f in levels), None)
         out = [base]
         for level in levels:
             if level != current:
                 out.append([level if f == current else f for f in base] if current else [*base, level])
-        if family in ("gcc", "ee"):
+        if family in ("gcc", "ee", "snc"):
             small = next((f for f in base if f.startswith("-G") and f[2:].isdigit()), None)
             for g in SMALL_DATA_SIZES:
                 if small and small != f"-G{g}":
@@ -461,19 +503,19 @@ class CompilerMixin:
         """A function's C (its best attempt, or `source`) built with the variants of its compiler's flags
         (flag_variants), each judged like an attempt and recorded nowhere: when the C looks right but won't match,
         the flags are often what's wrong, and agents tried them one compile at a time."""
-        if self.fork_slug(slug):
-            raise NetworkError("a fork builds with its project's own compilers and flags")
+        if self.fork_slug(slug):  # where the project lets each file have its own flags (PC), the fork engine's
+            return self.forks.search_flags(agent, slug, function, compiler, source)
         proj = self._project(slug)
         cfg = self.cfg(proj)
         fn = self._function(function, slug)
         own = compiler_for(cfg, fn["vram"])
         tc = self._toolchain_named(cfg, compiler) if compiler else own["toolchain"]
-        base = list(own["flags"]) if tc == own["toolchain"] else consoles.of(cfg).default_flags(tc, cfg.get("gp"))
+        base = list(own["flags"]) if tc == own["toolchain"] else consoles.default_flags(cfg, tc)
         source = source.strip() or self._source_of(fn)
         if not source:
             raise NetworkError(f"{fn['name']} has no attempt yet: pass the C as source")
         results = []
-        for flags in self.flag_variants(tc, base):
+        for flags in self.flag_variants(tc, base, consoles.of(cfg).flag_extras):
             ok, d, _ = self._judge_with(proj, fn, tc, flags, source)
             if d is not None:
                 results.append((0 if ok else max(1, d.score), flags))
@@ -500,7 +542,9 @@ class CompilerMixin:
         hit = next((s for s in self.cfg(self._project(slug)).get("suggestions", []) if s["id"] == sid), None)
         if hit is None:
             raise NetworkError(f"no suggestion {sid}")
-        if apply and hit["toolchain"] and hit.get("ranges"):
+        if apply and hit["toolchain"] and hit.get("ranges") and self.fork_slug(slug):  # (its files: each if it holds)
+            self.forks.set_compiler_ranges(slug, hit["ranges"], hit["toolchain"])
+        elif apply and hit["toolchain"] and hit.get("ranges"):
             self.set_compiler_ranges(slug, hit["ranges"], hit["toolchain"], hit["flags"])
         elif apply and hit["toolchain"]:
             self.set_compiler(slug, hit["toolchain"], hit["flags"], guard=guard)
@@ -508,17 +552,18 @@ class CompilerMixin:
             "status", "applied" if apply else "dismissed"))
 
     def set_compiler_ranges(self, slug: str, ranges: list[list[int]], toolchain: str | None,
-                            flags: list[str] | None = None, reopen: bool = False) -> None:
+                            flags: list[str] | None = None, reopen: bool = False) -> list[str]:
         """Address ranges built by another compiler than the rest of the game (replacing ranges they overlap), or
         with toolchain None: those ranges back to the project's compiler. Matched functions that wouldn't match any
         more stop it, unless `reopen` (removing a range the user judged a quirk: Ridge Racer V's two GCC 2.96 ranges
-        held two functions whose C only matched with 2.96): then they're open again, their C their best attempt."""
+        held two functions whose C only matched with 2.96): then they're open again, their C their best attempt.
+        Returns the functions `reopen` opened, so the page can say which the range no longer matches."""
         if self.fork_slug(slug):
             raise NetworkError("a fork builds with the project's own compilers and flags")
         if toolchain:
             cfg = self.cfg(self._project(slug))
             toolchain = toolchains.get(toolchain).id
-            flags = flags or consoles.of(cfg).default_flags(toolchain, cfg.get("gp"))
+            flags = flags or consoles.default_flags(cfg, toolchain)
         flags = flags or []
 
         before = self.cfg(self._project(slug)).get("compiler_ranges", [])
@@ -535,8 +580,9 @@ class CompilerMixin:
                   if any(a <= (f["vram"] or -1) < b for a, b in ranges)]
         broken = self.regression_test(proj, None, only=inside,
                                       header_for=lambda f: self._context(proj["id"], f["unit"])["header"]) if inside else []
+        reopened = []
         if broken and reopen and not toolchain:
-            self._reopen(proj, [n for n, _ in broken], "its range was removed")
+            reopened = self._reopen(proj, [n for n, _ in broken], "its range was removed")
         elif broken:
             self._update_cfg(slug, lambda cfg: cfg.__setitem__("compiler_ranges", before))
             raise NetworkError(f"{len(broken)} matched function(s) in those ranges wouldn't match with it any more "
@@ -546,11 +592,13 @@ class CompilerMixin:
             where = ", ".join(f"0x{a:X}-0x{b:X}" for a, b in ranges)
             self._event(db, proj["id"], None, "compiler", f"{consoles.compiler_name(toolchain)} {' '.join(flags)} for {where}"
                         if toolchain else f"the project's compiler again for {where}")
+        return reopened
 
-    def _reopen(self, proj, names: list[str], why: str) -> None:
+    def _reopen(self, proj, names: list[str], why: str) -> list[str]:
         """Matched functions open again: their matching C becomes their best attempt, scored with the compiler they're
-        built with now, so the next agent starts from it."""
+        built with now, so the next agent starts from it. Returns the ones it opened."""
         cfg = self.cfg(proj)
+        opened = []
         for name in names:
             fn = self.store.one("SELECT * FROM functions WHERE project_id=? AND name=?", proj["id"], name)
             if fn is None or fn["status"] != "matched":
@@ -562,6 +610,8 @@ class CompilerMixin:
                            "best_score=?, matched_source=NULL, matched_agent_id=NULL, matched_at=NULL WHERE id=?",
                            (d.score if d is not None else None, fn["id"]))
                 self._event(db, proj["id"], None, "reopen", f"{name}: open again ({why})")
+            opened.append(name)
+        return opened
 
     def set_compiler(self, slug: str, toolchain: str, flags: list[str] | None = None, guard: bool = False) -> None:
         """`guard` (auto-adjust, unattended): matched functions must still match with it, checked on up to 40 of them
@@ -572,7 +622,7 @@ class CompilerMixin:
         tc = toolchains.get(toolchain)
         cfg = json.loads(proj["config"])  # a copy of its own: changed below
         before = cfg["compiler"]
-        cfg["compiler"] = {"toolchain": tc.id, "flags": flags or consoles.of(cfg).default_flags(tc.id, cfg.get("gp")),
+        cfg["compiler"] = {"toolchain": tc.id, "flags": flags or consoles.default_flags(cfg, tc.id),
                            "timeout": 20}
         with self.store.tx() as db:
             db.execute("UPDATE projects SET config=? WHERE id=?", (json.dumps(cfg), proj["id"]))

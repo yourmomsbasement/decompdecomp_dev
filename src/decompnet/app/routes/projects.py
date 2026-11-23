@@ -15,7 +15,7 @@ from starlette.responses import JSONResponse, Response
 from ... import consoles, hostenv, toolchains
 from ...forks.project import SCOPES
 from ...network import NetworkError
-from .. import saves
+from .. import deep_permuter, saves
 from ..engine import parse_ranges
 from . import App
 
@@ -31,7 +31,13 @@ def register(app: App) -> None:
             data = await body(request) if request.method == "POST" else {}
             slug = data.get("slug") or request.query_params.get("slug", "")
             try:
-                return JSONResponse(await call(lambda: fn(slug, request, data)))
+                def perform():
+                    result = fn(slug, request, data)
+                    project = net.store.one("SELECT * FROM projects WHERE slug=?", slug)
+                    if request.method == "POST" and project and not net.project_missing(project):
+                        net.progress.sync(slug, force=True)
+                    return result
+                return JSONResponse(await call(perform))
             except (NetworkError, ValueError, toolchains.ToolchainError, OSError) as e:
                 return fail(e)
         return handler
@@ -40,7 +46,8 @@ def register(app: App) -> None:
         settings.data["last_project"] = slug
         settings.save()
         overview = net.overview(slug)
-        net.warm_briefs_soon(slug)  # the project is open: agents' first briefs come next
+        if not overview.get("missing"):
+            net.warm_briefs_soon(slug)  # the project is open: agents' first briefs come next
         return overview
 
     def p_live(slug, request, data):
@@ -59,16 +66,17 @@ def register(app: App) -> None:
             if not str(data.get("ranges") or "").strip():  # the whole game: every file, one at a time
                 return {"job": jobs.start("compiler", lambda log: net.forks.set_compiler_everywhere(slug, tc, log))}
             said = net.forks.set_compiler_ranges(slug, parse_ranges(str(data["ranges"])), None if data.get("remove") else tc)
-            return net.overview(slug) | {"said": said}
+            return net.overview(slug) | {"said": said, "reopened": []}
+        reopened = []
         if "auto" in data:  # this project's suggestions apply by themselves once proven, or wait for the user
             net.set_auto_adjust(slug, bool(data["auto"]))
         elif str(data.get("ranges") or "").strip():  # these address ranges only (or back to the project's: remove)
-            net.set_compiler_ranges(slug, parse_ranges(str(data["ranges"])),
-                                    None if data.get("remove") else str(data.get("toolchain", "")), data.get("flags") or None,
-                                    reopen=bool(data.get("reopen")))
+            reopened = net.set_compiler_ranges(slug, parse_ranges(str(data["ranges"])),
+                                               None if data.get("remove") else str(data.get("toolchain", "")),
+                                               data.get("flags") or None, reopen=bool(data.get("reopen")))
         else:
             net.set_compiler(slug, str(data.get("toolchain", "")), data.get("flags") or None)
-        return net.overview(slug)
+        return net.overview(slug) | {"reopened": reopened}
 
     def p_export(slug, request, data):
         def work(log):
@@ -84,11 +92,12 @@ def register(app: App) -> None:
             raise ValueError("choose a game file to reimport")
         proj = net.project_row(slug)
         cfg = json.loads(proj["config"])
-        if cfg.get("kind") != "rom":
-            raise NetworkError("only ROM projects can be reimported")
+        fork = bool(net.fork_slug(slug))
+        if cfg.get("kind") != "rom" and not (fork and net.forks.overview(slug).get("reimports")):
+            raise NetworkError("only ROM projects and PC projects started from scratch can be reimported")
         if slug in net.rooms or slug in net.links:
             raise NetworkError("leave the shared room before reimporting this game")
-        if consoles.identify(path).id != net.console(proj).id:
+        if consoles.identify(path).id != consoles.of(cfg).id:
             raise NetworkError("choose a game for the same console as this project")
         if net.surveys.get(slug, {}).get("state") == "running":
             raise NetworkError("wait for the compiler survey to finish before reimporting this game")
@@ -96,6 +105,8 @@ def register(app: App) -> None:
         net.stop_autopilot(slug)
         net.twins.stop(slug)
         net.permuter.stop(slug)
+        if fork:  # (its own analysis again: Console.reimport)
+            return {"job": jobs.start("reimport", lambda log: net.forks.reimport(slug, path, log=log))}
         return {"job": jobs.start(
             "reimport", lambda log: net.reimport_rom(slug, path, confirmed=True, name=path.name, log=log))}
 
@@ -153,6 +164,10 @@ def register(app: App) -> None:
         net.set_instructions(slug, str(data.get("text", "")))
         return net.overview(slug)
 
+    def p_claim_order(slug, request, data):
+        net.set_claim_order(slug, str(data.get("order", "")))
+        return net.overview(slug)
+
     def p_title(slug, request, data):
         net.set_title(slug, str(data.get("title", "")))
         return net.overview(slug)
@@ -208,6 +223,30 @@ def register(app: App) -> None:
             net.start_autopilot(slug)
         return net.overview(slug)
 
+    def p_deep_permuter(slug, request, data):
+        if request.method == "GET":
+            name = request.query_params.get("name", "")
+            latest = next((job for job in reversed(list(jobs.jobs.values())) if job["kind"] == "deep-permuter"
+                           and job.get("slug") == slug and job.get("function") == name), None)
+            return {"job": latest["id"] if latest and latest["state"] == "running" else None, "last": latest}
+        name = str(data.get("name", ""))
+        minutes = data.get("minutes", 10)
+        variants = data.get("variants", 500)
+        with jobs._lock:
+            running = [job for job in jobs.jobs.values() if job["kind"] == "deep-permuter"
+                       and job["state"] == "running"]
+            active = next((job for job in running if job.get("slug") == slug and job.get("function") == name), None)
+            if active:
+                return {"job": active["id"]}
+            if any(job.get("slug") == slug for job in running):
+                raise NetworkError("Another function is being deep permuted in this project; stop it or wait for it to finish.")
+            if len(running) >= 2:
+                raise NetworkError("Two deep searches are already running. Wait for one to finish.")
+            deep_permuter.validate(net, slug, name, minutes, variants)
+            jid = jobs.start("deep-permuter", lambda log: deep_permuter.run(net, slug, name, minutes, variants, log))
+            jobs.jobs[jid].update({"slug": slug, "function": name})
+        return {"job": jid}
+
     def p_save(slug, request, data):
         """Save the project's work as plain files (app/saves.py): to its progress/ folder, or one the user picks."""
         return saves.save(net, slug, hostenv.local_path(data["folder"]) if data.get("folder") else None)
@@ -235,8 +274,10 @@ def register(app: App) -> None:
         "/api/reimport": (p_reimport, ["POST"]),
         "/api/delete": (p_delete, ["POST"]),
         "/api/try": (p_try, ["POST"]), "/api/release": (p_release, ["POST"]), "/api/reopen": (p_reopen, ["POST"]), "/api/setaside": (p_set_aside, ["POST"]),
+        "/api/deep-permuter": (p_deep_permuter, ["GET", "POST"]),
         "/api/recheck": (p_recheck, ["POST"]),
         "/api/autopilot": (p_autopilot, ["POST"]), "/api/instructions": (p_instructions, ["POST"]), "/api/title": (p_title, ["POST"]),
+        "/api/claim-order": (p_claim_order, ["POST"]),
         "/api/priority": (p_priority, ["POST"]), "/api/note": (p_note, ["POST"]), "/api/scope": (p_scope, ["POST"]),
         "/api/unanalysed": (p_unanalysed, ["POST"]),
         "/api/suggestion": (p_suggestion, ["POST"]), "/api/boundary": (p_boundary, ["POST"]),

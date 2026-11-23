@@ -21,6 +21,9 @@ The engine is one class, RomNetwork, put together from a module per topic:
 - rooms.py: rooms (collab.py), the engine's side
 - gui.py: what the GUI shows, and the export
 - autopilot.py: autopilot, and what a match sets off
+
+app/progress.py keeps ROM progress files authoritative; core.py checks them before serving a project and
+judging.py rejects compiles made against progress that has since changed.
 """
 
 from __future__ import annotations
@@ -43,3 +46,8 @@ __all__ = ["RomNetwork", "COMPILERS", "TOOLS", "parse_ranges"]
 class RomNetwork(ImportMixin, JudgeMixin, BriefMixin, LayoutMixin, CompilerMixin, EditMixin, RoomMixin, GuiMixin,
                  AutopilotMixin, Core):
     """A ROM project engine: Network's claims, attempts and notes, for games split from their ROM (see above)."""
+
+    # Whether its projects can join functions (#192): app/tools.py offers join_functions to ROM projects when this is
+    # True or when this class has a join_functions handler. #192's EditMixin.join_functions is enough on its own; an
+    # engine whose handler has another name sets this True here, one line.
+    joins_functions = False

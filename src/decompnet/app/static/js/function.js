@@ -22,8 +22,16 @@ async function openFn(name) {
   const again = S.fn === name && !$("drawer").hidden;
   if (!again) { giveBack(name); S.editDirty = false; $("tryMsg").hidden = true; }
   S.fn = name;
+  if (!again) {
+    S.fnDetail = null;
+    $("fnName").textContent = name;
+    $("fnAddr").textContent = "";
+    $("fnAsm").textContent = "";
+    $("fnLoad").hidden = false;
+    $("fnLoadError").hidden = true;
+  }
   showDrawer("drawer");
-  if (!again) { S.ftab = null; S.which = "latest"; S.diffKey = null; $("diff").innerHTML = ""; $("diffSum").textContent = ""; }
+  if (!again) { S.ftab = null; S.which = null; S.diffKey = null; $("diff").innerHTML = ""; $("diffSum").textContent = ""; }
   drawMap();
   document.querySelectorAll("#fnRows tr").forEach((tr) => tr.classList.toggle("sel", tr.dataset.fn === name));
   await refreshFn(true);
@@ -41,20 +49,30 @@ function showFnTab(tab) {
   document.querySelectorAll("[data-ftab]").forEach((b) => b.classList.toggle("on", b.dataset.ftab === tab));
   $("fnDiffView").hidden = tab !== "diff";
   $("fnCodeView").hidden = tab !== "code";
+  $("deepPermuterPanel").hidden = tab !== "deep";
+  $("fnHistoryView").hidden = tab !== "history";
+  document.querySelectorAll("[data-ftab]").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.ftab === tab)));
+  const d = S.fnDetail;
+  $("diffWhich").hidden = tab !== "diff" || !d || d.status === "matched" || !d.best_differs;
   if (tab === "diff") loadDiff();
+  if (tab === "history" && d) renderFnChart(d);
+  if (tab === "deep") renderDeepSearch();
+}
+function setWhich(which) {
+  S.which = which;
+  document.querySelectorAll("#diffWhich [data-which]").forEach((x) => x.classList.toggle("on", x.dataset.which === which));
 }
 document.querySelectorAll("[data-ftab]").forEach((b) => { b.onclick = () => { S.ftab = b.dataset.ftab; showFnTab(S.ftab); }; });
 document.querySelectorAll("#diffWhich [data-which]").forEach((b) => {
-  b.onclick = () => {
-    S.which = b.dataset.which;
-    document.querySelectorAll("#diffWhich [data-which]").forEach((x) => x.classList.toggle("on", x === b));
-    loadDiff();
-  };
+  b.onclick = () => { setWhich(b.dataset.which); loadDiff(); };
 });
 
-let fnBusy = false;
+let fnBusy = false, fnPending = null;
 async function refreshFn(first) {
-  if (fnBusy || !S.fn) return;
+  if (!S.fn) return;
+  // Preserve the latest click while validation/diff for the preceding selection is still running.
+  if (fnBusy) { fnPending = { name: S.fn, first: !!first || !!(fnPending && fnPending.name === S.fn && fnPending.first) }; return; }
+  const requested = S.fn;
   fnBusy = true;
   try {
     const d = await api(`/api/function?slug=${S.slug}&name=${encodeURIComponent(S.fn)}`);
@@ -66,7 +84,9 @@ async function refreshFn(first) {
     $("fnName").textContent = d.name;
     fnBadge(d);
     $("fnSetAside").hidden = d.status !== "open";
+    $("fnActionsMenu").hidden = d.status !== "open";
     $("fnSetAside").onclick = async () => {
+      $("fnActionsMenu").open = false;
       const why = prompt(`Why does no C make ${d.name}? (optional: agents and you read it on its page)`, "hand-written assembly");
       if (why === null) return;
       try {
@@ -103,12 +123,20 @@ async function refreshFn(first) {
       } catch (e) { toast(esc(e.message), "err"); }
     };
     $("fnAsm").innerHTML = highlightAsm(d.asm);
+    $("fnLoad").hidden = true;
     const kinds = { matched: "Matching C", best: "Best attempt so far", latest: S.ov.kind === "fork" ? "In the source now" : "Latest attempt", draft: "Machine draft (m2c)" };
     $("fnSrcKind").textContent = kinds[d.source_kind] || "No C yet";
     if (!S.editDirty || first) setEditor(d.source || "", d);
+    renderDeepSearch();
+    reconnectDeepSearch(d.name);
     $("copySrc").onclick = () => navigator.clipboard.writeText($("fnEdit").value).then(() => toast("Copied."));
     renderFnChart(d);
-    $("diffWhich").hidden = d.status === "matched" || S.ov.kind === "fork" || d.scores.filter((x) => x.score != null).length < 2;
+    const canSwitch = d.status !== "matched" && !!d.best_differs;
+    $("diffWhich").hidden = !canSwitch;
+    if (S.which == null) S.which = canSwitch ? "best" : "latest";
+    const latestWhich = document.querySelector('#diffWhich [data-which="latest"]');
+    if (latestWhich) latestWhich.textContent = S.ov.kind === "fork" ? "In the source now" : "Latest attempt";
+    setWhich(S.which);
     const xr = [];
     if (d.calls.length) xr.push(`<div><b>calls</b>${d.calls.map(fnLink).join("")}</div>`);
     if (d.called_by.length) xr.push(`<div><b>called by</b>${d.called_by.map(fnLink).join("")}</div>`);
@@ -121,8 +149,17 @@ async function refreshFn(first) {
     const tab = S.ftab || (d.status === "matched" || !d.scores.length ? "code" : "diff");
     showFnTab(tab);
   } catch (e) {
+    if (requested !== S.fn) return;
+    $("fnLoad").hidden = true;
+    $("fnLoadError").hidden = false;
+    $("fnLoadError").textContent = e.message;
     if (first) toast(esc(e.message), "err");
-  } finally { fnBusy = false; }
+  } finally {
+    fnBusy = false;
+    const pending = fnPending;
+    fnPending = null;
+    if (pending && pending.name === S.fn && !$("drawer").hidden) await refreshFn(pending.first);
+  }
 }
 
 /* Editing a function yourself: a highlighted editor over a textarea, judged like an agent's attempt. */
@@ -153,6 +190,7 @@ $("fnEdit").addEventListener("keydown", (e) => {
 });
 $("tryBtn").onclick = () => tryIt();
 
+
 async function tryIt() {
   const name = S.fn, source = $("fnEdit").value, msg = $("tryMsg");
   if (!name || !source.trim() || $("tryBtn").disabled) return;
@@ -170,6 +208,7 @@ async function tryIt() {
       msg.textContent = r.score == null ? "It didn't compile:" : (r.text.split("\n")[0] || `score ${r.score}`);
       if (r.score == null) msg.textContent += "\n" + r.text.split("\n").slice(1, 12).join("\n");
     }
+    setWhich("latest");
     S.editDirty = false;
     S.diffKey = null;
     await refreshFn(false);
@@ -238,13 +277,14 @@ function renderDiff(d) {
   const sum = $("diffSum"), box = $("diff"), probs = $("diffProblems");
   probs.innerHTML = "";
   if (!d.rows) {
-    sum.innerHTML = d.error ? `<span class="bad">The ${d.kind === "best" ? "best" : "latest"} attempt didn't compile.</span>` : "No attempt yet. The diff appears after the first compile.";
+    sum.innerHTML = d.error ? `<span class="bad">The ${d.kind === "best" ? "best" : "latest"} attempt didn't compile.</span>`
+      : d.message ? esc(d.message) : "No attempt yet. The diff appears after the first compile.";
     box.innerHTML = d.error ? `<pre class="code errlog">${esc(d.error)}</pre>` : "";
     return;
   }
   const rows = d.rows;
   const same = rows.filter((r) => r[0] === " ").length, target = rows.filter((r) => r[1]).length;
-  const label = { matched: "Matching C", best: "Best attempt", latest: S.ov.kind === "fork" ? "The source now" : "Latest attempt" }[d.kind] || "Attempt";
+  const label = { matched: "Matching C", best: "Best attempt", latest: S.ov.kind === "fork" ? "In the source now" : "Latest attempt" }[d.kind] || "Attempt";
   sum.innerHTML = `<b>${label}</b> · ${d.percent === 100 && d.score === 0 ? `<span class="ok">byte-identical</span>` : `${d.percent}%${d.score != null ? ` · score ${d.score}` : ""}`} · ${same} of ${target} instructions identical
     <span class="diff-key"><i class="k arg"></i>operands <i class="k repl"></i>different <i class="k mov"></i>moved</span>`;
   const html = [];
@@ -319,6 +359,13 @@ function searchFunctions(fns, q, fork) {
   return found.length || fork ? found : fns.filter(inUnit);
 }
 
+function functionAge(stamp, now = Date.now() / 1000) {
+  if (stamp == null) return '<span class="dim">Never</span>';
+  const seconds = Math.max(0, now - stamp);
+  const age = seconds < 60 ? `${Math.floor(seconds)}s` : seconds < 3600 ? `${Math.floor(seconds/60)}m` : seconds < 86400 ? `${Math.floor(seconds/3600)}h` : `${Math.floor(seconds/86400)}d`;
+  return `<span title="${esc(new Date(stamp * 1000).toLocaleString())}">${age} ago</span>`;
+}
+
 function renderList() {
   if (!S.map.length || S.tab !== "functions") return;
   const counts = { all: S.map.length, open: 0, working: 0, tried: 0, matched: 0, asm: 0, polished: 0, first: 0 };
@@ -332,6 +379,7 @@ function renderList() {
     q, S.ov && S.ov.kind === "fork");
   const key = {
     i: (f) => f.i, name: (f) => f.name.toLowerCase(), insns: (f) => f.insns, attempts: (f) => f.attempts || 0,
+    last_checked: (f) => f.last_checked || 0, last_improved: (f) => f.last_improved || 0,
     best: (f) => (f.status === "matched" ? 2 : f.best == null ? -1 : pctOf(f.best, f.insns)), status: (f) => STATE_RANK[fnState(f)],
   }[L.sort === "vram" ? "i" : L.sort];
   rows = rows.slice().sort((a, b) => { const x = key(a), y = key(b); return (x < y ? -1 : x > y ? 1 : a.i - b.i) * L.dir; });
@@ -346,8 +394,8 @@ function renderList() {
     const starCell = !star ? "" : `<td class="star-col">${open || on ? `<button type="button" class="star-btn${on ? " on" : ""}" data-star="${esc(f.name)}" aria-pressed="${on}" aria-label="${on ? "Agents take it first: click to stop" : "Agents take it first"}" title="${on ? "Agents take it first (click to stop)" : "Agents take it first"}">${on ? "★" : "☆"}</button>` : ""}</td>`;
     return `<tr data-fn="${esc(f.name)}" class="${S.fn === f.name ? "sel" : ""}" tabindex="0">${starCell}<td class="mono dim">${fork ? esc(f.unit || "") : hex8(f.vram)}</td>
       <td class="mono name">${esc(f.name)}</td><td class="r mono">${f.insns.toLocaleString()}</td><td class="r mono">${best}</td>
-      <td class="r mono">${f.attempts || `<span class="dim">0</span>`}</td><td>${status}</td></tr>`;
-  }).join("") || `<tr class="none"><td colspan="7">${L.filter === "first" && !q ? "No function is starred. ☆ one and agents take it before the others." : `No function matches${q ? ` “${esc(L.q)}”` : ""}.`}</td></tr>`;
+      <td class="r mono">${f.attempts || `<span class="dim">0</span>`}</td><td class="fn-age-improved">${functionAge(f.last_improved)}</td><td class="fn-age-checked">${functionAge(f.last_checked)}</td><td>${status}</td></tr>`;
+  }).join("") || `<tr class="none"><td colspan="9">${L.filter === "first" && !q ? "No function is starred. ☆ one and agents take it before the others." : `No function matches${q ? ` “${esc(L.q)}”` : ""}.`}</td></tr>`;
   $("fnShown").textContent = rows.length > L.limit ? `${L.limit.toLocaleString()} of ${rows.length.toLocaleString()} shown` : plural(rows.length, "function");
   $("fnMore").hidden = rows.length <= L.limit;
   document.querySelectorAll(".fn-table th").forEach((th) => {
@@ -358,6 +406,17 @@ function renderList() {
 $("fnFilter").addEventListener("click", (e) => { const b = e.target.closest("[data-filter]"); if (b) { L.filter = b.dataset.filter; L.limit = FUNCTION_ROWS; renderList(); } });
 $("fnSearch").addEventListener("input", () => { L.q = $("fnSearch").value; L.limit = FUNCTION_ROWS; renderList(); });
 $("fnMore").onclick = () => { L.limit += MORE_ROWS; renderList(); };
+setInterval(() => {
+  if (document.hidden || S.tab !== "functions") return;
+  // Refresh the relative dates without replacing rows while someone is using the list.
+  for (const row of $("fnRows").querySelectorAll("tr[data-fn]")) {
+    const index = S.byName?.get(row.dataset.fn);
+    if (index == null) continue;
+    const fn = S.map[index];
+    row.querySelector(".fn-age-improved").innerHTML = functionAge(fn.last_improved);
+    row.querySelector(".fn-age-checked").innerHTML = functionAge(fn.last_checked);
+  }
+}, 15000);
 $("fnRows").addEventListener("click", (e) => {
   const star = e.target.closest("[data-star]");
   if (star) { togglePrio(star.dataset.star, star.getAttribute("aria-pressed") !== "true"); return; }
@@ -369,7 +428,7 @@ document.querySelectorAll(".fn-table th[data-sort]").forEach((th) => {
   th.onclick = () => {
     const k = th.dataset.sort === "vram" ? "i" : th.dataset.sort;
     if (L.sort === k) L.dir = -L.dir;
-    else { L.sort = k; L.dir = ["best", "attempts", "insns"].includes(k) ? -1 : 1; }
+    else { L.sort = k; L.dir = ["best", "attempts", "insns", "last_improved", "last_checked"].includes(k) ? -1 : 1; }
     renderList();
   };
 });

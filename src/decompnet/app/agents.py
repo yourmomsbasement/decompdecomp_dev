@@ -32,6 +32,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -42,7 +43,7 @@ from decompnet.hostenv import NO_WINDOW
 
 from .. import agents, consoles, network
 from ..network import NetworkError
-from . import tools
+from . import schedule, specialists, tools
 from .engine import RomNetwork
 
 log = logging.getLogger("decompdecomp")
@@ -71,6 +72,8 @@ _SIGNIN = re.compile(r"auth|log ?in|sign(ed)? ?in|credential|api.?key|unauthori[
 # with 2 per session that was most of what small functions cost.
 PER_SESSION = 8
 MAX_AT_ONCE = 8  # helpers started with one click
+MAX_PER_START = 24  # helpers one start may begin in total, across the models it picks: without it, many models at once
+                    # would launch hundreds (a start used to check only each endpoint's own max_sessions)
 FEED_LINES = 400  # what each helper said and did, kept for its details
 FEED_TEXT = 4000  # characters of one feed line
 LAST_WORDS = 600  # characters of the agent's last message kept on its record
@@ -131,14 +134,27 @@ SCHEMA = (
       output_tokens INTEGER NOT NULL DEFAULT 0, cache_read_tokens INTEGER NOT NULL DEFAULT 0,
       cache_write_tokens INTEGER NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0,
       turns INTEGER NOT NULL DEFAULT 0, tool_calls INTEGER NOT NULL DEFAULT 0, compiles INTEGER NOT NULL DEFAULT 0,
-      matches INTEGER NOT NULL DEFAULT 0)""",
+      matches INTEGER NOT NULL DEFAULT 0, role TEXT NOT NULL DEFAULT 'owner', request_id INTEGER)""",
     "CREATE INDEX IF NOT EXISTS idx_helper_sessions_model ON helper_sessions(project, model)",
 )
 TOKEN_KINDS = ("input", "output", "cache_read", "cache_write")  # what agents report, as `usage` items say it
+# A model spinning on a project: in the last SPIN_WINDOW its helpers compiled at least SPIN_COMPILES times, and either
+# matched once per SPIN_ALONE compiles or worse, or needed SPIN_RATIO times the compiles a match of another model at
+# work there (one with SPIN_MATCHES matches or more). On an Xbox game in one night: one model's 462 sessions
+# compiled 5,741 times for 10 matches ($138), another's 22 compiled 1,184 times for 26 ($199).
+SPIN_WINDOW = 24 * 3600
+SPIN_COMPILES = 200
+SPIN_ALONE = 200
+SPIN_RATIO = 4
+SPIN_MATCHES = 3
 
 
-# what an agent CLI says when nobody signed in to it (Claude Code: "Not logged in · Please run /login")
-_SIGNED_OUT = re.compile(r"not logged in|run /login|invalid api key|not authenticated|please (?:log|sign) ?in|"
+# what an agent CLI says when nobody signed in to it (Claude Code: "Not logged in · Please run /login"; Oh My Pi:
+# "No default model selected. Use /login, ..." on stderr, and a failed request's "401 Incorrect API key provided: ..."
+# as the errorMessage of a stdout message_end, so the words are matched wherever a CLI says them)
+_SIGNED_OUT = re.compile(r"not logged in|run /login|use /login|run ['\"]?(?:agent|kimi) login|no model configured|"
+                         r"no api key found|incorrect api key|"
+                         r"authentication required|invalid api key|not authenticated|please (?:log|sign) ?in|"
                          r"auth(?:entication)? method", re.I)
 # and when its sign-in stopped working (Claude Code, exit code 1 at once, nothing done: "Failed to authenticate: OAuth
 # session expired and could not be refreshed", its message marked "error": "authentication_failed"). Read as a plain
@@ -151,17 +167,21 @@ AUTH_FAILED = re.compile(r"failed to authenticate|oauth (?:session|token)[^.\n]{
 AUTH_RETRIES = 3  # failed sign-ins in a row before the helper pauses and asks for a new one
 AUTH_WAIT = 60  # seconds before the first try again, doubling
 # what a model's provider says when the account has no credit left (DeepSeek: "Insufficient Balance", OpenAI:
-# "insufficient_quota", Anthropic: "credit balance is too low", OpenCode: "quota exceeded"): trying again can't help
+# "insufficient_quota", Anthropic: "credit balance is too low", OpenCode: "quota exceeded", AgentRouter: "user quota
+# is not enough"): trying again can't help
 # until it's topped up
 _NO_CREDIT = re.compile(r"insufficient[ _](?:balance|credits?|funds|quota)|exceeded your current quota|"
-                        r"credit balance is too low|payment required|out of credits?", re.I)
+                        r"credit balance is too low|payment required|out of credits?|"
+                        # AgentRouter: "upstream 403: user quota is not enough" (28 restarts in 1.6 hours on one game)
+                        r"quota is not enough|not enough quota", re.I)
 # and when it's asked too much at once (HTTP 429): it works again in a while
-THROTTLED = re.compile(r"too many requests|rate[ _-]?limit|concurrency limit|\b429\b|overloaded", re.I)
+THROTTLED = re.compile(r"too many requests|rate[ _-]?limit|concurrency[ _-]?limit|\b429\b|overloaded", re.I)
 # and when a subscription's allowance is used up for now (Claude Code: "usage limit reached", "You've hit your
 # session limit", Codex: "You've hit your usage limit", Antigravity: RESOURCE_EXHAUSTED, OpenCode Go: "quota
 # exceeded"): it resets by itself in hours, so a helper waits for it instead of stopping (a night's run lost most of
 # its helpers that way; Claude Code's "session limit" wording once paused them as five fast failures)
-LIMIT = re.compile(r"(?:usage|session|weekly) limit|(?<!rate )(?<!rate-)(?<!rate_)limit (?:reached|exceeded)|"
+LIMIT = re.compile(r"(?:usage|session|weekly) limit|(?<!rate )(?<!rate-)(?<!rate_)(?<!concurrency )"
+                    r"(?<!concurrency-)(?<!concurrency_)limit (?:reached|exceeded)|"
                     r"hit your (?:(?!rate\b)[\w-]+ )?limit|quota[ _](?:exceeded|exhausted)|resource[ _]exhausted|"
                     r"out of (?:usage|messages)", re.I)
 # When a limit resets, as agents say it. Claude Code: "usage limit reached|1792140000" (seconds since 1970), or
@@ -253,6 +273,7 @@ def _which(cmd: str) -> str | None:
     if os.name == "nt":
         directories.append(Path(os.environ.get("APPDATA", home / "AppData" / "Roaming")) / "npm")
         directories.append(Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local")) / "agy" / "bin")
+        directories.append(Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local")) / "cursor-agent")
     for d in directories:
         if os.name == "nt":
             found = shutil.which(cmd, path=str(d))
@@ -286,6 +307,24 @@ def detect(quick: bool = False) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------------- sessions
+
+def _stdin_payload(prompt: str | None) -> str | None:
+    """What to write to a helper's stdin. None means its prompt went in a file (zcode's --attach), so write no
+    prompt text and just close the pipe. On Windows, winhelper.py still needs its \x01 gate before it starts the
+    CLI; that gate is app plumbing, not prompt text, and must arrive even for an empty (or file) prompt."""
+    gate = "\x01" if os.name == "nt" else ""
+    if prompt is None:
+        return gate or None
+    return gate + prompt
+
+
+def _feed_stdin(proc: subprocess.Popen, prompt: str | None) -> None:
+    """Write `_stdin_payload(prompt)` and close the pipe, so the agent sees end of input."""
+    payload = _stdin_payload(prompt)
+    if payload is not None:
+        proc.stdin.write(payload)
+    proc.stdin.close()
+
 
 def _fresh_usage() -> dict:
     return {"usd": 0.0, "tokens": 0, "turns": 0, "tool_calls": 0} | {k: 0 for k in TOKEN_KINDS}
@@ -339,6 +378,7 @@ class Session:
 
     def snapshot(self, since: int = 0) -> dict:
         return {"id": self.id, "kind": self.kind, "kind_name": agents.get(self.kind).name, "label": self.label,
+                "account_id": self.options.get("account_id") or "", "account_name": self.options.get("account_name") or "",
                 "task": self.options.get("task") or "",  # "readable": it polishes matched code
                 "slug": self.slug, "agent": self.agent_name, "model": self.model, "state": self.state, "why": self.why,
                 "todo": self.todo, "until": self.until, "stopped_by": self.stopped_by,
@@ -347,9 +387,56 @@ class Session:
                 "feed": [f for f in self.feed if f["seq"] > since]}
 
 
+def spin_advice(recent: list[dict]) -> dict[tuple[str, str], str]:
+    """A sentence for each model spinning on a project (SPIN_*), by (kind, model): what its helpers got for their
+    compiles lately and what a stronger model might do, for the user to weigh, not an order. `recent`: costs' rows
+    (kind, model, usd, compiles, matches) for the last SPIN_WINDOW."""
+    def name(r):
+        return r["model"] or r["kind"]
+
+    def per_match(r):
+        return (r["compiles"] or 0) / r["matches"] if r["matches"] else None
+
+    def money(r):
+        return f", ${r['usd'] / r['matches']:,.2f} a match" if r["usd"] and r["matches"] else ""
+
+    proven = [r for r in recent if (r["matches"] or 0) >= SPIN_MATCHES]
+    best = min(proven, key=per_match, default=None)
+    out = {}
+    for r in recent:
+        compiles, matches = r["compiles"] or 0, r["matches"] or 0
+        if compiles < SPIN_COMPILES or r is best:
+            continue
+        mine = compiles / matches if matches else float("inf")
+        if best is not None and mine >= SPIN_RATIO * per_match(best):
+            cheaper = bool(r["usd"] and best["usd"] and (not matches or r["usd"] / matches > best["usd"] / best["matches"]))
+            out[(r["kind"], r["model"])] = (
+                f"In the last day {name(r)}'s helpers here made {compiles:,} compiles for "
+                f"{matches or 'no'} match{'es' * (matches != 1)}{money(r)}; {name(best)}'s needed about "
+                f"{per_match(best):,.0f} compiles a match{money(best)}. What's left of this game may be past what "
+                f"{name(r)} does well: {name(best)} could get further{', for less' if cheaper else ''}. You might "
+                f"give {name(r)} fewer helpers here.")
+        elif mine >= SPIN_ALONE:
+            out[(r["kind"], r["model"])] = (
+                f"In the last day {name(r)}'s helpers here made {compiles:,} compiles for "
+                f"{matches or 'no'} match{'es' * (matches != 1)}{money(r)}. What's left of this game may be past what "
+                f"{name(r)} does well: a stronger model could get further.")
+    return out
+
+
 def _proc_start(pid: int) -> int | None:
     """When a process started (clock ticks since boot): with its pid, it tells that process from a later one that
     got the same pid."""
+    if sys.platform == "darwin":
+        try:
+            result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0 and result.stdout.strip():
+                from datetime import datetime
+
+                return int(datetime.strptime(result.stdout.strip(), "%a %b %d %H:%M:%S %Y").timestamp())
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+        return None
     try:
         return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[STAT_STARTTIME_INDEX])
     except (OSError, ValueError, IndexError):
@@ -422,6 +509,26 @@ class Manager:
         with net.store.tx() as db:
             for statement in SCHEMA:
                 db.execute(statement)
+            if "task" not in {r[1] for r in db.execute("PRAGMA table_info(helper_sessions)")}:
+                # Sessions from before it was kept take their helper's task now, while its record is there. Ids are
+                # reused (helpers.id has no AUTOINCREMENT), so the helper must also be the session's project and
+                # agent name: by id alone an old session took a new helper's task. A helper switched from polishing
+                # to decompiling counts its polishing as decompiling until it ages out of SPIN_WINDOW. Its options
+                # may not be JSON (an empty value, which _restore reads as no options): json_extract of one stopped
+                # the app from starting, so json_valid guards it.
+                db.execute("ALTER TABLE helper_sessions ADD COLUMN task TEXT NOT NULL DEFAULT ''")
+                db.execute("UPDATE helper_sessions SET task=COALESCE((SELECT CASE WHEN json_valid(h.options) THEN "
+                           "json_extract(h.options, '$.task') END FROM helpers h "
+                           "WHERE h.id=helper_sessions.helper_id AND h.project=helper_sessions.project "
+                           "AND h.name=helper_sessions.agent), '')")
+            columns = {r[1] for r in db.execute("PRAGMA table_info(helper_sessions)")}
+            for column in ("account_id", "account_name"):
+                if column not in columns:
+                    db.execute(f"ALTER TABLE helper_sessions ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(helper_sessions)")}
+            for column, ddl in [("role", "TEXT NOT NULL DEFAULT 'owner'"), ("request_id", "INTEGER")]:
+                if column not in columns:
+                    db.execute(f"ALTER TABLE helper_sessions ADD COLUMN {column} {ddl}")
         self._restore()
         self.refresh_detected()
 
@@ -444,7 +551,7 @@ class Manager:
             if s.kind not in {a.id for a in agents.AGENTS}:
                 continue
             if s.state in LIVE:
-                if r["pid"] and _proc_start(r["pid"]) == r["pid_start"]:  # still running: the app crashed
+                if r["pid"] and r["pid_start"] is not None and _proc_start(r["pid"]) == r["pid_start"]:
                     crashed.add(r["pid"])
                 s.state, s.stopped_by, s.until = "stopped", BY_QUIT, None
                 s.why = "decompdecomp closed while it worked"
@@ -501,21 +608,43 @@ class Manager:
             options.pop("model", None)  # a Gemini CLI model name may mean nothing to Antigravity: use its default
         if self._down:
             raise ValueError("decompdecomp is quitting")
+        # A helper keeps the model it starts on (#204): one started on the CLI's own default records that default
+        # now, so that changing the default later in the CLI's settings doesn't silently switch a resumed helper
+        # while its name still says the old model. The default as the CLI's settings spell it may not be a model id
+        # its command line takes (Antigravity's is a display name): resolve_model maps it from what the CLI last
+        # listed, or returns "" when it can't, and then the helper stays unpinned and starts on the CLI's default as
+        # before. An API helper's model is its endpoint's and is recorded there.
+        chosen = str(options.get("model") or "")
+        name_model = chosen
+        if agent.command and not chosen:
+            name_model = str(agent.default_model(options) or "")
+            if name_model:
+                pinned = agent.resolve_model(name_model, _which(agent.command))
+                if pinned:
+                    options["model"] = name_model = pinned
         ids = []
         self._prepare(slug)
         with self._lock:
+            if self._down:
+                raise ValueError("decompdecomp is quitting")
             for _ in range(max(1, min(int(count), MAX_AT_ONCE))):
-                model = options.get("model") or agent.config_model() or ""
+                model = name_model
                 if options.get("effort") and "#" not in model:  # an effort is a record of its own, as with the others
                     model = f"{model}#{options['effort']}"
-                name = helper_name(kind, model, self._taken())
+                # #45: a stopped helper keeps its account and totals. Another account of the same model must
+                # get a different record; otherwise its card would inherit the first account's spend.
+                other_accounts = {s.agent_name for s in self.sessions.values() if s.slug == slug
+                                  and s.options.get("account_id", "") != options.get("account_id", "")}
+                name = helper_name(kind, model, self._taken() | other_accounts)
                 s = self._record(slug, kind, name, self._label(kind, name, options), options)
                 s.restarts = 0
-                self._launch(s)
-                ids.append(s.id)
+                if self._launch(s):
+                    ids.append(s.id)
         return ids
 
-    def _launch(self, s: Session) -> None:
+    def _launch(self, s: Session) -> bool:
+        if self._down:
+            return False
         s.stop = threading.Event()
         s.state, s.why, s.todo, s.until, s.stopped_by, s.error = "starting", "", "", None, "", ""
         s.signed_out = s.throttled = s.limited = s.auth_failed = False
@@ -523,10 +652,13 @@ class Manager:
         self._save(s)
         s.thread = threading.Thread(target=self._run, args=(s,), daemon=True, name=f"agent-{s.agent_name}")
         s.thread.start()
+        return True
 
     def restart(self, sid: str) -> None:
         """Start a stopped or paused helper again, by hand."""
         with self._lock:
+            if self._down:
+                raise ValueError("decompdecomp is quitting")
             s = self.sessions.get(sid)
             if s is None:
                 raise ValueError("no such helper")
@@ -538,7 +670,7 @@ class Manager:
                 raise ValueError(f"{s.agent_name} works on another game right now: start a new helper instead")
             options = self.options_now(s.kind, dict(s.options))
             if options is None:
-                raise ValueError("its API endpoint was removed: start a new helper on another one")
+                raise ValueError("its account or API endpoint was removed: start a new helper and choose another one")
             s.options, s.restarts = options, 0
             self._prepare(s.slug)
             self._launch(s)
@@ -547,22 +679,36 @@ class Manager:
         """Helpers the app stopped by quitting carry on, as their options are now (options_now)."""
         ids = []
         with self._lock:
-            for s in list(self.sessions.values()):
-                if s.state != "stopped" or s.stopped_by != BY_QUIT:
+            sessions = list(self.sessions.values())
+        for s in sessions:
+            with self._lock:
+                if self._down:
+                    break
+                if self.sessions.get(s.id) is not s or s.state != "stopped" or s.stopped_by != BY_QUIT:
                     continue
-                try:
-                    self.net.project_row(s.slug)
-                except NetworkError:
-                    continue
-                options = self.options_now(s.kind, dict(s.options))
-                if options is None:
-                    s.stopped_by, s.why = BY_ITSELF, "its API endpoint was removed"
-                    self._save(s)
+            try:
+                self.net.project_row(s.slug)
+            except NetworkError:
+                continue
+            options = self.options_now(s.kind, dict(s.options))
+            if options is None:
+                with self._lock:
+                    if not self._down and self.sessions.get(s.id) is s \
+                            and s.state == "stopped" and s.stopped_by == BY_QUIT:
+                        s.stopped_by, s.why = BY_ITSELF, "its API endpoint was removed"
+                        self._save(s)
+                continue
+            self._prepare(s.slug)
+            with self._lock:
+                # Project sync and preparation can take a while. stop(), restart(), or shutdown may have
+                # changed this session while they ran; only register a helper that is still eligible.
+                if self._down:
+                    break
+                if self.sessions.get(s.id) is not s or s.state != "stopped" or s.stopped_by != BY_QUIT:
                     continue
                 s.options = options
-                self._prepare(s.slug)
-                self._launch(s)
-                ids.append(s.id)
+                if self._launch(s):
+                    ids.append(s.id)
         return ids
 
     def _prepare(self, slug: str) -> None:
@@ -608,6 +754,9 @@ class Manager:
         and they carry on when it starts again). Its function is free at once, not when its thread notices (an API
         helper waits on its model meanwhile, and its claim showed up as a "connected agent")."""
         by = BY_QUIT if sid is None else by
+        if sid is None:
+            with self._lock:
+                self._down = True
         for s in list(self.sessions.values()):
             if sid not in (None, s.id):
                 continue
@@ -620,12 +769,15 @@ class Manager:
                     s.state, s.stopped_by, s.until, s.todo = "stopped", by, None, ""
                     s.why = {BY_YOU: "stopped by you", BY_QUIT: "decompdecomp closed while it worked"}.get(by, s.why)
                     self._save(s)
+                elif sid is not None and s.state == "stopped" and s.stopped_by == BY_QUIT:
+                    s.stopped_by, s.why = by, "stopped by you"
+                    self._save(s)
             self._release(s)
 
     def stop_project(self, slug: str) -> None:
         """Stop every helper working on one project (by the user)."""
         for s in list(self.sessions.values()):
-            if s.slug == slug and s.state in LIVE:
+            if s.slug == slug and (s.state in LIVE or s.state == "stopped" and s.stopped_by == BY_QUIT):
                 self.stop(s.id)
 
     def remove(self, sid: str) -> None:
@@ -635,13 +787,33 @@ class Manager:
             db.execute("DELETE FROM helpers WHERE id=?", (sid,))
         self.sessions.pop(sid, None)
 
+    def remove_paused(self, slug: str) -> int:
+        """Forget only paused helpers on this project, without removing one restarted meanwhile."""
+        with self._lock:
+            paused = [s.id for s in self.sessions.values() if s.slug == slug and s.state == "paused"]
+            for sid in paused:
+                self.remove(sid)
+        return len(paused)
+
     def costs(self, slug: str) -> list[dict]:
         """What each model's helpers spent on a project and what they matched (helper_sessions): which models to run
-        more of. Cheapest per match first; models with no match last."""
-        rows = self.net.store.all(
-            "SELECT kind, model, COUNT(*) AS sessions, SUM(usd) AS usd, SUM(tokens) AS tokens, SUM(matches) AS matches, "
-            "SUM(compiles) AS compiles FROM helper_sessions WHERE project=? GROUP BY kind, model", slug)
-        out = [dict(r) | {"usd": r["usd"] or 0.0, "tokens": r["tokens"] or 0, "matches": r["matches"] or 0} for r in rows]
+        more of. Cheapest per match first; models with no match last. A model spinning in the last SPIN_WINDOW gets
+        `advice` (spin_advice) and the `advice_model` it is about, from its decompiling sessions only: polishing
+        compiles matched code and matches nothing new, so a model run only to polish an Xbox game was told its 1,282
+        compiles of a day had made no match. The GUI dismisses advice by model (#131): its sentence carries counts that
+        change as helpers work."""
+        query = ("SELECT kind, model, COUNT(*) AS sessions, SUM(usd) AS usd, SUM(tokens) AS tokens, SUM(matches) AS "
+                 "matches, SUM(compiles) AS compiles FROM helper_sessions WHERE project=? AND started_at >= ? {} "
+                 "GROUP BY kind, model")
+        rows = self.net.store.all(query.format(""), slug, 0)
+        recent = [dict(r) for r in self.net.store.all(query.format("AND task != 'readable'"), slug,
+                                                      time.time() - SPIN_WINDOW)]
+        advice = spin_advice(recent)
+        out = []
+        for r in rows:
+            said = advice.get((r["kind"], r["model"]), "")
+            out.append(dict(r) | {"usd": r["usd"] or 0.0, "tokens": r["tokens"] or 0, "matches": r["matches"] or 0,
+                                  "advice": said, "advice_model": (r["model"] or r["kind"]) if said else ""})
         # a model without a price (the API helper counts only tokens) isn't free: priced models by dollars a match,
         # then the rest by tokens a match, then those that matched nothing
         return sorted(out, key=lambda r: (r["matches"] == 0, r["usd"] == 0,
@@ -671,6 +843,22 @@ class Manager:
 
     def _strays(self) -> set[int]:
         """Process groups of processes this app's helpers started, found by HELPER_ENV in their environment."""
+        if sys.platform == "darwin":
+            try:
+                processes = subprocess.run(["ps", "eww", "-axo", "pid=,pgid=,command="], capture_output=True,
+                                           text=True, timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                return set()
+            if processes.returncode:
+                return set()
+            mark = f"{HELPER_ENV}={self.home}"
+            groups = set()
+            for line in processes.stdout.splitlines():
+                parts = line.split(None, 2)
+                if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit() and int(parts[0]) != os.getpid():
+                    if mark + " " in parts[2] or parts[2].endswith(mark):
+                        groups.add(int(parts[1]))
+            return groups
         # Linux exposes child environments through /proc. On Windows there is no equivalent filesystem, so there
         # are no stray groups to recover here; the live sessions are still stopped through their Popen handles.
         if not PROCFS.is_dir():
@@ -735,10 +923,24 @@ class Manager:
             agent_id, agent_id)
         return row["n"]
 
-    def _left(self, slug: str) -> int:
+    def _left(self, slug: str, task: str = "") -> int:
+        """What the session's task has left in the project: open functions, or for polishing, matched ones it can
+        still take (app/readable.py)."""
         proj = self.net.project_row(slug)
+        if task == "readable":
+            return self.net.readability.left(proj)
         row = self.net.store.one("SELECT COUNT(*) AS n FROM functions WHERE project_id=? AND status='open'", proj["id"])
         return row["n"]
+
+    def _ruled_out(self, slug: str, agent_name: str) -> int:
+        """How many functions are open when this helper said of every one that no C makes it (0 otherwise): the claim
+        order never hands them back to it (Network.claim_row), so a session could only find nothing to do. Its
+        sessions failed one after another into a pause (FAST_FAILURES_TO_PAUSE) instead, on a demo whose last open
+        function was a hand-written helper both agents of one model had ruled out."""
+        proj = self.net.project_row(slug)
+        waiting = self.net.awaiting_verdict(proj)
+        n = self._left(slug)
+        return n if n and sum(agent_name in said for said in waiting.values()) == n else 0
 
     def account(self, s: Session, usage: dict) -> None:
         """Add what a session spent to the helper, the session and the project (kept in its config)."""
@@ -754,6 +956,25 @@ class Manager:
         s.tokens += total
         if usd or total:
             self.net.add_spend(s.slug, usd, total)
+
+    def rename_account(self, aid: str, name: str) -> None:
+        """An account's label is local UI text: update its helpers without restarting or changing their login."""
+        with self._lock:
+            for session in list(self.sessions.values()):
+                if session.options.get("account_id") != aid:
+                    continue
+                session.options["account_name"] = name
+                kept = {k: v for k, v in session.options.items() if k != "api_key"}
+                with self.net.store.tx() as db:
+                    db.execute("UPDATE helpers SET options=? WHERE id=?", (json.dumps(kept), session.id))
+
+    def account_usage(self) -> list[dict]:
+        """Finished sessions recorded here, across projects, even after their helper records were removed."""
+        rows = self.net.store.all("SELECT kind, account_id, MAX(account_name) AS name, SUM(tokens) AS tokens, "
+                                  "SUM(usd) AS usd, COUNT(*) AS sessions FROM helper_sessions "
+                                  "WHERE ended_at IS NOT NULL GROUP BY kind, account_id")
+        supported = {a.id for a in agents.AGENTS if a.uses_accounts}
+        return [dict(r) for r in rows if r["kind"] in supported]
 
     def over_budget(self, slug: str) -> float | None:
         """The budget (USD) when the project's agents have spent it, else None."""
@@ -819,37 +1040,68 @@ class Manager:
             twins.ordered.wait(ORDER_WAIT)
         failures = fast = throttles = limits = auths = 0
         while not s.stop.is_set():
-            if self._left(s.slug) == 0:
-                self._finish(s, "nothing left to decompile here 🎉")
+            if self._left(s.slug, task := s.options.get("task") or "") == 0:
+                self._finish(s, f"nothing left to {'polish' if task == 'readable' else 'decompile'} here 🎉")
+                break
+            if task != "readable" and (ruled := self._ruled_out(s.slug, agent.name)):
+                self._finish(s, f"nothing left it can do: the {ruled} open function{'s' * (ruled != 1)} "
+                                f"{'are ones' if ruled != 1 else 'is one'} it found no C makes. Set "
+                                f"{'them' if ruled != 1 else 'it'} aside in {'their' if ruled != 1 else 'its'} panel, "
+                                "or start a helper of another model to look")
                 break
             if (cap := self.over_budget(s.slug)) is not None:
                 self._finish(s, f"the agents on this project have spent the ${cap:.2f} budget (Setup)")
                 break
+            if (opens := schedule.next_start(s.options.get("hours"))) is not None:
+                self._wait(s, f"off its hours ({schedule.describe(s.options.get('hours'))}): waiting for the next "
+                              f"window rather than paying the peak rate", opens, "")
+                continue
             if self._room_away(s):
                 continue
             if (broken := self._build_problem(s.slug)) is not None:
                 self._pause(s, f"the project doesn't build on this computer, so no session starts: {broken}",
                             "Fix the project's setup (its page says what's wrong), then press Start again.")
                 break
-            s.runs += 1
-            self._set(s, "working")
-            began = time.time()
-            before = self._progress(agent.id)
-            row = self._session_begin(s)
-            kind = agents.get(s.kind)
+            request = None
+            if s.options.get("task") != "readable":
+                request = specialists.take(self.net, agent, s.slug)
+                if request is not None:
+                    s.options["_specialist_request"] = request['id']
+                    s.push("info", f"advising owner on request #{request['id']} ({request['category']}); source remains owner-only")
             try:
-                ok = self._run_cli(s, token, workdir) if kind.command else kind.run(self, s, agent)
-            except Fatal as e:  # needs the user first: retrying can't help
-                self._session_end(s, row, agent, began, "paused")
-                s.error = str(e)
-                self._pause(s, str(e))
-                break
-            except Exception as e:  # keep the runner alive; show what happened
-                log.exception("helper %s failed", s.agent_name)
-                s.error = f"{type(e).__name__}: {e}"
-                s.push("error", s.error)
-                ok = False
-            if ok and not s.stop.is_set() and self._progress(agent.id) == before:
+                s.runs += 1
+                self._set(s, "working")
+                began = time.time()
+                before = self._progress(agent.id)
+                row = self._session_begin(s)
+                kind = agents.get(s.kind)
+            except BaseException:
+                if request is not None:
+                    specialists.finish(self.net, agent, s.slug, request['id'], "Advisory session setup failed.")
+                    s.options.pop("_specialist_request", None)
+                raise
+            try:
+                try:
+                    ok = self._run_cli(s, token, workdir) if kind.command else kind.run(self, s, agent)
+                except Fatal as e:  # needs the user first: retrying can't help
+                    self._session_end(s, row, agent, began, "paused")
+                    s.error = str(e)
+                    self._pause(s, str(e))
+                    break
+                except Exception as e:  # keep the runner alive; show what happened
+                    log.exception("helper %s failed", s.agent_name)
+                    s.error = f"{type(e).__name__}: {e}"
+                    s.push("error", s.error)
+                    ok = False
+                if request is not None and ok and not specialists.completed(self.net, agent, s.slug, request['id']):
+                    ok = False
+                    s.error = "the specialist ended without reporting its findings"
+                    s.push("error", s.error)
+            finally:
+                if request is not None:
+                    specialists.finish(self.net, agent, s.slug, request['id'], "Advisory helper session ended.")
+                    s.options.pop("_specialist_request", None)
+            if ok and request is None and not s.stop.is_set() and self._progress(agent.id) == before:
                 s.error = "the session ended without compiling anything (its messages are in its details)"
                 s.push("error", s.error)
                 ok = False
@@ -858,18 +1110,18 @@ class Manager:
             if s.stop.is_set():
                 break
             if s.signed_out:
-                self._pause(s, s.error)
+                self._pause(s, s.error, kind.signin_for(s.options))
                 break
             if s.auth_failed:  # not a failure of the helper's: tried again a few times, then a new sign-in
                 s.auth_failed, auths = False, auths + 1
                 if auths >= AUTH_RETRIES:
                     self._pause(s, f"{kind.name} needs you to sign in again: its sign-in failed {auths} times in a "
-                                   f"row ({s.error})", kind.signin)
+                                   f"row ({s.error})", kind.signin_for(s.options))
                     break
                 s.restarts += 1
                 self._wait(s, f"{kind.name}'s sign-in failed ({s.error}); trying again, and if it keeps failing "
                               "this helper will ask you to sign in again", time.time() + AUTH_WAIT * 2 ** (auths - 1),
-                           kind.signin)
+                           kind.signin_for(s.options))
                 continue
             auths = 0
             if s.limited:  # the plan's allowance is used up for now: it resets, so wait as long as it takes
@@ -894,7 +1146,7 @@ class Manager:
             failures += 1
             fast = fast + 1 if time.time() - began < FAST_FAILURE else 0
             if fast >= FAST_FAILURES_TO_PAUSE:
-                hint = kind.signin if _SIGNIN.search(s.error) else ""  # not after every failure: it misleads
+                hint = kind.signin_for(s.options) if _SIGNIN.search(s.error) else ""  # not after every failure: it misleads
                 self._pause(s, f"it failed {fast} times in a row, each soon after it started: {s.error}", hint)
                 break
             s.restarts += 1
@@ -938,9 +1190,13 @@ class Manager:
     def _session_begin(self, s: Session) -> int:
         s.usage = _fresh_usage()
         with self.net.store.tx() as db:
-            return db.execute("INSERT INTO helper_sessions(helper_id, project, kind, model, agent, started_at) "
-                              "VALUES(?,?,?,?,?,?)", (s.id, s.slug, s.kind, s.model or agents.get(s.kind).config_model() or "",
-                                                      s.agent_name, time.time())).lastrowid
+            return db.execute("INSERT INTO helper_sessions(helper_id, project, kind, model, agent, started_at, task, "
+                              "account_id, account_name, role, request_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                              (s.id, s.slug, s.kind, s.model or agents.get(s.kind).default_model(s.options) or "",
+                               s.agent_name, time.time(), s.options.get("task") or "",
+                               s.options.get("account_id") or "", s.options.get("account_name") or "",
+                               "specialist" if s.options.get("_specialist_request") else "owner",
+                               s.options.get("_specialist_request"))).lastrowid
 
     def _session_end(self, s: Session, row: int, agent, began: float, outcome: str) -> None:
         """What a session did and spent, on its row: to compare models on cost per match."""
@@ -962,46 +1218,95 @@ class Manager:
 
     def prompt(self, s: Session) -> str:
         text = self._prompt(s)
+        if s.options.get("_specialist_request"):
+            if (wish := self.net.instructions(s.slug)):
+                text += f"\nThe user's project instructions:\n{wish}\n"
+            return text
         # the know-how every session reads first, given up front (saves each session its first tool calls)
         ov = self.net.overview(s.slug)  # (only its platform's parts: tools.for_platform)
-        text += "\nKnow-how you'd otherwise read with guide() (more topics: guide()):\n\n" + tools.up_front(
+        text += "\nStartup guidance (detailed recipes remain available through guide()):\n\n" + tools.up_front(
             ov.get("platform") or "", ov.get("kind") or "", ov["compiler"]["toolchain"])
         if (known := self.net.knowledge.for_prompt(s.slug)):
             text += f"\n{known}\n"
         if (wish := self.net.instructions(s.slug)):
             text += f"\nThe user's instructions for this project (they come first):\n{wish}\n"
+        if (order := self.net.claim_order(s.slug)):
+            text += (f"\nThe project's owner chose the order helpers take functions in: {network.CLAIM_ORDERS[order]}. "
+                     "claim_function without a function follows it; one you name still comes.\n")
         return text
 
     def _prompt(self, s: Session) -> str:
+        if s.options.get("_specialist_request"):
+            row = self.net.store.one("SELECT id,name,owner,trusted FROM agents WHERE name=?", s.agent_name)
+            agent = network.Agent(row['id'], row['name'], row['owner'], bool(row['trusted']))
+            request_id = s.options["_specialist_request"]
+            return ("You are an advisory specialist for one named blocker. The existing claim holder remains the sole "
+                    "source owner. Inspect shared experiments and the indicated region, then call report_specialist "
+                    "once with evidence, uncertainties and up to four named exact-edit recipes. Do not claim, compile, "
+                    "edit, invoke automated solvers, or request more agents. You have at most 16 inspection calls. "
+                    "Finish this report and end the session. An improved score or agreement is not a correctness verdict.\n\n"
+                    + specialists.brief(self.net, agent, s.slug, request_id))
         ov = self.net.overview(s.slug)
         count = s.options.get("per_session", PER_SESSION)
         if s.options.get("task") == "readable":  # (in either mode: the step that differs is the mode's)
             return tools.READABLE_PROMPT.format(title=ov["title"], count=count, names=tools.READABLE_FORK
                                                 if ov.get("kind") == "fork" else tools.READABLE_ROM)
+        console = consoles.get(ov.get("platform"))
+        scratch = ov.get("origin") == "scratch"
         if ov.get("kind") == "fork":
-            guides = ["fork", "objdiff", *consoles.get(ov.get("platform")).guides]
+            guides = ["fork", "objdiff", *console.guides]
             platform = ov.get("platform_name") or "its platform"
-            what = tools.FORK_SCRATCH if ov.get("origin") == "scratch" else tools.FORK_PUBLIC
-            return tools.FORK_PROMPT.format(title=ov["title"], what=what.format(platform=platform),
+            what = tools.FORK_SCRATCH if scratch else tools.FORK_PUBLIC
+            text = tools.FORK_PROMPT.format(title=ov["title"], what=what.format(platform=platform),
                                             count=count, budget=network.stall_budget_text(),
                                             guides=", ".join(f'guide("{g}")' for g in guides))
-        guide = consoles.get(ov.get("platform")).up_front_guide(ov["compiler"]["toolchain"])
-        return tools.WORK_PROMPT.format(title=ov["title"], count=count, budget=network.stall_budget_text(),
+            if "join_functions" in tools.tool_names(True, console, scratch=scratch):
+                text += "\n\n" + tools.FORK_JOIN
+            return text
+        guide = console.up_front_guide(ov["compiler"]["toolchain"])
+        text = tools.WORK_PROMPT.format(title=ov["title"], count=count, budget=network.stall_budget_text(),
                                         compiler_guide=guide)
+        offered = set(tools.tool_names(False, console))
+        # (a ROM prompt may already name a join its engine offers, as #192's does: don't say it twice)
+        extra = [block for tool, block in (("join_functions", tools.ROM_JOIN),
+                                           ("guess_struct", tools.WORK_STRUCTS),
+                                           ("report_boundary", tools.WORK_BOUNDARY))
+                 if tool in offered and (tool != "join_functions" or "join_functions" not in text)]
+        if extra:
+            text += "\n\n" + "\n\n".join(extra)
+        return text
 
-    def _command(self, s: Session, token: str, workdir: Path) -> tuple[list[str], dict, str]:
-        """The agent's command line, environment and what goes in on stdin (the prompt). Each helper connects only to
-        this app's own MCP server, with its own token."""
+
+    def _command(self, s: Session, token: str, workdir: Path) -> tuple[list[str], dict, str | None]:
+        """The agent's command line, environment and what goes in on stdin (the prompt; None when its prompt went in
+        a file). Each helper connects only to this app's own MCP server, with its own token."""
         k = agents.get(s.kind)
+        options = self.options_now(s.kind, dict(s.options))
+        if options is None:
+            raise Fatal("Its account or API endpoint was removed. Start a new helper and choose another one.")
+        s.options = options
         exe = _which(k.command)
         if not exe:
             raise RuntimeError(f"{k.name} is not installed")
+        # zcode has no stdin prompt: its session command attaches a file, and this writes the prompt into it. Every
+        # other agent leaves prompt_file at None and keeps getting the prompt on stdin. Written before the command:
+        # a prompt zcode cannot attach fails the session before its settings file exists, and pauses the helper
+        # instead of retrying a prompt only the user can shorten.
+        prompt = self.prompt(s)
+        try:
+            prompt_file = k.prompt_file(workdir, prompt)
+        except ValueError as e:
+            raise Fatal(str(e)) from e
         cmd, more = k.session_command(exe, workdir, self.mcp_url, token, s.model)
-        cmd = agents.cli_argv(cmd)
+        cmd = k.launch_command(agents.cli_argv(cmd))
         # PWD too: opencode 2 works in $PWD, not the folder it starts in, and the app's PWD was the user's home, so
         # Mario Kart 64's helpers worked there without their folder's settings: no tools, and a free shell
         env = dict(os.environ, PWD=str(workdir), **{HELPER_ENV: str(self.home)}, **more)
-        return cmd, env, k.stdin(self.prompt(s))
+        try:
+            env = k.session_environment(s.options, env)
+        except ValueError as e:
+            raise Fatal(str(e)) from e
+        return cmd, env, None if prompt_file is not None else k.stdin(prompt)
 
     def _run_cli(self, s: Session, token: str, workdir: Path) -> bool:
         k = agents.get(s.kind)
@@ -1037,8 +1342,7 @@ class Manager:
 
         def feed_prompt():
             try:
-                proc.stdin.write(("\x01" if os.name == "nt" else "") + prompt)
-                proc.stdin.close()  # end of input: the agent works on this one prompt, then exits
+                _feed_stdin(proc, prompt)
             except OSError:  # it exited before reading (stderr says why)
                 pass
 
@@ -1085,7 +1389,7 @@ class Manager:
             s.throttled = True
         if code != 0 and _SIGNED_OUT.search(everything):
             s.signed_out = True
-            s.error = f"{k.name} isn't signed in on this computer. {k.signin}"
+            s.error = f"{k.name} isn't signed in on this computer. {k.signin_for(s.options)}"
             s.push("error", s.error)
             return False
         if (code != 0 or not saw_tool) and AUTH_FAILED.search(everything):

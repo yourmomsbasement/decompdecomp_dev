@@ -22,7 +22,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from .. import agents as kinds
-from .. import hostenv, ranking
+from .. import hostenv, ranking, wine
 from ..network import NetworkError
 from . import agents, collab, routes, saves, tools, updates, window
 from .engine import RomNetwork
@@ -52,7 +52,17 @@ def build(net: RomNetwork, home: Path, port: int, secret: str):
         """Quit means quit: the window, every helper with everything it started, then the server."""
         window.close_app()
         manager.shutdown()
+        flush_progress()
+        wine.stop()  # (its wine server would otherwise stay up to 10 minutes after the last compile)
         os._exit(0)
+
+    def flush_progress() -> None:
+        """Try every final save and leave a clear log entry when the user's progress folder is blocked."""
+        try:
+            for slug, error in net.progress.flush().items():
+                jobs.logger.error("could not save %s before exit: %s", slug, error)
+        except Exception:  # shutdown must continue even if the progress store itself is damaged
+            jobs.logger.exception("could not flush progress before exit")
     window.WINDOW = window.Window(home, f"http://127.0.0.1:{port}/", secret, window_ended)
     settings = Settings(home / "settings.json")
     if hostenv.in_old_windows_install() and (settings.data.get("auto_update") or settings.data.get("check_updates", True)):
@@ -76,32 +86,38 @@ def build(net: RomNetwork, home: Path, port: int, secret: str):
         return agent, slug
 
     threading.Thread(target=collab.local_addresses, daemon=True).start()  # `tailscale status` can take seconds
-    # rooms this computer belongs to reconnect (members keep their place; their agents wait while the host is away)
-    net.restore_links()
 
     def consoles_start() -> None:  # what each console does for its projects at start (Console.on_start)
-        for row in net.store.all("SELECT slug, config FROM projects"):
+        for row in net.store.all("SELECT id, slug, root, config FROM projects"):
             try:
+                if net.project_missing(row):
+                    continue  # its folder is gone: only its records are left, and those are removed, not set up
                 if net.is_rom(row):
                     net.rangechecks.reopen(row["slug"])
                 net.console(row).on_start(net, row["slug"], log=jobs.logger.info)
             except Exception:  # never stands between the user and the app
                 jobs.logger.exception("%s's console work at start failed", row["slug"])
-    threading.Thread(target=consoles_start, daemon=True, name="consoles-start").start()
-    saves.Autosave(net).start()  # each ROM project's work as plain files in its progress/ folder (app/saves.py)
 
     def options_now(kind: str, options: dict) -> dict | None:
         """A resumed helper's options as they are now: an API helper's endpoint as saved, with its key (None: the
-        endpoint was removed since)."""
+        endpoint was removed since). A model it was started on stays: the endpoint's default would record its costs
+        against another model."""
+        if options.get("account_id"):
+            try:
+                return options | settings.account_options(kind, str(options["account_id"]))
+            except ValueError:
+                return None
         if not kinds.get(kind).uses_endpoints:
             return options
         saved = settings.endpoint(str(options.get("endpoint") or "")) if options.get("endpoint") else (
             next((e for e in settings.endpoints() if e["base_url"] == options.get("base_url")), None))
         if saved is None and options.get("endpoint"):
             return None
-        return options | (session_options(saved) if saved is not None else {})
+        now = options | (session_options(saved) if saved is not None else {})
+        if options.get("picked_model"):
+            now["model"] = str(options["picked_model"])
+        return now
     manager.options_now = options_now
-    manager.resume()  # helpers that were working when the app last stopped carry on (their records say which)
 
     mcp = tools.build_mcp(net, agent_of)
 
@@ -117,7 +133,7 @@ def build(net: RomNetwork, home: Path, port: int, secret: str):
         except NetworkError:
             return ListToolsResult(tools=[])
         slug = manager.project_of(agent.id)
-        keep = set(tools.tool_names(bool(slug and net.fork_slug(slug))))
+        keep = set(tools.project_tools(net, slug))
         return ListToolsResult(tools=[t for t in everything if t.name in keep])
 
     mcp._lowlevel_server.add_request_handler("tools/list", PaginatedRequestParams, scoped_tools)
@@ -147,6 +163,7 @@ def build(net: RomNetwork, home: Path, port: int, secret: str):
 
     def before_restart() -> None:  # helpers stop now and resume in the new version; the window closes with the process
         manager.shutdown()
+        flush_progress()
 
     # the app's parts add their routes (routes/__init__.py says which is where); forks come after state and projects,
     # whose autopilot and with_project they use
@@ -158,4 +175,21 @@ def build(net: RomNetwork, home: Path, port: int, secret: str):
 
     security = TransportSecuritySettings(enable_dns_rebinding_protection=True, allowed_hosts=sorted(allowed_hosts),
                                          allowed_origins=[f"http://{h}" for h in sorted(allowed_hosts)])
+
+    def resume_work() -> None:
+        # A helper's project_row synchronizes its progress folder. On a large legacy save that takes minutes;
+        # doing it before uvicorn starts left the window waiting and repeat launches fighting for the database.
+        # Finish route registration before any background sync can take the store lock, too.
+        try:
+            net.restore_links()
+        except Exception:  # a broken room must not prevent local helpers from resuming
+            jobs.logger.exception("could not reconnect rooms at start")
+        threading.Thread(target=consoles_start, daemon=True, name="consoles-start").start()
+        saves.Autosave(net).start()
+        try:
+            manager.resume()
+        except Exception:  # the window must remain available to fix a project's blocked progress
+            jobs.logger.exception("could not resume helpers at start")
+
+    threading.Thread(target=resume_work, daemon=True, name="resume-work").start()
     return mcp, manager, security, quit_app

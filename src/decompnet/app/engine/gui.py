@@ -12,8 +12,9 @@ import time
 from pathlib import Path
 
 from ... import compilermap, consoles, scoring, toolchains
-from ...network import IN_BUILD, PROGRESS_COLUMNS, set_aside
+from ...network import CLAIM_ORDERS, IN_BUILD, PROGRESS_COLUMNS, set_aside
 from ...project import compiler_for
+from .. import saves
 
 # What the notification centre tells: news a person wants to hear about, not every claim and attempt agents make.
 NOTIFY_KINDS = ("match", "link", "autopilot", "compiler", "reopen", "not_c", "knowledge", "collab", "import", "reimport", "files",
@@ -27,16 +28,20 @@ EVENT_ROWS = ("SELECT e.id, e.kind, e.detail, e.created_at, a.name AS agent, p.s
               f"WHERE e.kind IN ({', '.join(repr(k) for k in NOTIFY_KINDS)})")
 
 
+def _same_source(a: str | None, b: str | None) -> bool:
+    """Whether two pieces of C are the same text, whitespace aside."""
+    return (a is not None and b is not None
+            and re.sub(r"\s+", " ", a).strip() == re.sub(r"\s+", " ", b).strip())
+
 
 class GuiMixin:
     def export_rom(self, slug: str, log=print) -> dict:
         """Write a rebuildable source tree (the base for ports and mods) and prove it rebuilds the game."""
         if self.fork_slug(slug):  # a fork's work is already in its source tree, committed
             return {"path": self._project(slug)["root"], "identical": None}
-        from ...rom.export import export_rom
 
         proj = self._project(slug)
-        res = export_rom(self, slug, Path(proj["root"]) / "source", self.console(proj), log=log)
+        res = self.console(proj).export_project(self, slug, Path(proj["root"]) / "source", log=log)
         with self.store.tx() as db:  # shown on the project page: what's in the tree and whether it rebuilds
             cfg = json.loads(db.execute("SELECT config FROM projects WHERE id=?", (proj["id"],)).fetchone()["config"])
             cfg["export"] = {"t": time.time(), "path": str(res["path"]), "identical": res.get("identical"),
@@ -47,6 +52,7 @@ class GuiMixin:
 
     def overview(self, slug: str) -> dict:
         proj = self._project(slug)
+        missing = self.project_missing(proj)
         last = self.store.one("SELECT MAX(created_at) AS t FROM events WHERE project_id=?", proj["id"])["t"]
         cfg = self.cfg(proj)
         # matches by the helper agents the app runs (their spend is what `spend` counts)
@@ -60,9 +66,12 @@ class GuiMixin:
                        "twins": None if twins is None else {
                            k: getattr(twins, k) for k in ("state", "pairs", "tried", "matched", "asm")},
                        "helper_matches": helpers,
+                       "big": self._big_functions(proj),
                        "readable": self.readability.counts(proj)["readable"],
                        "spend": cfg.get("spend"), "instructions": cfg.get("instructions") or "",
-                       "priority": cfg.get("priority", []),
+                       "claim_order": cfg.get("claim_order") if cfg.get("claim_order") in CLAIM_ORDERS else "",
+                       "priority": cfg.get("priority", []), "save_folder": str(saves.save_folder(self, slug)),
+                       "missing": missing,
                        # (a suggestion its own check disproved isn't one: older ones were filed)
                        "suggestions": [s for s in cfg.get("suggestions", []) if s["status"] == "open"
                                        and not re.search(r"does not match|doesn't compile", s["check"] or "")],
@@ -71,23 +80,41 @@ class GuiMixin:
                        "compiler_ranges": base.get("compiler_ranges") or self._range_rows(cfg),
                        "auto_compiler": self.auto_adjusts(proj)}
 
+    def _big_functions(self, proj) -> dict:
+        """The open functions of 400 instructions or more, how many were tried, and the parts of them helpers hold
+        (function_parts.py; big_function_report has the rest): on a PS4 game 810 of 815 were never tried."""
+        from ..function_parts import LARGE
+
+        row = self.store.one("SELECT COUNT(*) AS n, COALESCE(SUM(attempts > 0), 0) AS tried FROM functions "
+                             "WHERE project_id=? AND status='open' AND n_insns >= ?", proj["id"], LARGE)
+        parts = self.store.one("SELECT COUNT(*) AS n FROM part_claims p JOIN functions f ON f.id=p.function_id "
+                               "WHERE f.project_id=? AND p.expires_at >= ?", proj["id"], time.time())["n"]
+        return {"open": row["n"], "tried": row["tried"], "parts_held": parts, "insns": LARGE}
+
     def _overview(self, slug: str, proj) -> dict:
         if (fork := self.fork_slug(slug)):
             return self.forks.overview(fork)
         cfg = self.cfg(proj)
         agg = self.store.one(f"SELECT {PROGRESS_COLUMNS}, SUM(attempts) AS attempts "
                              f"FROM functions WHERE project_id=? AND {IN_BUILD}", proj["id"])
-        tc = toolchains.get(cfg["compiler"]["toolchain"])
+        # a project made with a compiler decompdecomp doesn't have still opens: the page says so, and its Settings
+        # let the user pick one that's here (#118)
+        compiler_id = cfg["compiler"]["toolchain"]
+        tc = toolchains.get(compiler_id) if toolchains.known(compiler_id) else None
         console = self.console(proj)
         return {
             "slug": proj["slug"], "title": proj["name"], "description": proj["description"],
             **console.project_facts(),
             "compilers": [c.id for c in console.compilers],
             "rom": {k: cfg["rom"].get(k) for k in ("title", "game_code", "region", "size", "sha1", "byte_order", "compiler_guess")},
-            "compiler": {"toolchain": tc.id, "name": consoles.compiler_name(tc.id), "flags": cfg["compiler"]["flags"],
-                         "installed": toolchains.installed(tc.id) is not None, "proprietary": tc.proprietary,
-                         "supported": tc.supported,
-                         "why": None if tc.supported else toolchains.unsupported_cpu()},
+            "compiler": {"toolchain": compiler_id, "name": consoles.compiler_name(compiler_id),
+                         "flags": cfg["compiler"]["flags"],
+                         "installed": tc is not None and toolchains.installed(tc.id) is not None,
+                         "proprietary": bool(tc and tc.proprietary),
+                         "supported": bool(tc and tc.supported), "known": tc is not None,
+                         "why": None if tc is None or tc.supported else toolchains.unsupported_cpu(),
+                         "missing": [{"id": t, "name": consoles.compiler_name(t), "proprietary": toolchains.get(t).proprietary}
+                                     for t in console.installable_compilers() if toolchains.installed(t) is None]},
             "functions": agg["total"] or 0, "matched": agg["matched"] or 0, "bytes": agg["bytes"] or 0,
             "matched_bytes": agg["matched_bytes"] or 0, "set_aside": agg["set_aside"] or 0,
             "set_aside_bytes": agg["set_aside_bytes"] or 0, "attempts": agg["attempts"] or 0,
@@ -106,6 +133,7 @@ class GuiMixin:
         cfg = self.cfg(proj)
         agg = self.store.one(f"SELECT {PROGRESS_COLUMNS} FROM functions WHERE project_id=? AND {IN_BUILD}", proj["id"])
         console = self.console(proj)
+        missing = self.project_missing(proj)
         if cfg.get("kind") == "fork":
             about = {"kind": "fork", "origin": cfg.get("origin"), "version": cfg.get("version"),
                      "ready": bool(cfg.get("ready")), "rom": {"game_code": cfg.get("version") or "", "region": console.name},
@@ -120,7 +148,8 @@ class GuiMixin:
                 "last_activity": self.store.one("SELECT MAX(created_at) AS t FROM events WHERE project_id=?",
                                                 proj["id"])["t"],
                 "room": (self._room_info(slug) or {}).get("role"),
-                "autopilot": (self.autopilot_status(slug) or {}).get("state")} | about
+                "autopilot": (self.autopilot_status(slug) or {}).get("state"),
+                "progress_error": self.progress.errors.get(slug), "missing": missing} | about
 
     def _room_info(self, slug: str) -> dict | None:
         if slug in self.links:
@@ -138,15 +167,17 @@ class GuiMixin:
         proj = self._project(slug)
         rows = self.store.all(
             "SELECT f.name, f.vram, f.size, f.n_insns, f.status, f.best_score, f.attempts, f.unit, f.matched_at, f.meta, "
+            "f.last_checked, f.last_improved, "
             "f.readable, "
             "a.name AS agent, m.name AS matched_by FROM functions f LEFT JOIN claims c ON c.function_id=f.id "
             "LEFT JOIN agents a ON a.id=c.agent_id LEFT JOIN agents m ON m.id=f.matched_agent_id "
-            f"WHERE f.project_id=? AND {IN_BUILD.replace('meta', 'f.meta')} ORDER BY f.vram, f.unit, f.id", proj["id"])
+            f"WHERE f.project_id=? AND f.{IN_BUILD} ORDER BY f.vram, f.unit, f.id", proj["id"])
         link = self.links.get(slug)
         # who works on what in the room: by address, or by name in a git project (its functions have no addresses)
         key = (lambda r: r["name"]) if link is not None and link.fork else (lambda r: r["vram"])
         remote = {key(c): "@" + c["agent"] for c in (link.claims if link is not None else [])}
         return [{"name": r["name"], "vram": r["vram"], "size": r["size"], "insns": r["n_insns"], "unit": r["unit"],
+                 "last_checked": r["last_checked"], "last_improved": r["last_improved"],
                  "status": r["status"] if r["status"] in ("matched", "asm") else "working" if (r["agent"] or key(r) in remote) else "open",
                  "best": r["best_score"], "attempts": r["attempts"], "agent": r["agent"] or remote.get(key(r)),
                  "matched_at": r["matched_at"], "matched_by": r["matched_by"],
@@ -183,25 +214,29 @@ class GuiMixin:
                 for r in cfg.get("compiler_ranges", [])]
 
     def map_signature(self, slug: str) -> str:
-        """What the function map shows, summed up: it changes when a function is added, matched, tried, claimed, polished
-        or set aside. A few sums over indexed rows, so the GUI can ask "anything new?" every few seconds without
-        fetching tens of thousands of functions (renames and splits come with events, which refetch anyway)."""
+        """What the function map shows, summed up: it changes when a function is added, matched, tried better,
+        polished or set aside. A few sums over indexed rows, so the GUI can ask "anything new?" every few seconds
+        without fetching tens of thousands of functions (renames and splits come with events, which refetch anyway).
+        Not the claims or how many attempts: the live poll brings both every second and the GUI applies them; with them
+        here, agents at work changed it every few seconds and a big game's whole map (3 MB) came again each time."""
         proj = self._project(slug)
-        f = self.store.one("SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS hi, COALESCE(SUM(attempts), 0) AS at, "
+        f = self.store.one("SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS hi, "
                            "COALESCE(SUM(status='matched'), 0) AS m, COALESCE(SUM(best_score), 0) AS bs, "
                            "COALESCE(MAX(matched_at), 0) AS ma, COALESCE(SUM(readable), 0) AS rd, "
                            "COALESCE(SUM(status='asm'), 0) AS sa FROM functions WHERE project_id=?", proj["id"])
-        c = self.store.one("SELECT COUNT(*) AS n, COALESCE(SUM(c.function_id * 31 + c.agent_id), 0) AS k FROM claims c "
-                           "JOIN functions f ON f.id=c.function_id WHERE f.project_id=?", proj["id"])
+        p = self.store.one("SELECT COUNT(*) AS n, COALESCE(SUM(p.function_id * 31 + p.agent_id * 7 + p.part), 0) AS k "
+                           "FROM part_claims p JOIN functions f ON f.id=p.function_id WHERE f.project_id=? AND "
+                           "p.expires_at >= ?", proj["id"], time.time())  # (parts of big functions, function_parts.py)
         link = self.links.get(slug)
         remote = sorted(str(x.get("vram") or x.get("name")) + x.get("agent", "") for x in (link.claims if link else []))
-        return f"{f['n']}.{f['hi']}.{f['at']}.{f['m']}.{f['bs']}.{f['ma']}.{f['rd']}.{f['sa']}.{c['n']}.{c['k']}.{hash(tuple(remote)) & 0xFFFFFF}"
+        return (f"{f['n']}.{f['hi']}.{f['m']}.{f['bs']}.{f['ma']}.{f['rd']}.{f['sa']}."
+                f"{p['n']}.{p['k']}.{hash(tuple(remote)) & 0xFFFFFF}")
 
     def function_diff(self, slug: str, name: str, which: str = "latest") -> dict:
         """The target next to an attempt, instruction by instruction, for the GUI: the matched C, else the latest
         (or best) attempt, compiled and linked like the judge does. Cached, so watching an agent costs nothing."""
         if (fork := self.fork_slug(slug)):
-            return self.forks.function_diff(fork, name)
+            return self.forks.function_diff(fork, name, which)
         fn = self._function(name, slug)
         proj = self.store.one("SELECT * FROM projects WHERE id=?", fn["project_id"])
         latest = self.store.one("SELECT source FROM attempts WHERE function_id=? AND source IS NOT NULL "
@@ -253,9 +288,12 @@ class GuiMixin:
         if not (fn["matched_source"] or fn["best_source"] or latest) and fn["status"] == "open":
             self._seed_for(fn, proj)  # (made again first when what it's made from changed)
             fn = self._function(fn["name"], slug)
+        best_differs = (fn["status"] != "matched" and fn["best_source"] is not None
+                        and not _same_source(fn["best_source"], latest["source"] if latest else None))
         return {
             "name": fn["name"], "vram": fn["vram"], "rom_offset": fn["rom_offset"], "size": fn["size"],
-            "insns": fn["n_insns"], "status": fn["status"], "best": fn["best_score"], **set_aside(fn),
+            "insns": fn["n_insns"], "status": fn["status"], "best": fn["best_score"],
+            "best_differs": best_differs, **set_aside(fn),
             "asm": self._asm_text(fn, proj),
             "source": fn["matched_source"] or fn["best_source"] or (latest["source"] if latest else None) or fn["seed"],
             "source_kind": "matched" if fn["matched_source"] else "best" if fn["best_source"] else
@@ -306,14 +344,20 @@ class GuiMixin:
             "SELECT f.name, f.n_insns, f.best_score, f.attempts, a.name AS agent, c.claimed_at FROM claims c "
             "JOIN functions f ON f.id=c.function_id JOIN agents a ON a.id=c.agent_id WHERE f.project_id=?", proj["id"])
         claims = [dict(c) for c in claims]
+        # helpers holding a part of a big function beside its owner (function_parts.py): each is at work on it too
+        claims += [dict(c) for c in self.store.all(
+            "SELECT f.name, f.n_insns, f.best_score, f.attempts, a.name AS agent, p.claimed_at, p.part FROM part_claims p "
+            "JOIN functions f ON f.id=p.function_id JOIN agents a ON a.id=p.agent_id WHERE f.project_id=? AND "
+            "p.expires_at >= ?", proj["id"], time.time())]
         if slug in self.links:
             for c in self.links[slug].claims:
                 row = self.store.one("SELECT name, n_insns, best_score, attempts FROM functions WHERE project_id=? AND vram=?",
                                      proj["id"], c["vram"])
                 if row:
                     claims.append(dict(row) | {"agent": "@" + c["agent"], "claimed_at": None})
+        # (`cut`: more attempts than it sends, so the map's counts need the whole map again)
         return {"events": [dict(e) for e in reversed(events)], "attempts": [dict(t) for t in reversed(attempts)],
-                "claims": claims, "overview": self.overview(slug)}
+                "cut": len(attempts) == LIVE_ATTEMPTS, "claims": claims, "overview": self.overview(slug)}
 
     def events_after(self, after: int | None, limit: int = EVENTS_PER_ASK) -> dict:
         """The notification centre's feed, for every project at once: what happened after event `after`, oldest

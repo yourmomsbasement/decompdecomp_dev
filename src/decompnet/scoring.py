@@ -27,7 +27,7 @@ _CS = arch.capstone_modes()  # (arch, big-endian) -> capstone's (architecture, m
 
 _REG = re.compile(
     r"^\$?(r[a-z0-9]+|e[a-z]{2}|[a-d][lhx]|[sd]il?|[bs]pl?|[xyz]mm\d+|r\d+[dwb]?"  # x86
-    r"|zero|at|v[01]|a[0-3]|t\d|s[0-8]|k[01]|gp|fp|ra|f\d+"  # mips
+    r"|zero|at|v\d+|a[0-3]|t\d|s[0-8]|k[01]|gp|fp|ra|f\d+|[SCRME]\d{3}"  # mips (the last: the Allegrex's VFPU)
     r"|cr\d|lr|pc|ip|sb|sl|d\d+|s\d+)$"  # ppc / arm
 )
 _NUM = re.compile(r"^-?(0x[0-9a-f]+|\d+)$", re.I)
@@ -52,31 +52,39 @@ def percent_text(p: float | None) -> str:
     return f"{math.floor(max(0.0, p) * 10) / 10:.1f}%"
 
 
-def disassemble(fn: FunctionObj) -> list[Insn]:
+VARIANT_INSN_BYTES = 4  # what a variant's own reader decodes (arch.Arch.variants): fixed-width words
+
+
+def disassemble(fn: FunctionObj, cpu: str | None = None) -> list[Insn]:
     """A function's instructions, with relocated fields masked and named after their symbols, so the target and a
-    candidate compare by what they do, not by where they were linked."""
-    arch, mode = _CS[(fn.arch, fn.big_endian)]
-    md = capstone.Cs(arch, mode)
-    md.detail = True
-    md.skipdata = True
+    candidate compare by what they do, not by where they were linked. `cpu`: the processor's variant (fn.cpu by
+    default); one capstone can't decode (the PSP's Allegrex) is read by its processor's own reader (arch/)."""
     code = mask_relocs(fn.code, fn.relocs, fn.arch, fn.big_endian)
+    own = arch.get(fn.arch).variants.get(fn.cpu if cpu is None else cpu)
+    if own:
+        lines = [(at, VARIANT_INSN_BYTES, name, ops, None) for at, name, ops in own(code, fn.big_endian)]
+    else:
+        cs_arch, mode = _CS[(fn.arch, fn.big_endian)]
+        md = capstone.Cs(cs_arch, mode)
+        md.detail = True
+        md.skipdata = True
+        lines = [(ins.address, ins.size, ins.mnemonic, ins.op_str, ins) for ins in md.disasm(code, 0)]
     mips_names = _mips_reloc_names(fn.relocs) if fn.arch == "mips" else {}
     out: list[Insn] = []
-    for ins in md.disasm(code, 0):
-        ops = ins.op_str
-        rel = next((r for r in fn.relocs if ins.address <= r.offset < ins.address + ins.size), None)
+    for address, size, mnemonic, ops, ins in lines:
+        rel = next((r for r in fn.relocs if address <= r.offset < address + size), None)
         if rel is not None and rel.offset in mips_names:
             ops = _mips_symbolize(ops, mips_names[rel.offset])
         elif rel is not None:
             off = rel.addend
             if fn.arch == "x86_64" and rel.type in (2, 4):
                 # PC-relative: addend = field_offset - (bytes from reloc field to end of insn)
-                off += (ins.address + ins.size) - rel.offset
+                off += (address + size) - rel.offset
             target = f"<{rel.symbol}{f'{off:+#x}' if off else ''}>"
-            ops = _symbolize(ins, ops, rel.offset - ins.address, target, fn.arch)
-        elif ins.id and ins.group(capstone.CS_GRP_JUMP) and _NUM.match(ops.strip()):
+            ops = _symbolize(ins, ops, rel.offset - address, target, fn.arch)
+        elif ins is not None and ins.id and ins.group(capstone.CS_GRP_JUMP) and _NUM.match(ops.strip()):
             ops = f".L{int(ops, 16):x}"  # intra-function branch: keep it position-relative
-        out.append(Insn(ins.address, ins.mnemonic, ops, f"{ins.mnemonic} {ops}".strip()))
+        out.append(Insn(address, mnemonic, ops, f"{mnemonic} {ops}".strip()))
     return out
 
 
@@ -185,13 +193,109 @@ LEGEND = ("markers: r=regalloc s=stack-offset i=operand |=different insn <=missi
           "o=reordered")
 
 
+_NOTE = re.compile(r"\s+;.*$")  # what the judge adds to a row (`; target's D_00412340 = 0.5f`): not code
+# an operand's names: registers, symbols (a C++ one with its ?, @ and $), keywords; and numbers
+_NAME = re.compile(r"(?<![\w$@?.])[$?.]?[A-Za-z_][\w$@?.]*")
+_NUMBER = re.compile(r"(?<![\w$@?.])(?:0x[0-9a-fA-F]+|\d+)(?![\w$@?])")
+_KEYWORDS = {"ptr", "byte", "word", "dword", "qword", "tbyte", "xmmword", "short", "near", "far", "offset", "st",
+             "lo", "hi", "ha", "l", "h", "sda21", "sda2rel", "gp_rel", "got", "call16", "got_disp",
+             # ARM's shifts and extends: `lsl #2` and `asr #2` are other instructions
+             "lsl", "lsr", "asr", "ror", "rrx", "uxtb", "uxth", "uxtw", "uxtx", "sxtb", "sxth", "sxtw", "sxtx"}
+_PADDING = {"nop", "int3", "lea R, [R]", "lea R, [R+0x0]"}
+# a memory operand through the stack pointer: x86 [esp+0x18], MIPS 0x54($sp), PowerPC 0x10(r1), ARM [sp, #0x10]
+_STACK_SLOT = re.compile(r"\[[^\]]*\b(?:esp|ebp|rsp|rbp|sp)\b[^\]]*\]|-?(?:0x[0-9a-fA-F]+|\d+)\((?:\$sp|\$fp|r1|sp)\)")
+# a number in a stack slot, and what comes before it: an index's scale (`ecx*4`) or shift (ARM's `lsl #2`, `uxtw #2`)
+# is the element's size, not the frame's layout, and stays
+_SLOT_NUMBER = re.compile(r"(\*\s*|\b(?:lsl|lsr|asr|ror|[us]xt[bhwx])\s+#?)?(?<![\w$@?.])(-?(?:0x[0-9a-fA-F]+|\d+))"
+                          r"(?![\w$@?])")
+# a branch's mnemonic (x86 j*, loop*; b* elsewhere; ARM64's compare/test and branch), and those that start like one and
+# aren't: ARM's bit clear, bit field ops, breakpoints and branch target marks with any condition (`biceq`, `bic.w`),
+# x86's bit tests and scans, bswap, bound and bextr, MIPS's break (`bic r0, r1, #0x100` vs `#0x200` read as one jump)
+_BRANCH = re.compile(r"j|b|loop|[ct]bn?z\b")
+_NOT_BRANCH = re.compile(r"bic|bf[ic]|bfm|bfxil|bkpt|brk|bti|(?:bt[crs]?|bsf|bsr|bswap|bound|bextr|break)\b")
+# x86 prefixes: `lock add` is an add, not a lock of something called add
+_PREFIXES = {"lock", "rep", "repe", "repz", "repne", "repnz", "xacquire", "xrelease", "bnd", "notrack"}
+RESIDUE_SHOWN = 5
+
+
+def shape(text: str) -> str:
+    """An instruction as the residue compares it: register names set aside (R), symbol names too (S: a reference
+    to the same thing under another name is the judge's to check, by address), and a branch's target (J), which moves
+    with the length of the code before it."""
+    t = _NOTE.sub("", text).strip()
+    if not t:
+        return ""
+    mnemonic, _, ops = t.partition(" ")
+    mnemonic = opcode = mnemonic.lower()
+    while opcode in _PREFIXES and ops.strip():  # (each word: `xacquire lock add` is an add)
+        word, _, ops = ops.strip().partition(" ")
+        opcode = word.lower()
+        mnemonic = f"{mnemonic} {opcode}"
+
+    def name(m: re.Match) -> str:
+        word = m.group(0)
+        if _REG.match(word.lower()):
+            return "R"
+        return word if word.lower() in _KEYWORDS else "S"
+
+    def slot(m: re.Match) -> str:
+        return _SLOT_NUMBER.sub(lambda n: n.group(0) if n.group(1) else "N", m.group(0))
+    # a stack slot's offset follows the frame's layout (the frame's size, `sub esp, 0x10`, stays as it is)
+    ops = _STACK_SLOT.sub(slot, ops.strip())
+    ops = _NAME.sub(name, ops)
+    ops = re.sub(r"\bS\s*[-+]\s*(?:0x[0-9a-fA-F]+|\d+)", "S", ops)  # a symbol and an offset: a place, like a symbol
+    if _BRANCH.match(opcode) and not _NOT_BRANCH.match(opcode):  # (ARM's targets are `#0x...` too: `b #0x108`)
+        ops = re.sub(r"(?<![\w$@?])(#?)0x[0-9a-fA-F]{3,}$", r"\1J", ops)
+    return f"{mnemonic} {ops}".strip()
+
+
+def residue(rows: list[tuple[str, str, str]]) -> tuple[list[str], list[str]]:
+    """(the target's instructions yours lacks, yours the target lacks) among the differing rows, register and symbol
+    names and order set aside: what a different register allocation or schedule doesn't explain. Each as the row's
+    own text. Padding (`nop`, x86's `lea esi, [esi]`) is left out: it follows from the length of the code before it."""
+    def side(k: int) -> tuple[Counter, dict[str, str]]:
+        found, text = Counter(), {}
+        for row in rows:
+            if row[0] == " " or not (s := shape(row[k + 1])) or s in _PADDING:
+                continue
+            found[s] += 1
+            text.setdefault(s, _NOTE.sub("", row[k + 1]).strip())
+        return found, text
+    (target, ttext), (yours, ytext) = side(0), side(1)
+    return ([ttext[s] for s in (target - yours).elements()], [ytext[s] for s in (yours - target).elements()])
+
+
+def residue_line(rows: list[tuple[str, str, str]]) -> str:
+    """The residue in a line for an agent: on near misses of an Xbox racing game, more than half had real differences
+    past the 60 rows a diff shows, among rows that only differ by register; and a near miss whose rows are all
+    register or order differences wants another approach (declaration order, temporaries) than one missing code."""
+    if not any(m != " " for m, _, _ in rows):
+        return ""
+    target, yours = residue(rows)
+    if not target and not yours:
+        return ("Registers, stack slots and order aside, your instructions are the target's: what differs is which "
+                "registers hold what and in which order values are computed (try the order of statements and "
+                "declarations, temporaries, a variable's type), not what the code does.")
+
+    def listed(items: list[str]) -> str:
+        found = Counter(items)
+        shown = [f"`{s}`" + (f" x{n}" if n > 1 else "") for s, n in found.most_common(RESIDUE_SHOWN)]
+        more = len(found) - RESIDUE_SHOWN
+        return ", ".join(shown) + (f" and {more} more" if more > 0 else "") if shown else "nothing"
+    return (f"Registers, stack slots and order aside, what still differs: the target has {listed(target)}; yours has "
+            f"{listed(yours)}. Start there: the other differing rows are registers and order that follow from it.")
+
+
 def render_rows(rows: list[tuple[str, str, str]], context: int = 2, max_rows: int = 60, run: int = 6,
                 legend: str = LEGEND, more_hint: bool = True) -> str:
     """A diff's rows as text for an agent: the differing lines with `context` lines around them, at most `max_rows`,
-    long equal stretches folded, and a count of each kind of difference. Where rows are cut, it says last_diff shows
-    them all without another compile (`more_hint`)."""
+    long equal stretches folded, and a count of each kind of difference with what's left once registers and order
+    are set aside (residue_line). Where rows are cut, it says last_diff shows them all without another compile
+    (`more_hint`)."""
     counts = Counter(m for m, _, _ in rows if m != " ")
     summary = ", ".join(f"{n} {MARKERS.get(m, m)}" for m, n in counts.most_common())
+    if summary and (left := residue_line(rows)):
+        summary += "\n" + left
     width = min(max((len(t) for _, t, _ in rows), default=10) + 2, 44)
     show = set()
     for i, (m, _, _) in enumerate(rows):
@@ -252,7 +356,7 @@ def compact_asm(text: str) -> str:
 def diff(target: FunctionObj, candidate: FunctionObj) -> DiffResult:
     """Compare a candidate with the target instruction by instruction: a score (0 is a match, lower is closer), the
     rows to show, and what's missing or extra. Equal bytes are a match whatever the score."""
-    t_ins, c_ins = disassemble(target), disassemble(candidate)
+    t_ins, c_ins = disassemble(target), disassemble(candidate, target.cpu)  # (a candidate is the target's processor)
     max_score = max(1, len(t_ins)) * PENALTY_INSERTION
     bytes_match = target.fingerprint() == candidate.fingerprint()
 

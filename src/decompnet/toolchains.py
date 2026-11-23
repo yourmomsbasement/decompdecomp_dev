@@ -12,11 +12,13 @@ import hashlib
 import json
 import os
 import platform as _platform
+import re
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import tomllib
 import urllib.request
@@ -26,9 +28,15 @@ from pathlib import Path
 
 from decompnet.hostenv import NO_WINDOW, find_uv
 
-from . import wsl
+from . import limits, linuxvm, wsl
 
 MANIFEST = ".decompnet-toolchain.json"
+# in each version's folder of a pack with `headers`: the other Include folders its compiler searches, one per line,
+# relative to the folder (the build reads it: consoles/pc/project_template/tools/configure.py)
+INCLUDES = "includes.txt"
+# what of a toolchain's entry decides what its install holds on disk (its fingerprint, installed()); a part's
+# `platforms` only says which computers take it
+INSTALLED_FROM = ("requires", "git", "commit", "pip_extra")
 LINUX = "linux-x86_64"
 # Parts for WSL: Linux programs packed in a format Windows can unpack (a .deb, not a .zst)
 WSL_PLATFORM = "wsl-x86_64"
@@ -60,6 +68,25 @@ class Toolchain:
     requires_java: int = 0  # minimum Java version (Ghidra)
     prelude: str = ""  # C put before every file it compiles: works around a compiler's own bugs (see toolchains.toml)
     cplusplus: bool = False  # it compiles C++ too (by the file's extension: .cpp)
+    wine: bool = False  # Windows programs wibo can't run: through wine on Linux and macOS (wine.py)
+    # toolchains whose Include folder a pack's compilers search after their own, in order: a Windows SDK several packs
+    # share, downloaded once (installed first, like `requires`; INCLUDES says where in each version's folder)
+    headers: list[str] = field(default_factory=list)
+    # A local, user-supplied toolchain (kind = "local", a kit: kits/): nothing is downloaded; the user points Setup at
+    # their own copy, which must hold these files (case doesn't matter, as on Windows), in the folder they picked or
+    # one of local_places in it
+    local_files: list[str] = field(default_factory=list)
+    local_places: list[str] = field(default_factory=list)
+
+    native_only: bool = False  # this pack cannot run through WSL or a Linux VM
+    linux_vm: bool = False  # optional local macOS Linux runner for this pack
+
+    def __post_init__(self):
+        self.requires = [*self.requires, *(h for h in self.headers if h not in self.requires)]
+
+    @property
+    def local(self) -> bool:
+        return bool(self.local_files)
 
     @property
     def proprietary(self) -> bool:
@@ -72,7 +99,12 @@ class Toolchain:
     @property
     def via_wsl(self) -> bool:
         """A Linux-only toolchain on Windows: installed from its Linux build and run inside WSL 2 (see wsl.py)."""
-        return wsl.wanted() and not self.git and not self.parts_for() and bool(self.parts_for(LINUX))
+        return not self.native_only and wsl.wanted() and not self.git and not self.parts_for() and bool(self.parts_for(LINUX))
+
+    @property
+    def via_vm(self) -> bool:
+        return (not self.native_only and self.linux_vm and not self.via_wsl and current_platform().startswith("macos-")
+                and linuxvm.wanted() and not self.parts_for() and bool(self.parts_for(LINUX)))
 
     def linux_parts(self) -> list[dict]:
         return [p for p in self.parts if WSL_PLATFORM in p.get("platforms", [])] or self.parts_for(LINUX)
@@ -80,7 +112,7 @@ class Toolchain:
     @property
     def supported(self) -> bool:
         """Whether this toolchain can be installed on this computer (on Windows, Linux ones through WSL 2)."""
-        return bool(self.git) or bool(self.parts_for()) or self.via_wsl
+        return self.local or bool(self.git) or bool(self.parts_for()) or self.via_wsl or self.via_vm
 
 
 def current_platform() -> str:
@@ -93,10 +125,11 @@ def current_platform() -> str:
 
 
 def unsupported_cpu() -> str | None:
-    """Why this computer can't run the games' compilers, or None: they're x86 programs, which an ARM computer
-    (a Raspberry Pi, an ARM laptop or server) doesn't run."""
-    machine = current_platform().split("-", 1)[1]
-    if machine == "x86_64":
+    """Supported hosts; Apple Silicon uses native builds or Intel Mac tools through Rosetta.
+    Each tool still checks that its own build is available before installation."""
+    host = current_platform()
+    machine = host.split("-", 1)[1]
+    if machine == "x86_64" or host == "macos-arm64":
         return None
     return (f"decompdecomp needs a 64-bit Intel or AMD PC for now (the games' compilers are x86 programs; this "
             f"computer's processor is {machine})")
@@ -104,15 +137,36 @@ def unsupported_cpu() -> str | None:
 
 @functools.cache
 def _registry_data() -> dict:
-    return tomllib.loads(resources.files("decompnet").joinpath("toolchains.toml").read_text(encoding="utf-8"))
+    """toolchains.toml's entries, and the kits users bring (kits/: local toolchains, nothing to download)."""
+    from . import kits
+
+    return {**tomllib.loads(resources.files("decompnet").joinpath("toolchains.toml").read_text(encoding="utf-8")),
+            **{k.id: k.toolchain() for k in kits.KITS}}
 
 
 def registry() -> dict[str, Toolchain]:
     return {tid: Toolchain(id=tid, **spec) for tid, spec in _registry_data().items()}
 
 
+def known(tid: str) -> bool:
+    """Whether the registry has this toolchain id. A project's config can name one it doesn't: the project was made
+    with another tool (#118: a Windows project named a 64-bit Visual C++ one), and it must still open."""
+    return tid in _registry_data() or _own(tid) is not None
+
+
+def _own(tid: str):
+    """A compiler of the user's own kit copies (kits.own_compiler) that a ROM project names as its toolchain; never
+    for a registry id (a kit's own id is one: looking its copies up would ask for it again)."""
+    from . import kits
+
+    return None if tid in _registry_data() else kits.own_compiler(tid)
+
+
 def get(tid: str) -> Toolchain:
     reg = registry()
+    if tid not in reg and (own := _own(tid)) is not None:
+        return Toolchain(id=tid, name=own.name, license="proprietary", source="your own copy: nothing is downloaded",
+                         description="A compiler in your own SDK copy.", flags=list(own.flags))
     if tid not in reg:
         raise ToolchainError(f"unknown toolchain {tid!r}; known: {', '.join(sorted(reg))}")
     return reg[tid]
@@ -132,28 +186,156 @@ def root() -> Path:
     return Path(env).expanduser() if env else data_dir() / "toolchains"
 
 
-def path(tid: str, linux: bool | None = None) -> Path:
-    """Where a toolchain is installed. `linux`: its Linux build for WSL (default: when that's how it runs here)."""
+def path(tid: str, linux: bool | None = None, *, vm: bool | None = None) -> Path:
+    """Where a toolchain is installed; VM and WSL copies are separate from native installations."""
+    if vm is None:
+        vm = linux is None and tid in _registry_data() and get(tid).via_vm
+    if vm:
+        return root() / 'linux-vm' / tid
     if linux is None:
         linux = tid in _registry_data() and get(tid).via_wsl
     return root() / "wsl" / tid if linux else root() / tid
 
 
-def installed(tid: str, linux: bool | None = None) -> dict | None:
-    m = path(tid, linux) / MANIFEST
+def installed(tid: str, linux: bool | None = None, *, vm: bool | None = None) -> dict | None:
+    """The install's manifest, or None when it isn't installed, or was installed from an entry toolchains.toml has
+    changed since (changed()), or lacks a program its install builds (_unbuilt): every caller then offers to install
+    it again, as for one never installed, and a free tool reinstalls by itself (ensure). Archives already downloaded
+    aren't downloaded again (root()/.downloads)."""
+    manifest = _manifest(tid, linux, vm=vm)
+    if manifest is None and _own(tid) is not None:
+        return {"own": True}  # (a compiler in a kit copy is there as long as the copy is: nothing was installed)
+    if manifest is None or changed(tid, manifest, path(tid, linux, vm=vm)) or _unbuilt(tid, linux):
+        return None
+    tc = registry().get(tid)
+    if tc is not None and any(installed(h, linux, vm=vm) is None for h in tc.headers):
+        return None  # (its compilers can't build without the headers: installing it brings them, install())
+    return manifest
+
+
+def _manifest(tid: str, linux: bool | None = None, *, vm: bool | None = None) -> dict | None:
+    m = path(tid, linux, vm=vm) / MANIFEST
     return json.loads(m.read_text(encoding="utf-8")) if m.exists() else None
 
 
-def require(tid: str, linux: bool | None = None) -> Path:
+# Ghidra's folder of native programs for each computer (ghidra.framework.Platform)
+# (Windows on Arm runs the release's Intel one, emulated: Ghidra's GettingStarted.md)
+GHIDRA_OS = {"linux-x86_64": "linux_x86_64", "linux-aarch64": "linux_arm_64", "macos-x86_64": "mac_x86_64",
+             "macos-arm64": "mac_arm_64", "windows-x86_64": "win_x86_64", "windows-aarch64": "win_x86_64"}
+
+
+def ghidra_decompiler(ghidra: Path, plat: str | None = None) -> Path:
+    """Where the Ghidra in `ghidra` looks for its decompiler on this computer."""
+    plat = plat or current_platform()
+    name = "decompile.exe" if plat.startswith("windows") else "decompile"
+    return ghidra / "Ghidra" / "Features" / "Decompiler" / "os" / GHIDRA_OS.get(plat, plat) / name
+
+
+def _unbuilt(tid: str, linux: bool | None) -> bool:
+    """Whether an install lacks the native program it can't work without: Ghidra's decompiler, which its release
+    brings for Intel Linux and Windows and its install builds elsewhere (build = "ghidra-decompiler"). Without it
+    Ghidra's analysis gives no function a calling convention. A Ghidra installed on a Mac before decompdecomp built
+    its decompiler has none, and one whose decompiler went missing on any computer neither: either is installed
+    again (ensure), not used without it."""
+    if tid != "ghidra" or tid not in _registry_data():
+        return False
+    linux = get(tid).via_wsl if linux is None else linux
+    return not ghidra_decompiler(path(tid, linux), LINUX if linux else None).is_file()
+
+
+def fingerprint(tc: Toolchain, linux: bool = False) -> str:
+    """What an install of this entry holds, as a short hash: its parts (archives, hashes, where each goes) and what
+    else INSTALLED_FROM names. Its name and description don't change an install."""
+    parts = tc.linux_parts() if linux else tc.parts_for()
+    entry = {"parts": [{k: v for k, v in p.items() if k != "platforms"} for p in parts],
+             **{k: getattr(tc, k) for k in INSTALLED_FROM}}
+    return hashlib.sha256(json.dumps(entry, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def changed(tid: str, manifest: dict, where: Path | None = None) -> bool:
+    """Whether toolchains.toml's entry changed since this install: a pack moved its Windows SDK into a toolchain of its
+    own, and an install that kept the SDK inside would have built without the SDK's new folder. An install
+    made before installs recorded their entry's fingerprint is judged by the archives it records; one that still
+    matches is given the fingerprint (in `where`, its folder, when it can be written), so a later change to the entry
+    is seen too."""
+    tc = registry().get(tid)
+    if tc is None:  # (a project names a toolchain decompdecomp doesn't have: known())
+        return False
+    linux = bool(manifest.get("wsl") or manifest.get("linux_vm"))
+    now = fingerprint(tc, linux)
+    if "fingerprint" in manifest:
+        return manifest["fingerprint"] != now
+    if "parts" not in manifest:  # (not one install() wrote)
+        return False
+    parts = tc.linux_parts() if linux else tc.parts_for()
+    urls = {p["url"] for p in parts} | {v for p in parts for k, v in p.items() if k.endswith("_url")}
+    had = {(p.get("url"), p.get("sha256")) for p in manifest["parts"]}
+    if {url for url, _ in had} != urls or (manifest.get("commit") or "") != tc.commit or \
+            any(p.get("sha256") and (p["url"], p["sha256"]) not in had for p in parts):
+        return True
+    try:
+        if where is not None:
+            _write_manifest(where, {**manifest, "fingerprint": now})
+    except OSError:
+        pass  # (a folder it can't write, read-only: judged by its archives again next time)
+    return False
+
+
+def _write_manifest(folder: Path, manifest: dict) -> None:
+    """An install's manifest, written whole or not at all: installed() reads it while /api/state, builds and other
+    installs run, and changed() adds the fingerprint to an older one during such a read. Written to a file beside
+    it, then moved over it in one step (os.replace), so a reader sees the old manifest or the new, never half."""
+    tmp = folder / f"{MANIFEST}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        tmp.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        os.replace(tmp, folder / MANIFEST)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+@functools.cache
+def _intel_mac_runtime_ready() -> bool:
+    try:
+        return subprocess.run(["/usr/bin/arch", "-x86_64", "/usr/bin/true"], capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def runtime_error(tid: str) -> str | None:
+    """What this computer lacks to run a toolchain, said before it's downloaded: Intel-only Mac compiler archives
+    need Apple's translation runtime on Apple Silicon, and a pack wibo can't run needs wine (off Windows)."""
+    if get(tid).via_vm:
+        ok, why = linuxvm.status()
+        return None if ok else why
+    if get(tid).wine:
+        from . import wine
+
+        return wine.problem(get(tid).name)
+    if current_platform() != "macos-arm64" or not any(
+            p.get("rosetta") for pack in (get(tid), *(get(d) for d in get(tid).requires))
+            for p in pack.parts_for()):
+        return None
+    if _intel_mac_runtime_ready():
+        return None
+    _intel_mac_runtime_ready.cache_clear()  # a newly installed Rosetta runtime works on the next compile
+    return (f"{tid} uses Intel macOS binaries and needs Rosetta 2 on Apple Silicon. "
+            "Run `softwareupdate --install-rosetta` in Terminal, accept Apple's license if you agree, then try again.")
+
+
+def require(tid: str, linux: bool | None = None, *, vm: bool | None = None) -> Path:
     """Directory of an installed toolchain, or a clear error telling the operator how to install it."""
-    if installed(tid, linux) is None:
+    if installed(tid, linux, vm=vm) is None:
         raise ToolchainError(f"toolchain {tid!r} is not installed: install it in decompdecomp, under Compilers & tools")
-    return path(tid, linux)
+    if why := runtime_error(tid):
+        raise ToolchainError(why)
+    return path(tid, linux, vm=vm)
 
 
 def runtime_dirs(tid: str) -> tuple[Path, ...]:
     """The toolchain plus everything it requires, for mounting into the sandbox (all Linux builds for WSL)."""
     tc = get(tid)
+    if tc.via_vm:
+        return (require(tid, vm=True), *(require(dep, vm=True) for dep in tc.requires))
     linux = tc.via_wsl
     return (require(tid, linux), *(require(dep, linux) for dep in tc.requires))
 
@@ -169,10 +351,17 @@ def _sha256(p: Path) -> str:
 
 
 def _download(url: str, dest: Path, log) -> None:
+    """The file at `url`, written beside `dest` and then moved there whole: another download of it (another
+    program's) never reads half of one, nor writes into it."""
     log(f"  downloading {url}")
     req = urllib.request.Request(url, headers={"User-Agent": "decompnet-toolchain-installer"})
-    with urllib.request.urlopen(req, timeout=120) as r, open(dest, "wb") as f:
-        shutil.copyfileobj(r, f)
+    part = dest.with_name(f"{dest.name}.{os.getpid()}-{threading.get_ident()}.part")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r, open(part, "wb") as f:
+            shutil.copyfileobj(r, f)
+        os.replace(part, dest)
+    finally:
+        part.unlink(missing_ok=True)
 
 
 def _deb_data(deb: Path, out: Path) -> Path:
@@ -191,7 +380,17 @@ def _deb_data(deb: Path, out: Path) -> Path:
     raise ToolchainError(f"{deb.name} has no data.tar")
 
 
-def _extract(archive: Path, dest: Path, subdir: str | None) -> None:
+def _extract(archive: Path, dest: Path, subdir: str | None, keep: dict[str, str] | None = None) -> None:
+    """Unpack an archive (or its `subdir`) into `dest`. `keep`: {path in it: where it goes in dest}, and nothing else:
+    a compiler's archive is often a whole install (its IDE, libraries, the C runtime's sources: 700 MB for Visual C++
+    2010) of which a build needs the compiler and headers. Two paths may go to one folder: they're merged."""
+    prefix = f"{subdir.strip('/')}/" if subdir else ""
+    wanted = None if keep is None else [prefix + k.strip("/") for k in keep]
+
+    def take(name: str) -> bool:
+        name = name.rstrip("/")
+        return wanted is None or any(name == w or name.startswith(w + "/") for w in wanted)
+
     with tempfile.TemporaryDirectory(dir=dest.parent) as tmp:
         if archive.name.endswith(".deb"):
             with tempfile.TemporaryDirectory(dir=dest.parent) as raw:
@@ -202,6 +401,8 @@ def _extract(archive: Path, dest: Path, subdir: str | None) -> None:
 
             with zipfile.ZipFile(archive) as z:
                 for info in z.infolist():
+                    if not take(info.filename):
+                        continue
                     target = (Path(tmp) / info.filename).resolve()
                     if Path(tmp).resolve() not in target.parents and target != Path(tmp).resolve():
                         raise ToolchainError(f"refusing to extract {info.filename} outside the toolchain folder")
@@ -226,36 +427,153 @@ def _extract(archive: Path, dest: Path, subdir: str | None) -> None:
             # gz/xz in pure Python, so this works on Windows and macOS too. The "data" filter refuses
             # absolute paths, links out of the tree and device files, and drops setuid bits.
             with tarfile.open(archive) as t:
-                t.extractall(tmp, filter="data")
+                t.extractall(tmp, members=[m for m in t.getmembers() if take(m.name)], filter="data")
         src = Path(tmp) / subdir if subdir else Path(tmp)
-        if not src.is_dir():
+        if not src.is_dir() and keep is None:  # (with `keep`, the first path it doesn't have is named)
             raise ToolchainError(f"archive {archive.name} has no {subdir}/")
-        for item in src.iterdir():
+        for path, to in (keep or {}).items():
+            item, target = src / path, dest / to
+            if item.is_dir():
+                shutil.copytree(item, target, dirs_exist_ok=True)
+            elif item.is_file():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(item, target)
+            else:
+                raise ToolchainError(f"archive {archive.name} has no {path}")
+        for item in src.iterdir() if keep is None else ():
             target = dest / item.name
             if target.exists():
                 shutil.rmtree(target) if target.is_dir() and not target.is_symlink() else target.unlink()
             shutil.move(str(item), target)
 
 
-def install(tid: str, *, accept_license: bool = False, force: bool = False, log=print, linux: bool | None = None) -> Path:
-    """Install a toolchain (and what it requires). `linux`: its Linux build, to run inside WSL (default: when
-    that's how it runs on this computer)."""
+_INSTALLING = threading.Lock()
+_installs: dict[str, threading.RLock] = {}
+
+
+def find_local(tc: Toolchain, folder: str | Path) -> Path | None:
+    """The folder that holds a copy of a local toolchain (a kit): the one given, or where inside it the kit says
+    (Kit.locate: the XDK's `xbox`, `XDK/xbox`, so the folder its installer unpacks works as it is)."""
+    from . import kits
+
+    return kits.get(tc.id).locate(Path(folder).expanduser())
+
+
+def _copies(m: dict | None) -> list[str]:
+    """The folders a local toolchain's manifest records: a list of copies, or (a manifest from before several copies
+    were allowed) its one `folder`."""
+    m = m or {}
+    return list(m.get("folders") or ([m["folder"]] if m.get("folder") else []))
+
+
+def local_folders(tid: str) -> list[Path]:
+    """Where the user's own copies of a local toolchain are (as Setup recorded them) that are still there, or a clear
+    error when none is."""
+    copies = _copies(installed(tid))
     tc = get(tid)
-    linux = tc.via_wsl if linux is None else linux
-    if tc.proprietary and not accept_license and (force or installed(tid, linux) is None):
+    if not copies:
+        raise ToolchainError(f"{tc.name} isn't set up: in decompdecomp's Setup, under Compilers & tools, give the "
+                             "folder where your own copy is")
+    found = [Path(c) for c in copies if find_local(tc, c) is not None]
+    if not found:
+        raise ToolchainError(f"{tc.name} isn't at {copies[0]} any more (it needs {', '.join(tc.local_files)}): give "
+                             "its folder again in Setup")
+    return found
+
+
+def local_folder(tid: str) -> Path:
+    """The first copy of a local toolchain (local_folders)."""
+    return local_folders(tid)[0]
+
+
+def _link_local(tc: Toolchain, folder: str | Path | None, accept_license: bool, log) -> Path:
+    """Record where a copy of the user's own local toolchain is, besides the copies recorded already. Nothing is
+    copied or downloaded: decompdecomp reads it where it is, so none of it ends up in projects or in the toolchains
+    folder."""
+    if not folder:
+        raise ToolchainError(f"{tc.name} isn't downloaded: give the folder where your own copy is")
+    if tc.proprietary and not accept_license:
+        raise ToolchainError(f"{tc.id} ({tc.name}) is proprietary software. Using your copy is your own licensing "
+                             "decision; accept that to go on.")
+    found = find_local(tc, folder)
+    if found is None:
+        raise ToolchainError(f"{folder} doesn't look like {tc.name}: it should hold {', '.join(tc.local_files)} "
+                             "(give the folder that has them, or the one above it)")
+    copies = [c for c in _copies(_manifest(tc.id)) if find_local(tc, c) is not None]
+    _write_copies(tc, copies if any(Path(c) == found for c in copies) else [*copies, str(found)])
+    log(f"{tc.id}: using your copy at {found}")
+    return found
+
+
+def _write_copies(tc: Toolchain, copies: list[str]) -> None:
+    dest = path(tc.id, False)
+    dest.mkdir(parents=True, exist_ok=True)
+    # (`folder`, the first copy: what a decompdecomp from before several copies reads)
+    _write_manifest(dest, {"id": tc.id, "name": tc.name, "license": tc.license, "source": "local",
+                           "folder": copies[0], "folders": copies, "installed_at": time.time(),
+                           "license_accepted": bool(tc.proprietary), "wsl": False})
+
+
+def remove_local(tid: str, folder: str | Path) -> None:
+    """Forget one of a local toolchain's copies (its files stay where they are); the last one forgotten leaves the
+    toolchain not set up."""
+    tc = get(tid)
+    if not tc.local:
+        raise ToolchainError(f"{tc.name} isn't a copy of your own")
+    copies = _copies(_manifest(tid))
+    left = [c for c in copies if Path(c) != Path(folder)]
+    if len(left) == len(copies):
+        raise ToolchainError(f"{folder} isn't one of your copies of {tc.name}")
+    if left:
+        _write_copies(tc, left)
+    else:
+        (path(tid, False) / MANIFEST).unlink(missing_ok=True)
+
+
+def install(tid: str, *, accept_license: bool = False, force: bool = False, log=print, linux: bool | None = None, vm: bool | None = None,
+            folder: str | Path | None = None) -> Path:
+    """Install a toolchain (and what it requires). A local toolchain (the Xbox XDK) is the user's own copy in
+    `folder`: checked and recorded, never copied. `linux`: its Linux build, to run inside WSL (default: when
+    that's how it runs on this computer). One install of a toolchain at a time: a free tool's threads that all need
+    it (ensure) install it once, and the others find it installed. When an update changed objdiff's entry, the
+    project's indexing threads each started its download into the same file, and each found the others' bytes in
+    it (checksum mismatch)."""
+    if get(tid).local:
+        return _link_local(get(tid), folder, accept_license, log)
+    with _INSTALLING:
+        lock = _installs.setdefault(tid, threading.RLock())
+    with lock:
+        return _install(tid, accept_license=accept_license, force=force, log=log, linux=linux, vm=vm)
+
+
+def _install(tid: str, *, accept_license: bool, force: bool, log, linux: bool | None, vm: bool | None) -> Path:
+    tc = get(tid)
+    if tc.native_only and not tc.parts_for():
+        raise ToolchainError(f"{tc.name} needs its native host build. {tc.description}")
+    vm = tc.via_vm if vm is None else vm
+    linux = (tc.via_wsl or vm) if linux is None else linux
+    location = {'vm': True} if vm else {}
+    _intel_mac_runtime_ready.cache_clear()  # Rosetta may have been installed since the last setup attempt
+    if not vm and (why := runtime_error(tid)):
+        raise ToolchainError(why)
+    if tc.proprietary and not accept_license and (force or installed(tid, linux, **location) is None):
         raise ToolchainError(
             f"{tid} ({tc.name}) is proprietary software. Running it on your coordinator is your own licensing "
             f"decision; re-run with --accept-license if you accept that.")
-    if linux:
+    if vm:
+        ok, why = linuxvm.status(refresh=True)
+        if not ok:
+            raise ToolchainError(why)
+    elif linux:
         ok, why = wsl.status()
         if not ok:
             raise ToolchainError(f"{tc.name} is a Linux program: on Windows it runs in WSL 2. {why}")
     for dep in tc.requires:
-        if installed(dep, linux) is None or force:
-            install(dep, accept_license=accept_license, force=force, log=log, linux=linux)
-    if installed(tid, linux) and not force:
-        log(f"{tid}: already installed at {path(tid, linux)}")
-        return path(tid, linux)
+        if installed(dep, linux, **location) is None or force:
+            install(dep, accept_license=accept_license, force=force, log=log, linux=linux, **location)
+    if installed(tid, linux, **location) and not force:
+        log(f"{tid}: already installed at {path(tid, linux, **location)}")
+        return path(tid, linux, **location)
     parts = tc.linux_parts() if linux else tc.parts_for()
     if not parts and not tc.git:
         why = unsupported_cpu()
@@ -268,12 +586,12 @@ def install(tid: str, *, accept_license: bool = False, force: bool = False, log=
             f"{tid} ({tc.name}) is proprietary software. Running it on your coordinator is your own licensing "
             f"decision; re-run with --accept-license if you accept that.")
 
-    dest = path(tid, linux)
+    dest = path(tid, linux, **location)
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
-    log(f"{tid}: installing {tc.name} [{tc.license}]" + (" (Linux build, runs in WSL 2)" if linux else ""))
-    pinned = []
+    log(f"{tid}: installing {tc.name} [{tc.license}]" + (" (Linux build, runs in local VM)" if vm else " (Linux build, runs in WSL 2)" if linux else ""))
+    pinned, archive_parts = [], []
     try:
         if tc.git or tc.pip_extra:
             _install_python_env(tc, dest, log)
@@ -289,31 +607,314 @@ def install(tid: str, *, accept_license: bool = False, force: bool = False, log=
                 raise ToolchainError(f"checksum mismatch for {part['url']}: expected {part['sha256']}, got {digest}")
             if not part.get("sha256"):
                 log(f"  no pinned checksum in the registry; pinning on first use: sha256 {digest}")
-            if part.get("binary"):  # a plain executable, not an archive
+            if vm:
+                if part.get('build') or tc.git or tc.pip_extra:
+                    raise ToolchainError(f'{tid} needs a guest build recipe before it can use archive staging.')
+                # macOS and Windows can collapse libc.so.1/libC.so.1 into one file.
+                # Keep the verified bytes intact until the guest's case-sensitive filesystem.
+                folder = dest / '.archives'
+                folder.mkdir(exist_ok=True)
+                suffix = ''.join(archive.suffixes)
+                saved = folder / (str(len(archive_parts)) + suffix)
+                shutil.copyfile(archive, saved)
+                archive_parts.append({**part, 'archive': str(saved.relative_to(dest)).replace('\\', '/'), 'sha256': digest})
+                pinned.append({'url': part['url'], 'sha256': digest})
+                continue
+            if part.get("build") == "mips-binutils":
+                _build_mips_binutils(archive, dest, part.get("subdir"), log)
+            elif part.get("build") == "psx-gcc-2.6.3":
+                _build_psx_gcc_263(archive, dest, part, log)
+                for url_key, hash_key, _ in (
+                    ("patches_url", "patches_sha256", "old-gcc-patches.tar.gz"),
+                    ("config_guess_url", "config_guess_sha256", "config.guess"),
+                    ("config_sub_url", "config_sub_sha256", "config.sub"),
+                ):
+                    pinned.append({"url": part[url_key], "sha256": part[hash_key]})
+            elif part.get("binary"):  # a plain executable, not an archive
                 shutil.copyfile(archive, dest / part["binary"])
                 os.chmod(dest / part["binary"], 0o755)
             else:
                 into = dest / part.get("into", "")  # a pack of several versions: each in its own folder
                 into.mkdir(parents=True, exist_ok=True)
-                _extract(archive, into, part.get("subdir"))
+                _extract(archive, into, part.get("subdir"), part.get("keep"))
+                for folder in part.get("mkdir", ()):  # the POSIX root of an MSYS2 program needs them (#130)
+                    (into / folder).mkdir(parents=True, exist_ok=True)
                 if part.get("executable"):  # archives that don't record the executable bit
                     for f in dest.rglob("*"):
                         if f.is_file():
                             os.chmod(f, 0o755)
+                if part.get("build") == "ghidra-decompiler":
+                    _build_ghidra_decompiler(into, log)
             pinned.append({"url": part["url"], "sha256": digest})
-        if linux and "runtime-i386" in tc.requires:  # WSL systems rarely have a 32-bit loader: bring ours
+        for into in dict.fromkeys(part.get("into", "") for part in parts) if tc.headers else ():
+            folder = dest / into  # (relative: the toolchains' folder can be moved, DECOMPNET_TOOLCHAINS)
+            lines = [Path(os.path.relpath(path(h, linux, **location) / "Include", folder)).as_posix() for h in tc.headers]
+            (folder / INCLUDES).write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
+        if linux and not vm and "runtime-i386" in tc.requires:  # WSL systems rarely have a 32-bit loader: bring ours
             n = wsl.wrap_i386(dest, wsl.path(path("runtime-i386", linux=True)))
             log(f"  {n} 32-bit programs start through the pinned 32-bit runtime")
+        if tc.wine and not linux:
+            from . import wine
+
+            if wine.needed():  # its prefix now, not in the middle of the first build (wineboot takes up to a minute)
+                try:
+                    wine.prepare(log=log)
+                except RuntimeError as error:  # (not "install wine" later: wine is here, its prefix failed)
+                    raise ToolchainError(f"{tc.name} downloaded, but {error}") from None
     except BaseException:
         shutil.rmtree(dest, ignore_errors=True)
         raise
-    (dest / MANIFEST).write_text(json.dumps({
+    _write_manifest(dest, {
         "id": tid, "name": tc.name, "license": tc.license, "source": tc.source,
         "parts": pinned, "commit": tc.commit or None, "installed_at": time.time(),
-        "license_accepted": bool(tc.proprietary and accept_license), "wsl": linux,
-    }, indent=2), encoding="utf-8")
+        "license_accepted": bool(tc.proprietary and accept_license), "wsl": linux and not vm, "linux_vm": vm,
+        "archive_parts": archive_parts,
+        "fingerprint": fingerprint(tc, linux),
+    })
     log(f"{tid}: installed at {dest}")
     return dest
+
+
+def _build_ghidra_decompiler(ghidra: Path, log) -> None:
+    """Build Ghidra's decompiler from the C++ source its release ships, where the release has none for this computer
+    (macOS, ARM Linux). Only the host build tools (a C++ compiler and make) come from the system. Its Makefile builds
+    for Intel on every Mac (ARCH_TYPE) and for macOS 10.6 (ADDITIONAL_FLAGS): both are left out, so it builds for
+    this computer."""
+    target = ghidra_decompiler(ghidra)
+    if target.is_file():
+        return
+    mac = current_platform().startswith("macos")
+    tools = ("Ghidra's decompiler is built from its source on this computer, which needs "
+             + ("Xcode Command Line Tools: run `xcode-select --install`, then try again." if mac else
+                "a C++ compiler and make (on Debian or Ubuntu: `sudo apt install g++ make`), then try again."))
+    if not shutil.which("make") or not shutil.which("c++"):
+        raise ToolchainError(tools)
+    with tempfile.TemporaryDirectory(prefix="decomp-ghidra-") as tmp:
+        build = Path(tmp) / "decompile"
+        shutil.copytree(ghidra / "Ghidra" / "Features" / "Decompiler" / "src" / "decompile", build)
+        argv = ["make", "-j" + str(min(4, os.cpu_count() or 1)), "ghidra_opt", "ARCH_TYPE=", "ADDITIONAL_FLAGS=-w",
+                "CXX=c++ -std=c++11"]
+        log("  building Ghidra's decompiler for this computer (first install only, a few minutes)")
+        try:
+            res = subprocess.run(limits.capped(argv), cwd=build / "cpp", capture_output=True, text=True,
+                                 errors="replace", timeout=1800)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ToolchainError(f"Couldn't build Ghidra's decompiler: {error}. {tools}") from error
+        built = build / "cpp" / "ghidra_opt"
+        if res.returncode or not built.is_file():
+            raise ToolchainError(f"Couldn't build Ghidra's decompiler. {tools}\n" + (res.stdout + res.stderr)[-4000:])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(built, target)
+        target.chmod(0o755)
+
+
+def _build_mips_binutils(archive: Path, dest: Path, subdir: str | None, log) -> None:
+    """The v0.10 upstream has no Intel Mac archive. Build that same pinned source, never a tool from PATH.
+    Only the host build tools (Xcode's C compiler and make) come from the system; installed MIPS tools stay pinned.
+    """
+    if not shutil.which("make") or not shutil.which("clang"):
+        raise ToolchainError("Building MIPS binutils on Intel macOS needs Xcode Command Line Tools: run `xcode-select --install`, then try again.")
+    with tempfile.TemporaryDirectory(prefix="decomp-binutils-") as tmp:
+        source = Path(tmp) / "source"
+        build = Path(tmp) / "build"
+        source.mkdir()
+        build.mkdir()
+        (build / "gas" / "doc").mkdir(parents=True)  # git sources omit the generated documentation directory
+        _extract(archive, source, subdir)
+        # The git archive includes GDB, unlike a standalone binutils release. Its top-level configure probes
+        # GMP/MPFR whenever gdb/ exists, even with --disable-gdb. We build only the assembler/linker/object tools.
+        shutil.rmtree(source / "gdb", ignore_errors=True)
+        shutil.rmtree(source / "gdbserver", ignore_errors=True)
+        commands = [
+            [str(source / "configure"), "--target=mips", "--disable-gprofng", "--disable-gdb", "--disable-werror",
+             "--disable-nls", "--disable-sim", "--without-zstd", "--with-system-zlib"],
+            ["make", "-j" + str(min(4, os.cpu_count() or 1)), "all-binutils", "all-gas", "all-ld", "MAKEINFO=true"],
+        ]
+        for argv in commands:
+            log("  building pinned MIPS binutils: " + Path(argv[0]).name + " (first install only)")
+            try:
+                res = subprocess.run(limits.capped(argv), cwd=build, capture_output=True, text=True,
+                                     errors="replace", timeout=900, env=dict(os.environ, CC="/usr/bin/clang", MAKEINFO="true"))
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise ToolchainError(f"Couldn't build the pinned MIPS tools: {error}. Install Xcode Command Line Tools and try again.") from error
+            if res.returncode:
+                raise ToolchainError("Couldn't build the pinned MIPS tools. Install Xcode Command Line Tools and try again.\n"
+                                     + (res.stdout + res.stderr)[-4000:])
+        outputs = {"as": "gas/as-new", "ld": "ld/ld-new", "objcopy": "binutils/objcopy",
+                   "objdump": "binutils/objdump", "nm": "binutils/nm-new", "ar": "binutils/ar",
+                   "ranlib": "binutils/ranlib", "strip": "binutils/strip-new", "readelf": "binutils/readelf"}
+        for name, binary in outputs.items():
+            target = dest / ("mips-ps2-decompals-" + name)
+            if not (build / binary).is_file():
+                raise ToolchainError(f"The pinned MIPS binutils build did not produce {name} ({binary}). "
+                                     "Check Xcode Command Line Tools and try again.")
+            shutil.copy2(build / binary, target)
+            target.chmod(0o755)
+
+
+def _build_psx_gcc_263(archive: Path, dest: Path, part: dict, log) -> None:
+    """Build the GPL PlayStation GCC 2.6.3 natively for this Mac.
+
+    The only host tools are Xcode's clang and make. GCC source and the old-gcc patch bundle,
+    plus modern config.guess/config.sub, are checksum-pinned by this toolchain part.
+    """
+    if not shutil.which("/usr/bin/clang") or not shutil.which("/usr/bin/make"):
+        raise ToolchainError(
+            "Building GCC 2.6.3 for PlayStation needs Xcode Command Line Tools. "
+            "Run `xcode-select --install`, then try again."
+        )
+    dest.mkdir(parents=True, exist_ok=True)
+    build_inputs = (
+        ("patches_url", "patches_sha256", "old-gcc-patches.tar.gz"),
+        ("config_guess_url", "config_guess_sha256", "config.guess"),
+        ("config_sub_url", "config_sub_sha256", "config.sub"),
+    )
+    with tempfile.TemporaryDirectory(prefix="decomp-psx-gcc-263-") as tmp:
+        root = Path(tmp)
+        source_root = root / "source"
+        source_root.mkdir()
+        _extract(archive, source_root, None)
+        source = source_root / "gcc-2.6.3"
+        if not source.is_dir():
+            raise ToolchainError("The pinned GCC 2.6.3 archive has no gcc-2.6.3 source directory.")
+
+        downloads = root / "inputs"
+        downloads.mkdir()
+        inputs = {}
+        for url_key, hash_key, filename in build_inputs:
+            path = downloads / filename
+            _download(part[url_key], path, log)
+            actual = _sha256(path)
+            if actual != part[hash_key]:
+                raise ToolchainError(f"checksum mismatch for {part[url_key]}: expected {part[hash_key]}, got {actual}")
+            inputs[filename] = path
+
+        patch_root = root / "old-gcc"
+        patch_root.mkdir()
+        _extract(inputs["old-gcc-patches.tar.gz"], patch_root, None)
+        old_gcc = next(patch_root.glob("old-gcc-*/"), None)
+        if old_gcc is None:
+            raise ToolchainError("The pinned old-gcc patch archive has no repository directory.")
+        patches = old_gcc / "patches"
+        for name in ("obstack-2.7.2.h.patch", "sdbout-2.6.3.c.patch", "g++-2.6.3.c.patch", "psx-2.5.7.patch"):
+            if not (patches / name).is_file():
+                raise ToolchainError(f"The pinned old-gcc patch archive is missing {name}.")
+
+        env = dict(os.environ)
+        env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:" + env.get("PATH", "")
+        env.pop("CC", None)
+        env.pop("CXX", None)
+        for source_file in source.glob("*.c"):
+            source_file.chmod(source_file.stat().st_mode | 0o200)
+            text = source_file.read_text(encoding="latin-1")
+            if "include <varargs.h>" in text:
+                source_file.write_text(text.replace("include <varargs.h>", "include <stdarg.h>"), encoding="latin-1")
+
+        commands = [
+            ["/usr/bin/patch", "-u", "-p1", "-i", str(patches / "obstack-2.7.2.h.patch")],
+            ["/usr/bin/patch", "-u", "-p0", "-i", str(patches / "g++-2.6.3.c.patch")],
+            ["/usr/bin/patch", "-su", "-p1", "-i", str(patches / "psx-2.5.7.patch")],
+        ]
+        for argv in commands:
+            log("  applying pinned PlayStation GCC patch " + Path(argv[-1]).name)
+            res = subprocess.run(argv, cwd=source, capture_output=True, text=True, errors="replace",
+                                 timeout=60, env=env)
+            if res.returncode:
+                raise ToolchainError(f"Couldn't apply {Path(argv[-1]).name}:\n{(res.stdout + res.stderr)[-2000:]}")
+
+        # The upstream sdbout patch's context is one line off in the released 2.6.3 tarball; make the same
+        # portability change directly and fail closed if upstream changes the source.
+        sdbout = source / "sdbout.c"
+        sdb = sdbout.read_text(encoding="latin-1")
+        old_guard = "#if defined(USG) && !defined(MIPS) && !defined (hpux) && !defined(WINNT)"
+        new_guard = "#if defined(USG) && !defined(MIPS) && !defined (hpux) && !defined(_WIN32) && !defined(__linux__)"
+        if old_guard not in sdb:
+            raise ToolchainError("GCC 2.6.3 sdbout.c no longer matches the pinned portability patch.")
+        sdbout.write_text(sdb.replace(old_guard, new_guard, 1), encoding="latin-1")
+
+        for name in ("gcc.c", "cp/g++.c"):
+            path = source / name
+            path.chmod(path.stat().st_mode | 0o200)
+            text = path.read_text(encoding="latin-1")
+            text = text.replace("extern int sys_nerr;", "extern const int sys_nerr;")
+            text = text.replace("extern char *sys_errlist[];", "extern const char *const sys_errlist[];")
+            path.write_text(text, encoding="latin-1")
+
+        # The upstream PSX configure stanza assigns three DEFS words without quoting them, so dash treats
+        # the second word as a command. Keep the complete preprocessor definition string together.
+        configure = source / "configure"
+        config_text = configure.read_text(encoding="latin-1")
+        target_defs = "DEFS=-Dpsx -D__psx__ -D__psx"
+        if target_defs not in config_text:
+            raise ToolchainError("GCC 2.6.3 configure no longer has the expected PSX target stanza.")
+        config_text = config_text.replace(target_defs, 'DEFS="-Dpsx -D__psx__ -D__psx"', 1)
+
+        # GCC 2.6.3's config scripts predate Apple Silicon and do not recognize Sony's PSX target OS.
+        for filename, destination in (("config.guess", source / "config.guess"),
+                                      ("config.sub", source / "config.sub")):
+            destination.chmod(destination.stat().st_mode | 0o200)
+            shutil.copyfile(inputs[filename], destination)
+            destination.chmod(0o755)
+        config_sub = (source / "config.sub").read_text(encoding="latin-1")
+        marker = "| hiux* | abug | nacl*"
+        if marker not in config_sub:
+            raise ToolchainError("The pinned config.sub no longer has the expected OS list.")
+        (source / "config.sub").write_text(config_sub.replace(marker, "| psx* \\\n\t     " + marker, 1), encoding="latin-1")
+
+        # Teach this GCC release's hand-written configure script the native Darwin host description.
+        case = "\t*)\n\t\techo \"Configuration $machine not supported\" 1>&2"
+        if case not in config_text:
+            raise ToolchainError("GCC 2.6.3 configure no longer has the expected host fallback.")
+        config_text = config_text.replace(
+            case,
+            "\t\t*-apple-darwin*)\n\t\t\txm_file=xm-darwin.h\n\t\t\tfixincludes=Makefile.in\n\t\t\t;;\n" + case,
+            1,
+        )
+        configure.chmod(configure.stat().st_mode | 0o200)
+        configure.write_text(config_text, encoding="latin-1")
+        configure.chmod(0o755)
+        shutil.copyfile(patches / "xm-darwin.h", source / "config" / "xm-darwin.h")
+        for name in ("cp/parse.y", "cp/parse.h", "cp/parse.c", "insn-config.h"):
+            path = source / name
+            if path.exists():
+                path.chmod(path.stat().st_mode | 0o200)
+                path.touch()
+
+        build = root / "build"
+        build.mkdir()
+        commands = [
+            [str(source / "configure"), "--target=mips-sony-psx", "--prefix=/opt/cross",
+             "--with-endian-little", "--with-gnu-as"],
+            ["/usr/bin/make", "-j" + str(min(4, os.cpu_count() or 1)), "cpp", "cc1", "xgcc", "cc1plus", "g++",
+             "CFLAGS=-std=gnu89 -w -Wno-int-conversion -Wno-implicit-function-declaration -Wno-return-mismatch"],
+        ]
+        for argv in commands:
+            log("  building native GCC 2.6.3 for PlayStation (first install only): " + Path(argv[0]).name)
+            try:
+                res = subprocess.run(limits.capped(argv), cwd=build, capture_output=True, text=True,
+                                     errors="replace", timeout=900, env=dict(env, CC="/usr/bin/clang"))
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise ToolchainError(f"Couldn't build GCC 2.6.3 for PlayStation: {error}. Install Xcode Command Line Tools and retry.") from error
+            if res.returncode:
+                raise ToolchainError("Couldn't build GCC 2.6.3 for PlayStation. Install Xcode Command Line Tools and retry.\n"
+                                     + (res.stdout + res.stderr)[-4000:])
+
+        # Check the target's byte order and the GCC extensions expected by PSY-Q before exposing the toolchain.
+        smoke = root / "little_endian.c"
+        smoke.write_text("unsigned char read_byte(const unsigned char *p) { return *p; }\n", encoding="utf-8")
+        asm = root / "little_endian.s"
+        try:
+            res = subprocess.run([str(build / "cc1"), "-quiet", "-O2", str(smoke), "-o", str(asm)],
+                                 capture_output=True, text=True, errors="replace", timeout=30, env=env)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ToolchainError(f"GCC 2.6.3 failed its target smoke test: {error}") from error
+        if res.returncode or not re.search(r"lbu\s+\$2,0\(\$4\)", asm.read_text(errors="replace")):
+            raise ToolchainError("GCC 2.6.3 failed its little-endian MIPS smoke test.\n" + (res.stdout + res.stderr)[-2000:])
+        outputs = {"cpp": "cpp", "cc1": "cc1", "gcc": "xgcc", "cc1plus": "cc1plus", "g++": "g++"}
+        for name, binary in outputs.items():
+            target = dest / name
+            shutil.copy2(build / binary, target)
+            target.chmod(0o755)
 
 
 def venv_bin(venv: Path, name: str) -> Path:
@@ -390,6 +991,22 @@ def java_version() -> int:
     return int(m.group(1)) if m else 0
 
 
+def _local_status(tc: Toolchain, m: dict) -> dict:
+    """Where the copies of a kit the user set up are, each with its build and whether its files are ones
+    decompdecomp knows (Kit.verify). `folder` and `verified` are the first copy's."""
+    from . import kits
+
+    kit, copies = kits.get(tc.id), []
+    for c in _copies(m):
+        at = find_local(tc, c)
+        try:
+            copies.append({"folder": c, "build": (kit.build(at) or "") if at else "",
+                           "verified": kit.verify(at) if at else "it isn't there any more: remove it or put it back"})
+        except OSError:
+            copies.append({"folder": c, "build": "", "verified": ""})
+    return {"folder": copies[0]["folder"], "verified": copies[0]["verified"], "copies": copies} if copies else {}
+
+
 def status() -> list[dict]:
     """Every pinned compiler and tool: whether it's installed and can be on this computer, its licence, and whether
     its downloads are pinned. For Compilers & tools."""
@@ -397,7 +1014,10 @@ def status() -> list[dict]:
     for tc in registry().values():
         m = installed(tc.id)
         rows.append({"id": tc.id, "name": tc.name, "kind": tc.kind, "platform": tc.platform, "license": tc.license,
+                     "source": tc.source,  # (where it comes from: the install's confirmation says)
                      "installed": m is not None, "supported": tc.supported, "description": tc.description,
-                     "wsl": tc.via_wsl,
+                     # installed from an entry that has changed since: Compilers & tools offers to install it again
+                     "changed": m is None and _manifest(tc.id) is not None,
+                     "wsl": tc.via_wsl, "linux_vm": tc.via_vm, "local": tc.local, **(_local_status(tc, m) if tc.local and m else {}),
                      "pinned": all(p.get("sha256") for p in tc.parts) or bool(tc.commit)})
     return rows

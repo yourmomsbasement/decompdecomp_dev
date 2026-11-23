@@ -149,6 +149,7 @@ class NintendoDS(Console):
                                                  encoding="utf-8")
 
     splits_sources = True
+    compiler_config = (".decomp.wtf.json", "config/**/*")  # file_compilers.json and each module's delinks.txt
 
     def rename_symbol(self, fp, version: str, old: str, new: str) -> dict:
         """ds-decomp's symbols.txt: the line `old kind:...` becomes `new kind:...` (the delinked objects take it)."""
@@ -229,7 +230,7 @@ class NintendoDS(Console):
         own = scratch.file_compilers(fp.root, manifest["version"]).get(source)
         return f"DS/{own}" if own else manifest.get("compiler", self.usual)
 
-    def set_file_compiler(self, fp, source: str, compiler: str) -> str:
+    def set_file_compiler(self, fp, source: str, compiler: str, why: str = "", evidence: list | None = None) -> str:
         from ...forks.project import ForkError
         from . import scratch
 

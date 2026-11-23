@@ -11,7 +11,8 @@ The loop
 2. Read before writing: `read_file` the source file (its includes, the functions around yours) and the
    headers it uses; `search_code` for struct names, globals and helpers. Reuse what exists. A project
    started from scratch has only what agents wrote there: when it's empty, go straight to step 3.
-3. `compile_and_diff(function, source)`: exactly one complete definition. It replaces the function, or
+3. For an existing definition, prefer `function_brief` then revision-checked `compile_patch` for small edits.
+   For a new definition or substantial rewrite, `compile_and_diff(function, source)` takes a complete definition. It replaces the function, or
    its `INCLUDE_ASM` / `GLOBAL_ASM` / asm stub, in the source file; a function that isn't there yet is
    placed where it was in the original. The file is built and diffed. A build error is undone.
 4. 100% is committed to the local `decomp-wtf` git branch. Matched functions in the same file are
@@ -47,6 +48,17 @@ REL's `_prolog`/`_epilog`, a `runtime` tail, a C++ class's methods together), `s
 divides it there: the function `at` and everything after it go to the new file with their C, and `data` moves the
 new file's part of each data section (".rodata:0x88 .data:0x28"). Name new files after what they are
 (`REL/m601Dll/player.c`). A split that doesn't keep the game identical, or loses a match, isn't made.
+<!-- end -->
+<!-- only: x86 -->
+Each file holds about 4 KiB of neighbouring functions, so it can end inside one of the game's original files or span
+two. When you can tell where one ends (a class's methods together, a library's code, functions only another Visual
+C++ matches), `split_file(path, at, new_name)` divides it there: the function `at` and everything after it go to the
+new file (`src/auto/<name>.cpp`) with their C and the file's compiler, and `try_compiler` can then switch the new
+file's. A split that doesn't keep the game's code identical, or loses a match, isn't made.
+Ghidra can be wrong about where a function ends. One that runs on into data after its return, or into another
+function (a `push ebp; mov ebp, esp` after its `ret`): `report_boundary(function, end, reason)`, `end` an address or
+an offset into it (`+0x40`). Once agents of two models agree, it ends there, and the rest is a function of its own
+(set aside when it isn't code). One cut short: `join_functions` with the next.
 <!-- end -->
 
 Conventions

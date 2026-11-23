@@ -184,12 +184,33 @@ def test_what_a_function_waits_for_is_claimed_first_and_its_match_brings_it_back
 
 def test_notes_that_say_it_matches_are_marked_out_of_date_on_a_function_that_doesnt():
     for text in ("Already 100% - the data check failed earlier", "f is matched; nothing to do", "score 0 now",
-                 "✅ MATCH with the stand-in", "objdiff 100% match"):
+                 "✅ MATCH with the stand-in", "objdiff 100% match",
+                 # what agents wrote while a judge misread a unit's object as score 0
+                 "Matched 100% with plain C (the best attempt source, unchanged), committed.",
+                 "Matches 100% via compile_and_diff (committed again)",
+                 "Compiles to 100% every time with the brief's source. Don't spend compiles on it."):
         assert stale_note(text, "open").startswith("[out of date"), text
         assert stale_note(text, "matched") == text
     for text in ("not 100% match yet: the call to g differs", "68.7%: reads this from the stack, ret 4",
-                 "never matched, tried 4 times", "score 0.5"):
+                 "never matched, tried 4 times", "score 0.5", "Not matched; best stays 97.6% (score 433)",
+                 "It never compiles to 100% with the literal"):
         assert stale_note(text, "open") == text, text
+
+
+def test_longer_notes_that_say_it_matches_go_after_the_findings_on_a_function_that_doesnt():
+    """An Xbox game: notes saying "matches 100%, don't spend compiles on it" (a judge had misread the unit's object)
+    held three of a function's six note slots, above the finding that took it to 92%."""
+    from decompnet.network import brief_notes
+
+    fn = {"status": "open", "best_score": 1668, "n_insns": 222}
+    tail = " The remaining diff the brief shows is stack slots and the order of the three quads' corner sums." * 2
+    rows = [{"text": "Compiles to 100% every time with the brief's source; don't spend compiles on it." + tail,
+             "created_at": 30, "name": "a"},
+            {"text": "Matched 100% with plain C, committed." + tail, "created_at": 20, "name": "b"},
+            {"text": "76.7% -> 92.4%: the origin is a fresh temporary at each call", "created_at": 10, "name": "c"}]
+    out = brief_notes(rows, fn, best_at=10, best_text="92.4%", when=False)
+    assert out[0] == "- (c) 76.7% -> 92.4%: the origin is a fresh temporary at each call"
+    assert all(line.startswith(("- (a) [out of date", "- (b) [out of date")) for line in out[1:])
 
 
 def test_briefs_leave_out_infrastructure_notes_show_duplicates_once_and_mark_beaten_ceilings(tmp_path):
@@ -265,3 +286,61 @@ def test_a_brief_leaves_out_notes_that_only_say_an_open_function_matches(tmp_pat
     section = "\n".join(net.notes_for_brief(net.store.one("SELECT * FROM functions WHERE id=?", fid)))
     assert "no work needed" not in section and "1 note saying it already matches left out" in section
     assert "[out of date" in section and "func_0206d4f8" in section
+
+
+def test_a_big_function_is_released_only_after_real_work_on_it(tmp_path):
+    """A helper took a 501-instruction function from 2% to 48% in seven compiles, rebuilt three of its six parts and
+    released it ten minutes after the claim: asking again after the push-back let it through. A big function's
+    release asked again now waits for BIG_RELEASE_COMPILES compiles or BIG_RELEASE_SECONDS on it; a small one's
+    doesn't."""
+    from decompnet.app.function_parts import BIG_RELEASE_COMPILES, BIG_RELEASE_SECONDS
+
+    net, _ = _game(tmp_path, [("big", 501, "open"), ("small", 10, "open")])
+    a, _ = net.local_agent("a")
+    net.claim_row(a, "game", "big")
+    time.sleep(0.01)
+    _attempts(net, a, "big", [49000, 37000, 32000, 26000])  # getting better: no move-on
+    for _ in range(2):  # pushed back, and again when asked again
+        said = net.release_function(a, "big", "parts 4-6 left", "game")
+        assert said.startswith("Not released yet") and _held(net, a) == "big"
+    assert f"after {BIG_RELEASE_COMPILES} compiles (4 so far)" in said and "501 instructions" in said
+    _attempts(net, a, "big", [25000 - k for k in range(BIG_RELEASE_COMPILES - 4)])
+    assert net.release_function(a, "big", "parts 4-6 left", "game").startswith("Released big")
+
+    c, _ = net.local_agent("c")
+    net.claim_row(c, "game", "big")  # a claim older than BIG_RELEASE_SECONDS, with a compile in it, goes through
+    with net.store.tx() as db:
+        db.execute("UPDATE claims SET claimed_at=claimed_at-? WHERE agent_id=?", (BIG_RELEASE_SECONDS + 1, c.id))
+    _attempts(net, c, "big", [20000])
+    assert net.release_function(c, "big", "", "game").startswith("Not released yet")  # pushed back once still
+    assert net.release_function(c, "big", "the rest needs its struct", "game").startswith("Released big")
+
+    b, _ = net.local_agent("b")
+    net.claim_row(b, "game", "small")
+    time.sleep(0.01)
+    _attempts(net, b, "small", [40])
+    assert net.release_function(b, "small", "", "game").startswith("Not released yet")
+    assert net.release_function(b, "small", "can't get closer", "game").startswith("Released small")
+
+
+def test_a_big_function_whose_every_part_was_compiled_can_be_released(tmp_path, monkeypatch):
+    from decompnet.app import function_parts
+    from decompnet.app.function_parts import Part
+
+    net, _ = _game(tmp_path, [("big", 450, "open")])
+    a, _ = net.local_agent("a")
+    parts = [Part(n, 0, 1, 0, 0, "block") for n in (1, 2, 3)]
+    monkeypatch.setattr(net, "fork_slug", lambda slug: slug)
+    monkeypatch.setattr(function_parts, "target_parts", lambda net, slug, fn: ([], parts))
+    fn = net.claim_row(a, "game", "big")
+    time.sleep(0.01)
+    _attempts(net, a, "big", [40000, 30000])
+    progress = net.claim_progress(a, fn)
+    for part in (1, 3):
+        with net.store.tx() as db:
+            net._event(db, fn["project_id"], a.id, "compile_part", f"big part {part}")
+    owed = function_parts.release_owed(net, "game", fn, a, progress)
+    assert "a compile_part of each of its 3 parts (not yet: 2)" in owed
+    with net.store.tx() as db:
+        net._event(db, fn["project_id"], a.id, "compile_part", "big part 2")
+    assert function_parts.release_owed(net, "game", fn, a, progress) is None

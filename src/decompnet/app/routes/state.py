@@ -13,7 +13,7 @@ from pathlib import Path
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from ... import __version__, consoles, hostenv, toolchains
+from ... import __version__, consoles, hostenv, linuxvm, toolchains
 from ...agents.api import API_PRESETS
 from ...forks.project import SCOPES
 from ...network import NetworkError
@@ -21,6 +21,8 @@ from .. import cleanup, edition, picker, saves, updates
 from ..engine import COMPILERS, TOOLS
 from ..support import MAX_DISC, job_error, static_file
 from . import App
+
+DEBUG_SUFFIXES = (".pdb", ".map", ".functions.jsonl")  # sidecars read by the PC and PS4 importers
 
 
 def system_name() -> str:
@@ -45,9 +47,10 @@ def register(app: App) -> None:
         return {"version": __version__, "build": build_id, "install": updates.installed(), "dev": edition.DEV,
                 "platform": toolchains.current_platform(), "system": system_name(), "home": hostenv.shown_path(home.parent),
                 "log_file": hostenv.shown_path(home / "logs" / "decomp.log"),
+                "linux_vm": ({"ready": linuxvm.status()[0], "why": linuxvm.status()[1]} if linuxvm.wanted() else None),
                 "toolchains": tcs, "agents": manager.detected(), "agents_detecting": manager.detecting(),
                 "bridges_removed": [] if settings.data.get("bridges_removed_seen") else cleanup.report(home),
-                "api_presets": API_PRESETS, "settings": settings.public(), "mcp_url": mcp_url,
+                "account_usage": manager.account_usage(), "api_presets": API_PRESETS, "settings": settings.public(), "mcp_url": mcp_url,
                 # every console: names, status, compilers, layout, features (consoles/, Console.describe)
                 "consoles": [c.describe() for c in consoles.CONSOLES]}
 
@@ -74,8 +77,14 @@ def register(app: App) -> None:
                 out.append(net.summary(p["slug"]) | {"working": running.get(p["slug"], 0)})
             except Exception as e:  # noqa: BLE001
                 jobs.logger.warning("project %s can't be read: %s", p["slug"], e, exc_info=not isinstance(e, NetworkError))
-                out.append({"slug": p["slug"], "title": p["name"] or p["slug"], "working": 0,
-                            "broken": job_error(e, jobs.log_path)})
+                progress_error = net.progress.errors.get(p["slug"])
+                if progress_error:
+                    out.append({"slug": p["slug"], "title": p["name"] or p["slug"], "working": 0,
+                                "kind": "rom", "platform_short": "?", "functions": 0, "matched": 0,
+                                "progress_error": progress_error})
+                else:
+                    out.append({"slug": p["slug"], "title": p["name"] or p["slug"], "working": 0,
+                                "broken": job_error(e, jobs.log_path)})
         return out
 
     @mcp.custom_route("/api/projects", methods=["GET"])
@@ -124,6 +133,25 @@ def register(app: App) -> None:
         after = q.get("after", "")
         return JSONResponse(await call(net.events_after, int(after) if after.isdigit() else None))
 
+    def split_extras(game: Path, size: int, extras: str | None) -> None:
+        """The files dropped with a game, sent after it in one upload (`extras`: [[name, bytes], ...]): a PC game's
+        program database or linker map, or PS4 function map. Put them beside the uploaded program."""
+        if not extras:
+            return
+        try:
+            wanted = [(Path(str(name)).name, int(n)) for name, n in json.loads(extras)]
+        except (ValueError, TypeError):
+            raise ValueError("the files sent with the game aren't listed right") from None
+        if any(not (name.lower().endswith(DEBUG_SUFFIXES) or name.lower() == "functions.jsonl")
+               or name == game.name or n < 0 for name, n in wanted) or \
+                sum(n for _, n in wanted) >= size:
+            raise ValueError("only .pdb, .map or functions.jsonl sidecars can be sent with a game")
+        with open(game, "r+b") as f:
+            f.seek(size - sum(n for _, n in wanted))
+            for name, n in wanted:
+                (game.parent / name).write_bytes(f.read(n))
+            f.truncate(size - sum(n for _, n in wanted))
+
     @mcp.custom_route("/api/import", methods=["POST"])
     async def api_import(request: Request) -> Response:
         """A game the user owns: the demo, an upload streamed to disk (discs are gigabytes), or a local path."""
@@ -132,6 +160,14 @@ def register(app: App) -> None:
         q = request.query_params
         toolchain = q.get("toolchain") or None
         scope = q.get("scope") or None  # what the project covers, where its console sets library code aside
+        try:  # the answers to the console's import_options (JSON, an object of strings)
+            options = json.loads(q.get("options") or "{}")
+            if not isinstance(options, dict) or not all(isinstance(v, str) for v in options.values()):
+                raise ValueError
+        except ValueError:
+            return fail(ValueError("options must be a JSON object of strings"))
+        # every compiler of the game's console first (the proprietary ones with `accept`), so its test tries them all
+        all_compilers, accept = q.get("all_compilers") == "1", q.get("accept") == "1"
         if scope not in (None, *SCOPES):
             return fail(ValueError(f"a project covers the game's own code or the whole program, not {scope!r}"))
         if q.get("demo") == "1":
@@ -144,8 +180,8 @@ def register(app: App) -> None:
                 return fail(ValueError("confirm that this is your own legally obtained copy of the game"))
             if q.get("path"):
                 game = hostenv.local_path(q["path"])
-                if not game.is_file():
-                    return fail(ValueError(f"no file at {game}"))
+                if not game.exists():  # (a folder too: a PC game's, whose own DLLs come along)
+                    return fail(ValueError(f"no file or folder at {game}"))
                 name = game.name
             else:
                 name = Path(q.get("name") or "game.bin").name
@@ -164,14 +200,22 @@ def register(app: App) -> None:
                 if size == 0:
                     game.unlink(missing_ok=True)
                     return fail(ValueError("the file was empty"))
+                try:
+                    split_extras(game, size, q.get("extras"))
+                except ValueError as e:
+                    shutil.rmtree(game.parent, ignore_errors=True)
+                    return fail(e)
         uploaded = isinstance(game, Path) and game.parent.parent == home / "uploads"
 
         def work(log):
             try:
-                slug = net.import_rom(game, toolchain=toolchain, confirmed=True, name=name, log=log, scope=scope)
+                slug = net.import_rom(game, toolchain=toolchain, confirmed=True, name=name, log=log, scope=scope,
+                                     options=options)
             finally:
                 if uploaded:
                     shutil.rmtree(game.parent, ignore_errors=True)
+            if all_compilers:
+                net.install_compilers(slug, accept, retest=toolchain is None, log=log)
             settings.data["last_project"] = slug
             settings.save()
             autopilot(slug)

@@ -9,8 +9,7 @@ import re
 import time
 
 from ... import arch
-from ...network import Agent, NetworkError
-from ...rom import split
+from ...network import CLAIM_ORDERS, Agent, NetworkError
 from ...rom.symbols import IDENT, Symbol, SymbolTable
 from .common import _ADDRESS
 
@@ -39,17 +38,47 @@ class EditMixin:
         syms = self.symbols(proj["id"])
         if not IDENT.match(new_name) or new_name in syms.by_name:
             raise NetworkError(f"`{new_name}` is not a free C identifier")
+        console = self.console(proj)
+        inside = fn["vram"] <= addr < fn["vram"] + fn["size"]
+        if not inside and addr % console.instruction_size(fn) == 0:
+            rom, _ = self._rom(proj)
+            following = [r["vram"] for r in self.store.all(
+                "SELECT vram FROM functions WHERE project_id=? AND vram>?", proj["id"], addr)]
+            limit = min(following) if following else fn["vram"] - (fn["rom_offset"] or 0) + len(rom)
+            new = console.function_at(rom, addr, limit, new_name)
+            if new is not None:
+                return self._add_function(proj, fn, new, syms, agent.id, new_name)
         head, tail = self._cut(proj, fn, addr, new_name, syms, agent.id, "split", f"{fn['name']} / {new_name}")
-        return (f"✅ split: {fn['name']} is now {len(head.lines)} instructions; {new_name} at 0x{addr:08X} has "
-                f"{len(tail.lines)}. Continue with {fn['name']} (get_function shows its new assembly).")
+        return (f"✅ split: {fn['name']} is now {console.function_insns(head)} instructions; {new_name} at "
+                f"0x{addr:08X} has {console.function_insns(tail)}. Continue with {fn['name']} "
+                "(get_function shows its new assembly).")
+
+    def _add_function(self, proj, prev, new, syms: SymbolTable, agent_id: int | None, new_name: str) -> str:
+        """Add a function the splitter missed after `prev`; it starts at its own address and mode."""
+        console = self.console(proj)
+        syms.add(Symbol(new_name, new.vram, new.size, "func"))
+        target = self._make_target(proj, new, syms)
+        meta = console.function_meta(new)
+        with self.store.tx() as db:
+            db.execute("INSERT INTO functions(project_id,name,size,n_insns,target,relocs,asm,seed,unit,vram,rom_offset,"
+                       "status,meta) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (proj["id"], new_name, new.size, console.function_insns(new), target.code,
+                        json.dumps(target.to_json()), console.function_asm(new), None, prev["unit"], new.vram, new.rom,
+                        console.function_status(new), json.dumps(meta) if meta else None))
+            db.execute("INSERT OR REPLACE INTO symbols(project_id,name,address,size,kind) VALUES(?,?,?,?,?)",
+                       (proj["id"], new_name, new.vram, new.size, "func"))
+            self._event(db, proj["id"], agent_id, "split", f"{prev['name']} / {new_name}")
+        self._xrefs.pop(proj["id"], None)
+        self._ops.pop(proj["id"], None)
+        return f"✅ new function {new_name} at 0x{new.vram:08X}, {new.size} bytes."
 
     def _cut(self, proj, fn, addr: int, new_name: str, syms: SymbolTable, agent_id: int | None, kind: str, detail: str,
              tail_meta: dict | None = None):
         """Cut a MIPS function in two at `addr`: the head keeps its row, the tail becomes `new_name` (status 'asm'
         with `tail_meta` when it isn't code agents should work on). Returns (head, tail)."""
-        rf = self._parse_asm(fn["name"], fn["asm"], fn["unit"])
+        console = self.console(proj)
         try:
-            head, tail = split.split_function(rf, addr, new_name)
+            head, tail = console.split_function(fn, addr, new_name)
         except ValueError as e:
             raise NetworkError(str(e)) from None
         syms.add(Symbol(new_name, addr, tail.size, "func"))
@@ -58,14 +87,17 @@ class EditMixin:
             old.size = head.size
         th, tt = self._make_target(proj, head, syms), self._make_target(proj, tail, syms)
         with self.store.tx() as db:
+            meta = console.function_meta(tail)
+            if tail_meta:
+                meta.update(tail_meta)
             db.execute("UPDATE functions SET size=?, n_insns=?, target=?, relocs=?, asm=?, seed=NULL, best_score=NULL "
-                       "WHERE id=?", (head.size, len(head.lines), th.code, json.dumps(th.to_json()),
-                                      self._asm_source(head), fn["id"]))
+                       "WHERE id=?", (head.size, console.function_insns(head), th.code, json.dumps(th.to_json()),
+                                      console.function_asm(head), fn["id"]))
             db.execute("INSERT INTO functions(project_id,name,size,n_insns,target,relocs,asm,seed,unit,vram,rom_offset,"
                        "status,meta) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                       (proj["id"], new_name, tail.size, len(tail.lines), tt.code, json.dumps(tt.to_json()),
-                        self._asm_source(tail), None, fn["unit"], addr, tail.rom, "asm" if tail_meta else "open",
-                        json.dumps(tail_meta) if tail_meta else None))
+                       (proj["id"], new_name, tail.size, console.function_insns(tail), tt.code, json.dumps(tt.to_json()),
+                        console.function_asm(tail), None, fn["unit"], addr, tail.rom,
+                        "asm" if tail_meta else console.function_status(tail), json.dumps(meta) if meta else None))
             db.execute("UPDATE symbols SET size=? WHERE project_id=? AND name=?", (head.size, proj["id"], fn["name"]))
             db.execute("INSERT OR REPLACE INTO symbols(project_id,name,address,size,kind) VALUES(?,?,?,?,?)",
                        (proj["id"], new_name, addr, tail.size, "func"))
@@ -76,28 +108,36 @@ class EditMixin:
     def request_boundary(self, agent: Agent, slug: str, function: str, end: str, reason: str) -> str:
         """An agent's report that a function really ends earlier: what follows is alignment padding, linker leftovers
         or data, not code anyone wrote. Changing the function list is the user's call, so it waits for them on the
-        project page (resolve_boundary); approved, the function is cut there and the rest set aside."""
+        project page (resolve_boundary); approved, the function is cut there and the rest set aside. A project
+        decompdecomp made (PC) cuts it once agents agree instead (ForkEngine.report_boundary)."""
+        if (fork := self.fork_slug(slug)):
+            return self.forks.report_boundary(agent, fork, function, end, reason)
         self._rom_only(slug, "report_boundary")
         if self._link(slug) is not None:
             raise NetworkError("in a team room the host's project decides where functions end: tell the host (add_note)")
         fn = self._function(function, slug)
         proj = self._project(slug)
-        if arch.BOUNDARIES not in self.console(proj).features:
-            raise NetworkError(f"boundary reports are for MIPS games (N64, PlayStation 2) for now, not {self.console(proj).name}")
+        console = self.console(proj)
+        if arch.BOUNDARIES not in console.features:
+            raise NetworkError(f"boundary reports aren't supported for {console.name} yet (ROADMAP.md)")
         if fn["status"] == "matched":
             raise NetworkError(f"{fn['name']} is matched: its boundaries are proven")
         m = _ADDRESS.match(str(end).strip())
         if not m:
             raise NetworkError("`end` must be an address like 0x80001234: where the function's last instruction ends")
         addr = int(m.group(1), 16)
+        size = console.instruction_size(fn)
         off = addr - fn["vram"]
-        if off <= 0 or off >= fn["size"] or off % 4:
-            raise NetworkError(f"0x{addr:08X} isn't a word inside {fn['name']} (0x{fn['vram']:08X}, {fn['size']} bytes)")
+        if off <= 0 or off >= fn["size"] or off % size:
+            word = "word" if size == 4 else "instruction"
+            raise NetworkError(f"0x{addr:08X} isn't a {word} inside {fn['name']} "
+                               f"(0x{fn['vram']:08X}, {fn['size']} bytes)")
         reason = " ".join(reason.split())[:600]
         if not reason:
             raise NetworkError("say what the bytes after it are (padding, linker leftovers, data) and how you can tell")
         order = "big" if proj["big_endian"] else "little"
-        rest = " ".join(f"{int.from_bytes(fn['target'][at:at + 4], order):08X}" for at in range(off, min(fn["size"], off + 32), 4))
+        rest = " ".join(f"{int.from_bytes(fn['target'][at:at + size], order):0{2 * size}X}"
+                        for at in range(off, min(fn["size"], off + 32), size))
 
         def change(cfg):
             items = cfg.setdefault("boundaries", [])
@@ -148,7 +188,7 @@ class EditMixin:
         if not pairs:
             return "nothing to rename"
         syms = self.symbols(proj["id"])
-        trial = SymbolTable([Symbol(s.name, s.address, s.size, s.kind) for s in syms.by_name.values()])
+        trial = syms.copy()  # with every overlay twin's name (#117 review)
         addresses = {}
         for old, new in pairs:
             if not (IDENT.match(old) and IDENT.match(new)):
@@ -160,15 +200,24 @@ class EditMixin:
             taken = trial.resolve(new)
             if taken is not None and taken != addr:
                 raise NetworkError(f"`{new}` already names 0x{taken:08X}")
+            at = self.store.all("SELECT id, name, size FROM functions WHERE project_id=? AND vram=?", proj["id"], addr)
+            renamed = [r for r in at if r["name"] == old] or (at if len(at) == 1 else [])
+            if any(r["name"] == new for r in at) and not any(r["name"] == new for r in renamed):
+                # the other overlay function at this address has it: the names would collide (#117 review)
+                raise NetworkError(f"`{new}` already names another function at 0x{addr:08X} (an overlay's)")
             addresses[old] = addr
             if old in trial.by_name:
                 trial.rename(old, new)
             else:
-                fnrow = self.store.one("SELECT size FROM functions WHERE project_id=? AND vram=?", proj["id"], addr)
+                fnrow = at[0] if at else None
                 current, _ = syms.name_at(addr)
                 base = syms.by_name.get(current) if current != f"D_{addr:08X}" else None
-                trial.add(Symbol(new, addr, fnrow["size"] if fnrow else (base.size if base and base.address == addr else 0),
-                                 "func" if fnrow else (base.kind if base else "data")))
+                sym = Symbol(new, addr, fnrow["size"] if fnrow else (base.size if base and base.address == addr else 0),
+                             "func" if fnrow else (base.kind if base else "data"))
+                if len(at) > 1:  # an overlay twin still called by its address's name: the other twin's name stays
+                    trial.alias(sym)
+                else:
+                    trial.add(sym)
         new_of = dict(pairs)
         word = re.compile(r"\b(" + "|".join(re.escape(old) for old in new_of) + r")\b")
         swap = lambda text: word.sub(lambda m: new_of[m.group(1)], text)
@@ -196,7 +245,12 @@ class EditMixin:
                     s = trial.by_name[new]
                     db.execute("INSERT OR REPLACE INTO symbols(project_id,name,address,size,kind) VALUES(?,?,?,?,?)",
                                (proj["id"], new, s.address, s.size, s.kind))
-                db.execute("UPDATE functions SET name=? WHERE project_id=? AND (name=? OR vram=?)", (new, proj["id"], old, addr))
+                # By name: an address overlays share names one of their functions, never all of them (#107 review).
+                # A name only the symbols had (a function whose row kept its address's name) goes by the address.
+                if not db.execute("UPDATE functions SET name=? WHERE project_id=? AND name=?",
+                                  (new, proj["id"], old)).rowcount:
+                    db.execute("UPDATE functions SET name=? WHERE project_id=? AND vram=? AND (SELECT COUNT(*) FROM "
+                               "functions WHERE project_id=? AND vram=?)=1", (new, proj["id"], addr, proj["id"], addr))
             for u, header in changed.items():
                 version = self._next_version(db, proj["id"])
                 db.execute("INSERT INTO context_versions(project_id,version,header,agent_id,message,created_at,unit) "
@@ -238,6 +292,20 @@ class EditMixin:
 
     def instructions(self, slug: str) -> str:
         return self.cfg(self._project(slug)).get("instructions") or ""
+
+    def set_claim_order(self, slug: str, order: str) -> str:
+        """Which functions helpers claim without a name take first, whatever strategy they ask for; "" is the
+        agent's own choice (easiest, or finish in project mode)."""
+        order = (order or "").strip()
+        if order not in ("", *CLAIM_ORDERS):
+            raise NetworkError(f"claim order must be left empty (the default) or be one of {', '.join(CLAIM_ORDERS)}")
+        self._update_cfg(slug, lambda cfg: cfg.__setitem__("claim_order", order) if order
+                         else cfg.pop("claim_order", None))
+        return order
+
+    def claim_order(self, slug: str) -> str:
+        order = self.cfg(self._project(slug)).get("claim_order") or ""
+        return order if order in CLAIM_ORDERS else ""
 
     def set_title(self, slug: str, title: str) -> str:
         """The name the project shows by, which the user can change: a disc's title is often only its serial

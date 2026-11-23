@@ -1,5 +1,50 @@
 # Matching PlayStation 4 code (x86-64, clang 5.0.2)
 
+
+## Agent quick reference
+
+- Judge current targets with strict relocation and constant checks. Historical scores from earlier target formats
+  are not comparable. Keep repaired function-local symbol-linkage aliases intact.
+- Start from the best saved source and inspect the actual prologue, signature, destinations and failing region.
+  Database instruction counts may be estimates. A skeleton or guessed signature is not ABI evidence.
+- Use `function_brief` and `compile_patch` for small function edits. Use `edit_file` for shared declarations/helpers;
+  preserve all matched neighbors. Target objects, compiler configuration and build scripts are not agent-editable.
+- For globals, a relaxed address load followed by a separate access can need default visibility; a folded direct
+  RIP-relative access can need hidden visibility. The current binder supports eligible GOT relaxation. Inspect the
+  target and relocation rather than applying visibility rules globally. See the data-reference section for details.
+- If only independent instruction ordering remains after checking operands and semantics, test local
+  `target("arch=btver2")` before releasing. Recheck the whole function. Scheduling failure alone is not proof that
+  the compiler cannot match it. Send only genuine remaining scheduling/register differences to the permuter.
+- Keep `no-sse` experiments local to compatible integer-only by-value callers. Do not enable AVX2/BMI2, global
+  fast-math or another architecture just to force one expression. The configured build already supplies its ISA.
+- A target canary requires reconstructing the observed protected locals. The current patched compiler/binder
+  supports the global guard; old TLS-only/global-guard blocker notes are not current limitations.
+- A unit can be built with another compiler (clang 3.8.1 or 3.9.1) where its functions show it: if C that looks
+  right stalls on register choice or instruction order, try_compiler(function, "all"). One match is kept as evidence;
+  the unit switches once a second of its functions matches only with that compiler and none of its matches is lost.
+  Each unit's settings and why are in docs/build-settings.md (the brief quotes its file's).
+- A switch's jump table is bound to the game's by the build (tools/jump_tables.py) when every case lands where the
+  game's does: a remaining `lea reg,[D_...]` against `[.rodata...]` row means some case's code or order differs, not
+  a tool limit. Fix the cases; don't release the function for it.
+- A function of 400+ instructions goes a part at a time: `list_parts` shows its parts, mark them in the C with
+  `/* part N */ ... /* end part N */` and send one part's C with `compile_part`; `claim_part` joins someone else's.
+  Repeated calls with other constants become one-letter macros in the file (`edit_file`).
+- Recover vector helpers from the target operations, masks and order; original helper source is not required.
+  Use the donor and block hints in the brief. Read detailed PS4 recipes only when the current diff calls for them.
+- Acquire loads, fences and scheduling attributes are scoped experiments. When reusing a saved traversal example
+  containing all three, retain the complete observed combination until isolation tests establish necessity.
+  `weak,noinline` changes symbol binding; validate the caller and matched neighbors, not just the callee.
+
+## Validate targets before tuning C
+
+Target format 2 fixes ELF symbol indices, short-branch operand widths, and function extents.
+Use `functionRelocDiffs: all`: a matching instruction with the wrong call or data destination is not a match.
+Old scores and old target disassembly must be rechecked after migration; do not use them as evidence that C is correct.
+Recovered sources can contain function-local `extern __typeof__(...)` declarations with an `__asm__("symbol")`
+linkage name. These preserve the existing type while correcting that function's destination. They contain no assembly
+instructions. Keep the linkage names intact; do not globally rename an identifier based on one repaired call site.
+
+
 The compiler this project builds with was found by measurement, not from the SDK's name. On inFAMOUS Second Son's
 eboot (`ET_SCE_EXEC`, ELF64, no section headers), clang 5.0.2 with
 
@@ -51,43 +96,133 @@ function the buffer the target shows (an array local, a memcpy destination) so t
 
 ## Spend turns where they pay
 
-- **A function already at 94% or more is the permuter's, not yours.** Its C is right and its last few instructions are
-  scheduling or register choice; four to ten more attempts from you usually buy nothing. Take a function that is far
-  from matching and leave the near miss alone — the background permuter grinds those on spare cores, without tokens.
-- **Write the smallest edit that could be right.** `edit_file` on the one expression that differs costs a fraction of
-  the tokens of resubmitting the whole function, and the judge only cares about the result.
+- **For a near match, classify the remaining differences before spending more attempts.** Confirm call/data destinations,
+  types, and control flow first. If only scheduling or register choice remains, test applicable local recipes such as btver2 before leaving the remainder to the background permuter.
+  A high percentage alone does not establish that the C is correct.
+- **Write the smallest edit that could be right.** `function_brief` followed by revision-checked
+  `compile_patch` avoids resending the whole definition. Reserve `edit_file` for shared declarations and helpers.
 - **Read the target's first ten instructions before writing anything.** They say whether the function has a stack
   canary, whether it realigns the stack, which argument registers it keeps, and whether it is a thunk — most wrong
   first attempts are wrong about one of those, and the brief already carries the disassembly.
 
-## Where the matches actually come from (measured on this project)
+## Choose work from verified evidence
 
-815 functions matched so far, and they are overwhelmingly small:
+A corrected-target snapshot had 1,282 matches: 1,195 had at most 25 decoded instructions,
+but one had 69. Calls, branches and vector instructions all occur in verified matches;
+their presence alone does not imply a compiler limitation. App instruction counts based on
+size/4 are estimates; use actual decoding for architecture-specific claims.
 
-| instructions | functions | matched | attempted | matched / attempted |
-|---|---|---|---|---|
-| 1-10 | 5,081 | 529 | 839 | **63.1%** |
-| 11-25 | 5,809 | 210 | 1,199 | 17.5% |
-| 26-60 | 7,777 | 75 | 1,089 | 6.9% |
-| 61-150 | 5,859 | 0 | 3 | 0% |
-| 151+ | 3,076 | 0 | 2 | 0% |
+Prefer verified matching function families and compatible declarations. A file with no
+matches is not evidence of bad flags: grouping files by whether they have matches makes
+that conclusion circular. Large functions need block-by-block reconstruction because most
+unmatched bytes live there (list_parts and compile_part do it a part at a time); do not
+mark them impossible after a few skeleton attempts.
 
-- **Nothing over 60 instructions has ever matched**, and no matched function is bigger than 60; the median matched
-  function is 7 instructions and 280 of them are 5 or fewer. Yield falls by an order of magnitude per band. A big
-  function is not "more work", it is a different problem - take small ones.
-- **There are still 4,121 functions of 10 instructions or fewer that nobody has touched**, and 4,610 of 11-25. At
-  the rates above that is where the next two thousand matches are; the code mass is elsewhere (61+ instructions are
-  80% of the unmatched bytes and have never converted).
-- **Matches cluster by unit**: all 815 sit in 447 units; the other 2,120 units have 1,197 attempts and zero matches.
-  Even at 1-10 instructions, 679 attempts in units that already had a match converted, while 161 attempts in units
-  without one converted none. (Partly size - median attempted in a cold unit is 24 instructions vs 16 - but not
-  enough to explain 0 of 161.) Work a unit that already has a match before opening a new one; if a unit has no match
-  after a few tries, its file or its data names are probably wrong, and that is worth a note rather than more
-  attempts.
-- **A plain `extern` byte global gives a GOT load** (`mov rax,[rip+GOT]; mov (%rax),%al`); the same declaration with
-  `__attribute__((visibility("hidden")))` gives one direct `mov al,[rip+D]`. The game also writes `lea` + deref in
-  some places - the address stayed live in its C - and neither declaration reproduces that, so don't chase it with
-  visibility; it needs the address to escape (a call taking it, a stored pointer), which changes the function's size.
+Target format 3 relocates RIP-relative references into BSS (mapped memory without file
+bytes). Earlier target literals can make correct data references appear as near-misses.
+Recheck current targets before trying scheduling changes; retain strict relocation identities.
+
+## What 5,311 matched functions actually use (counted, not guessed)
+
+Census over every 100% function in the project, by what its C contains:
+
+    __asm__("func_X") externs        1,398  (43%)   the ABI-repair linkage trampoline
+    casted pointer arithmetic        1,428  (45%)
+    _mm_loadu_ps / _mm_storeu_ps     610 / 576     16-byte copies go through intrinsics, not memcpy
+    __builtin_annotation                463  (9%)   an optimisation barrier, see below
+    __atomic_signal_fence                190  (6%)
+    volatile                             160  (5%)
+    __atomic_load_n                       42  (1%)
+    __builtin_expect                      28
+    __builtin_islessgreater                6
+    __builtin_{u,s}sub_overflow            3
+
+Two of those are worth reaching for before anything more elaborate.
+
+**`__builtin_annotation` holds an add/sub pair that clang would cancel.** When the target keeps
+`add rdi, 8; ...; add rdi, -8` around a refcount decrement, writing the arithmetic plainly lets clang
+cancel it. Annotating the value keeps it:
+
+    if (q && --*(int *)(q + 8) == 0)
+        func_000AA250((char *)__builtin_annotation((unsigned long)(q + 8), "refcount") - 8);
+
+That is `func_00065ED0` (matched) and the same line appears in `func_00069340`. The label is arbitrary;
+what matters is that the value flows through the annotation, which the optimiser will not fold.
+
+**16-byte copies are written with `_mm_loadu_ps`/`_mm_storeu_ps`.** 610 matched bodies use the load and
+576 the store; `__builtin_memcpy(a, b, 16)` produces `vmovups` from the same clang and does not compare
+to the game's `movq/movq` or `vmovups` pairs depending on the unit.
+
+**A symbol referenced by an asm name is how 43% of matches link.** The pattern the project uses:
+
+    extern __typeof__(func_00984350) repaired_func_000000A0_1 __asm__("func_00984370")
+        __attribute__((visibility("hidden")));
+
+It names the callee `func_00984370` (so the call relocates against the real target symbol) while the
+declaration keeps the ABI types the recovered call needed. Renaming such a declaration's symbol is what
+makes a match fragile - see the naming note in the tool section.
+
+## An unsigned bounds check whose comparison order the target keeps
+
+`cmp (%rsi),%edi; jae` (index first, bound in memory) and `cmp %edi,(%rsi); jbe` (bound first) are the same test
+and different bytes. Clang writes the second for `if (i < s->count)`; the target has the first. Writing the test as
+an overflow check on the subtraction restores the order:
+
+    unsigned unused;
+    if (__builtin_usub_overflow(i, s->count, &unused)) return 0;
+    return s->items[(unsigned short)i];
+
+Verified by compiling both against the same struct: plain gives `cmp %edi,(%rsi); jbe`, the builtin gives
+`cmp (%rsi),%edi; jae` with no `sub` emitted (the difference is dead, only its flags are used). On this project it
+took `func_007DB030` from 90.5% to 100% (matched, score 0). It only matters when one side of the test is a memory
+operand - with the bound in a register clang already emits the index-first order.
+
+## Canonical relaxed TLSGD access uses -fPIC: name the slot in the C
+
+The game's TLS access is `mov rax,fs:[0x0]; add rax,[D_slot]; mov rax,[rax]` - a thread pointer plus a module offset
+word, three instructions. clang 5 emits two (`mov rcx,[D]; mov fs:[rcx],rcx`, R_X86_64_GOTTPOFF) unless the unit is
+compiled for shared objects, where it emits the TLSGD resolver pair that `tools/tls_relax.py` (called from `bind.py`)
+rewrites into the game's form.
+
+1. **The build does the -fPIC part.** decompdecomp gives every unit whose target has the sequence `-fPIC` (in
+   `tools/compiler_units.json`, with the functions that show it; `tools/compile.py` drops the base `-fPIE` for it),
+   kept only where no match of the unit is lost. `docs/build-settings.md` lists them. A unit that stayed `-fPIE`
+   because one of its matches needs it: split the TLS function into a file of its own (split_file), and it gets
+   `-fPIC` at the next Check again. Don't ask for the flag: it's set from the target's bytes.
+2. **The source names the slot by its name in `tools/tls_slots.json`, not the raw `D_` symbol.** The relaxation pairs
+   the TLSGD sequence with the target's slot only through that file. `D_00D9E060` is `decomp_tls_context`; every
+   other slot is `decomp_tls_` + its symbol (`D_00D9E080` is `decomp_tls_D_00D9E080`):
+   `extern __thread void *decomp_tls_D_00D9E080 __attribute__((tls_model("global-dynamic")));`. A raw
+   `extern __thread void *D_00D9E080` never matches a slot and stays GOTTPOFF.
+
+With both, `func_0033A950` in `text_00339D40` went 39.3% -> **100%**. `__builtin_thread_pointer()` doesn't compile
+with clang 5 (the backend can't select it). Ordinary `address_space(257)` loads can fold into `fs:[reg]`.
+
+Do not confuse that canonical sequence with `mov offset,[D_slot]; mov base,fs:[0]; mov value,[base+offset]`.
+The latter is not the 16-byte TLSGD linker relaxation, and does not make the automatic detector choose -fPIC.
+For that explicit-base form, an acquire `__atomic_load_n` of an unsigned-long pointer in address_space(257)
+can preserve the base register. Read the ordinary offset word where the original does; delaying it past object
+stores changes scheduling. The complete matched donor `func_002F2630` in `text_002F1FF0` combines the early
+offset read and atomic base with its growth-loop recipe. Retrieve that source; do not generalize it to all TLS.
+
+PS4 `split_file` now divides a source at a function in the function-map config and inherits its compiler/flags.
+The engine rebuilds both files and rejects splits that lose an exact neighbor. To isolate one function in the
+middle, split at it, then split its successor into a third file; `try_compiler` can test the one-function unit.
+Original function addresses, extents and relocations stay unchanged.
+
+## Data references: read the target before choosing visibility
+
+The game's code was linked, so a data reference appears in it in one of two shapes, and which one decides the
+declaration. Getting this backwards costs the match.
+
+- **Two instructions** - `lea rax,[rip+D]` then a load or store through `rax` - is a default-visibility access the
+  linker relaxed (GOTPCRELX). Declare the symbol plainly (`extern char D_xxx[];`): clang then emits the pre-link
+  `mov rax,[rip+GOT]`, and `tools/bind.py` performs the same relaxation in the object, which is what makes the row
+  match. Measured on `func_000EB270`: plain declaration 80%, hidden 46.7%, plain + relaxation **100%**.
+- **One instruction** - the offset folded in (`vmovss 0xc0(%rip),%xmm0`, `cmp byte ptr [rip+D], 0`) - is a
+  non-preemptible access: declare the symbol `__attribute__((visibility("hidden")))` so clang folds it the same way.
+- Never write `hidden` on a symbol whose target loads in two instructions: it folds the address away and no amount
+  of C gets it back.
 
 ## Spellings that turned near misses into matches
 
@@ -98,8 +233,8 @@ what clang 5.0.2 does without it.
   default-visibility declaration goes through `PLT32` and the judge shows `call <next instruction>` instead of the
   symbol; hidden makes it a direct `PC32` reference. Turned `func_0078AD80` 87.1% -> 100%, `func_0016B5C0` and
   `func_0016B5F0` 95-96% -> 100%, `func_0034FD80`'s four call/jump rows -> 100%. The same attribute on **data**
-  can be worse: it lets clang fold a test into one `cmp qword ptr [rip+sym], 0` and lose an instruction, so keep
-  plain `extern` declarations for data and use hidden on code.
+  can be worse: it lets clang fold a test into one `cmp qword ptr [rip+sym], 0` and lose an instruction, so choose data visibility from the actual one-instruction or two-instruction shape described above. Code
+  visibility also needs verification against the actual call relocation; do not rewrite declarations globally.
 - **`fcmp ONE`** (the game's `a != b` on floats): write `__builtin_islessgreater(a, b)`. `a != b` is `fcmp UNE`,
   which clang expands to `setp` + `or`; the builtin is the single `vucomiss; setne` the game has.
 - **A byte the game keeps in a register** (`mov al,[x]; test al,al`): read it with
@@ -118,9 +253,10 @@ what clang 5.0.2 does without it.
 - **A loop with a call and a count reloaded after it**: hoist the count (`signed long n = *(int *)(self + off);`)
   and write `do { ...; ++i; } while (i < n);`. In `for (...; i < *(int *)(...); i++)` clang schedules `inc` first
   and the `movsxd` lands on the wrong side.
-- **Intra-unit calls**: a callee defined in the same source loses its relocation (`call 0x550` where the game has
-  `call func_x`) unless it stays a separate, non-inlined symbol; `weak` + `noinline` on the definition keeps the
-  `PC32` when `noinline` alone does not.
+- **Intra-unit calls**: retain a separate, non-inlined callee. The binder normalizes a defined function's PLT32
+  call or tail jump to PC32 only when the original owner branches to that same symbol with the same opcode.
+  It does not fix an incorrect destination, external call or section-relative branch. Inspect the actual relocation
+  before trying more `weak`/`noinline` declarations.
 
 ## Keep the build able to run
 
@@ -131,18 +267,41 @@ what clang 5.0.2 does without it.
   project measure as if the rest did not exist. Build the unit you changed (`ninja build/<version>/src/auto/<unit>.o`)
   before moving on.
 
-## The three deltas left
+## Investigate remaining differences before changing the compiler
 
-These are the SDK's LLVM fork, not the flags; expect them on functions that hit them, and expect the permuter to close
-the first:
+Store merging, instruction scheduling and branch shapes are hypotheses to isolate, not
+proof of an SDK compiler difference. First check types, widths, alignment, aliasing,
+control flow and symbol destinations. Identical instruction multisets do not establish
+identical semantics. Only send genuine scheduling/register differences to the permuter.
 
-1. **Order only.** The same instructions, scheduled differently: `movsxd` before `lea`, a `-1` hoisted after `mov
-   rbx,rdi`, a float spill before the pointer add. The instruction multiset is identical, so the C is right and the
-   compiler's scheduler is not — leave it and move on.
-2. **Store merging.** clang 5.0.2 merges two adjacent 4-byte zero stores into one 8-byte store where the game keeps
-   three separate 4-byte stores. Writing the fields through separate, non-adjacent statements does not always stop it.
-3. **Branch idiom.** The game often keeps an early `mov al,1` and jumps to a shared `ret`, where clang 5.0.2 emits
-   `setne al`. Same behaviour, different shape.
+Earlier scheduling experiments failed to reproduce some independent instruction swaps. They did not establish
+that all local compiler settings fail: later tests of `target("arch=btver2")` matched several such cases. After
+checking control flow, widths, constants and destinations, try that local scheduling model through the normal
+judge before releasing. A result from one function is not a guarantee for another. Record the exact remaining
+rows and experiments; do not use inline assembly as a scheduling workaround.
+
+The pinned compiler already enables SSE4.1 under `-mavx`; `_mm_max_epu32` emits `vpmaxud`.
+Do not request extra ISA flags solely because scalar C produced a scalar max.
+
+For large structs passed by value on the stack, local `__attribute__((target("no-sse")))`
+can replace overlapping YMM copies with qword copies in integer-only callers. Tested
+56-byte cases improved from about 42-46% to 78-80%, but grouping/registers still differed.
+The attribute affects the whole function. Keep it local and check the function's complete
+instruction and ABI requirements. A 24+32-byte grouping remains a hypothesis, not recovered
+source or a reason to change global flags.
+
+For vector math, reconstruct small always-inline intrinsic helpers rather than requiring
+original helper source. `vdpps` immediate 0x7f means XYZ dot product replicated to all lanes;
+`_mm_dp_ps(a,b,0x7f)` expresses it. `_mm_rsqrt_ps` followed by `_mm_mul_ps` expresses the
+observed approximate normalization sequence; substituting scalar sqrt/division changes it.
+Reconstruct zero-length handling, masks, shuffle immediates and operation order from the
+assembly. Do not enable global fast-math to force a local sequence.
+
+Read original branch destinations, not nearby function names or unit-relative disassembly
+addresses. An old analysis of `func_0070BD40` called the adjacent `func_0070BE90` a dependency,
+but the original direct call is to `func_00771C80`. The vector function itself has no FS
+access. Treat the wrapper's TLS folding problem separately and recover the vector function's
+actual incoming arguments before replacing its skeleton. A placeholder signature is not ABI evidence.
 
 ## What the code looks like
 
@@ -153,3 +312,12 @@ the first:
   byte-for-byte against what the linker laid out.
 - Imports are Sony's NIDs, resolved through a stub table; a call to one shows as a relocation to `func_<stub address>`
   until the NID is named.
+
+## Call matching and target layout
+
+Targets use one text section per function, matching `-ffunction-sections`.
+Original addresses are stored separately for guard binding and read from the
+project config for the app map. PLT32 relocations normalize to PC32 while keeping
+the callee, offset, addend and instruction bytes. Incorrect identities still fail.
+Existing projects retain their own tools until explicitly refreshed; refreshing
+needs a rebuild and verification that all existing matches remain matched.

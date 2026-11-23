@@ -5,6 +5,7 @@ import json
 import pytest
 
 from decompnet.app.engine import RomNetwork
+from decompnet.consoles import Console
 from decompnet.network import NetworkError
 from decompnet.rom import Picked, split
 
@@ -39,6 +40,7 @@ def test_reimport_replaces_analysis_and_keeps_only_unchanged_matches(tmp_path, m
             (pid, "func_80000004", 4, 1, bytes.fromhex("24020001"), "[]", "matched",
              "void func_80000004(void) {}", 0x80000004),
         ).lastrowid
+        db.execute("UPDATE functions SET last_checked=123,last_improved=120 WHERE id=?", (changed_id,))
         removed_id = db.execute("INSERT INTO functions(project_id,name,size,n_insns,vram,status,matched_source) "
                                 "VALUES(?,?,?,?,?,?,?)", (pid, "func_80000008", 4, 1, 0x80000008, "matched",
                                                           "void func_80000008(void) { gone(); }")).lastrowid
@@ -54,7 +56,7 @@ def test_reimport_replaces_analysis_and_keeps_only_unchanged_matches(tmp_path, m
     game = tmp_path / "selected.z64"
     game.write_bytes(b"new rom")
 
-    class TestConsole:
+    class TestConsole(Console):  # the connector's own split/judge/asm parts, with only the facts this test needs
         id = "n64"
         name = "Nintendo 64"
         arch = "mips"
@@ -115,9 +117,11 @@ def test_reimport_replaces_analysis_and_keeps_only_unchanged_matches(tmp_path, m
     assert not net.store.one("SELECT 1 FROM symbols WHERE project_id=? AND name='func_80000000'", pid)
     kept = net.store.one("SELECT text FROM notes WHERE text LIKE '%it matched with this C%'")["text"]
     assert "gone();" in kept and any("their C is kept in the project's notes" in m for m in messages)
-    changed = net.store.one("SELECT status, matched_source, target FROM functions WHERE id=?", changed_id)
+    changed = net.store.one("SELECT status, matched_source, target, last_checked, last_improved "
+                            "FROM functions WHERE id=?", changed_id)
     assert changed["status"] == "open" and changed["matched_source"] is None
     assert changed["target"] == bytes.fromhex("24020002")
+    assert changed["last_checked"] is None and changed["last_improved"] is None
     assert net.store.one("SELECT text FROM notes WHERE function_id=?", changed_id)["text"] == "keep this note"
     assert net.store.one("SELECT 1 FROM functions WHERE project_id=? AND name=?",
                          pid, "func_80000008") is None
@@ -154,3 +158,24 @@ def test_reimport_still_blocks_projects_with_an_active_room(tmp_path):
     net.rooms["game"] = object()
     with pytest.raises(NetworkError, match="leave the shared room"):
         net.import_split(console, Picked("n64", b"rom", "game.z64", {}, True), reimport_slug="game")
+
+
+def test_reimport_pairs_the_two_functions_an_overlay_puts_at_one_address():
+    """A game's overlay loads at the same address as main code, so two functions can share one. Paired by address
+    alone, the second was left unpaired and its name (held by the old twin) was inserted again."""
+    from types import SimpleNamespace
+
+    from decompnet.app.engine.importing import pair_old_functions
+
+    old = [{"id": 1, "name": "func_00100000", "vram": 0x100000},
+           {"id": 2, "name": "ovl_ntgui2_func_00100000", "vram": 0x100000},
+           {"id": 3, "name": "agents_name", "vram": 0x200000}]
+    new = [SimpleNamespace(name="ovl_ntgui2_func_00100000", vram=0x100000),
+           SimpleNamespace(name="func_00100000", vram=0x100000),
+           SimpleNamespace(name="func_00200000", vram=0x200000),
+           SimpleNamespace(name="func_00300000", vram=0x300000)]
+    paired = pair_old_functions(old, new)
+    assert paired["func_00100000"]["id"] == 1 and paired["ovl_ntgui2_func_00100000"]["id"] == 2
+    assert paired["func_00200000"]["id"] == 3  # renamed since: still paired by its address
+    assert "func_00300000" not in paired  # new in this split
+    assert len({o["id"] for o in paired.values()}) == len(paired)  # each old function pairs once

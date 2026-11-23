@@ -7,20 +7,21 @@ is never relocated. A relocation on one side against a literal on the other can 
 writes the game's own displacement into the object and drops the relocation — what its linker would have done.
 
 The displacement is relative to the instruction, so the instruction's address in the *game* is what matters: it is
-taken from the delinked target object (which lays every function out at its real offset) through the symbol names
-both objects share.
+taken from the delinked target object’s original-address metadata through the symbol names
+both objects share. Older targets fall back to their unit name and symbol offsets.
 
 Usage: bind.py <object.o> [--target target.o] [--guard 0xd9de00]
 """
 
 import argparse
+import json
 import struct
 import sys
 from pathlib import Path
 
 GUARD_SYMBOL = "__stack_chk_guard"
 GUARD_ADDRESS = 0xD9DE00  # the GOT slot every canary prologue in the game reads its guard pointer from
-GOTPCREL, GOTPCRELX, REX_GOTPCRELX, PC32 = 9, 41, 42, 2
+GOTPCREL, GOTPCRELX, REX_GOTPCRELX, PC32, PLT32 = 9, 41, 42, 2, 4
 
 SHDR = struct.Struct("<IIQQQQIIQQ")
 SYM = struct.Struct("<IBBHQQ")
@@ -64,12 +65,43 @@ def unit_vaddr(obj: Path) -> int | None:
 
 
 def game_addresses(target: Path) -> dict[str, int]:
-    """name -> the address the game has that symbol at (from the delinked object, laid out at real offsets)."""
+    """Original addresses, independent of how functions are arranged in the target's sections."""
+    tab = section_table(target.read_bytes())
+    strings = tab["secs"][tab["shstrndx"]]
+    names = tab["data"][strings["off"]:strings["off"] + strings["size"]]
+    for section in tab["secs"]:
+        start = section["name"]
+        end = names.find(b"\0", start)
+        if names[start:end] == b".decomp.addresses":
+            return json.loads(tab["data"][section["off"]:section["off"] + section["size"]])
+    # Projects made before per-function sections keep symbols at offsets from their unit's name.
     base = unit_vaddr(target)
     if base is None:
         return {}
-    tab = section_table(target.read_bytes())
     return {name: base + value for name, _t, shndx, value, _s in symbol_table(tab) if shndx != 0 and name}
+
+
+def normalize_plt(obj: Path) -> int:
+    """The linked ELF has direct PC32 branches; Clang leaves their PLT32 form in candidates (#119).
+
+    Change only the relocation type. The callee symbol, field offset and addend still have to match exactly.
+    Imports need this too, even when there is no target beside the object yet.
+    """
+    data = bytearray(obj.read_bytes())
+    if data[:4] != b"\x7fELF":
+        return 0
+    count = 0
+    for section in section_table(bytes(data))["secs"]:
+        if section["type"] != 4:
+            continue
+        for offset in range(section["off"], section["off"] + section["size"], RELA.size):
+            info, = struct.unpack_from("<Q", data, offset + 8)
+            if info & 0xFFFFFFFF == PLT32:
+                struct.pack_into("<Q", data, offset + 8, (info & ~0xFFFFFFFF) | PC32)
+                count += 1
+    if count:
+        obj.write_bytes(data)
+    return count
 
 
 def bind(obj: Path, target: Path | None, guard: int) -> int:
@@ -163,6 +195,132 @@ def relax_got(obj: Path, target: Path | None) -> int:
     return relaxed
 
 
+
+def bind_builtins(obj: Path, target: Path | None, aliases: dict[str, str]) -> int:
+    """Resolve explicitly configured builtins only where the target function calls that symbol.
+
+    Compiler-inserted calls ignore source-level asm/pragma aliases. This applies the linker's symbol binding;
+    it never guesses an alias from a candidate's score or changes an instruction opcode.
+    """
+    if not aliases or target is None or not target.exists():
+        return 0
+    data = bytearray(obj.read_bytes())
+    tab = section_table(bytes(data))
+    syms, secs = symbol_table(tab), tab["secs"]
+    target_tab = section_table(target.read_bytes())
+    target_syms = symbol_table(target_tab)
+    calls = {}
+    for sec in target_tab["secs"]:
+        if sec["type"] != 4:
+            continue
+        body = target_tab["secs"][sec["info"]]
+        for at in range(sec["off"], sec["off"] + sec["size"], RELA.size):
+            offset, info, addend = RELA.unpack_from(target_tab["data"], at)
+            if info & 0xffffffff != PC32 or addend != -4 or offset < 1 or offset + 4 > body["size"]:
+                continue
+            opcode = target_tab["data"][body["off"] + offset - 1]
+            kind = "call" if opcode == 0xe8 else "load" if offset >= 2 and (
+                target_tab["data"][body["off"] + offset - 2] == 0x8b and opcode & 0xc7 == 5) else None
+            if kind is None:
+                continue
+            owner = next((s for s in target_syms if s[1] == 2 and s[2] == sec["info"]
+                          and s[3] <= offset < s[3] + s[4]), None)
+            if owner:
+                calls.setdefault((owner[0], kind), set()).add(target_syms[info >> 32][0])
+    symtab = next(s for s in secs if s["type"] == 2)
+    strtab = secs[symtab["link"]]
+    strings = bytearray(data[strtab["off"]:strtab["off"] + strtab["size"]])
+    symbols = bytearray(data[symtab["off"]:symtab["off"] + symtab["size"]])
+    indexes = {s[0]: i for i, s in enumerate(syms)}
+    changed = 0
+    for sec in secs:
+        if sec["type"] != 4:
+            continue
+        body = secs[sec["info"]]
+        for at in range(sec["off"], sec["off"] + sec["size"], RELA.size):
+            offset, info, addend = RELA.unpack_from(data, at)
+            if info & 0xffffffff not in (PC32, 4, GOTPCREL, GOTPCRELX, REX_GOTPCRELX) or addend != -4 or offset < 1 or offset + 4 > body["size"]:
+                continue
+            name = syms[info >> 32][0]
+            dest = aliases.get(name)
+            owner = next((s for s in syms if s[1] == 2 and s[2] == sec["info"]
+                          and s[3] <= offset < s[3] + s[4]), None)
+            if not dest or not owner or dest not in calls.get((owner[0], "load" if name == GUARD_SYMBOL else "call"), set()):
+                continue
+            field = body["off"] + offset
+            if name == GUARD_SYMBOL:
+                if info & 0xffffffff not in (GOTPCREL, GOTPCRELX, REX_GOTPCRELX) or offset < 2 or (
+                        data[field - 2] != 0x8b or data[field - 1] & 0xc7 != 5):
+                    continue
+            elif info & 0xffffffff not in (PC32, 4) or data[field - 1] != 0xe8:
+                continue
+            if dest not in indexes:
+                indexes[dest] = len(symbols) // SYM.size
+                symbols.extend(SYM.pack(len(strings), 0x10, 0, 0, 0, 0))
+                strings.extend(dest.encode() + b"\0")
+            struct.pack_into("<Q", data, at + 8, (indexes[dest] << 32) | PC32)
+            changed += 1
+    if changed:
+        for sec, content in ((strtab, strings), (symtab, symbols)):
+            data.extend(b"\0" * (-len(data) % 8))
+            struct.pack_into("<QQ", data, tab["shoff"] + sec["i"] * tab["shentsize"] + 24,
+                             len(data), len(content))
+            data.extend(content)
+        obj.write_bytes(data)
+    return changed
+
+
+def bind_local_branches(obj: Path, target: Path | None) -> int:
+    """An executable's linker resolves PLT calls/jumps to its own definitions directly.
+
+    Keep the destination, addend and instruction bytes. Only normalize a defined function's PLT32 relocation
+    when the same original owner has a PC32 branch of the same kind to that exact symbol. External/preemptible
+    library calls, section-relative jumps and guessed aliases are deliberately left alone.
+    """
+    if target is None or not target.exists():
+        return 0
+    original = section_table(target.read_bytes())
+    osyms = symbol_table(original)
+    approved = set()
+    for sec in original["secs"]:
+        if sec["type"] != 4:
+            continue
+        body = original["secs"][sec["info"]]
+        for at in range(sec["off"], sec["off"] + sec["size"], RELA.size):
+            offset, info, addend = RELA.unpack_from(original["data"], at)
+            if info & 0xffffffff != PC32 or addend != -4 or not 0 < offset <= body["size"] - 4:
+                continue
+            opcode = original["data"][body["off"] + offset - 1]
+            owner = next((s for s in osyms if s[1] == 2 and s[2] == sec["info"]
+                          and s[3] < offset and offset + 4 <= s[3] + s[4]), None)
+            if owner and opcode in (0xe8, 0xe9):
+                approved.add((owner[0], opcode, osyms[info >> 32][0]))
+    data = bytearray(obj.read_bytes())
+    tab = section_table(bytes(data))
+    syms = symbol_table(tab)
+    changed = 0
+    for sec in tab["secs"]:
+        if sec["type"] != 4:
+            continue
+        body = tab["secs"][sec["info"]]
+        for at in range(sec["off"], sec["off"] + sec["size"], RELA.size):
+            offset, info, addend = RELA.unpack_from(data, at)
+            dest = syms[info >> 32]
+            if info & 0xffffffff != 4 or addend != -4 or dest[1] != 2 or not 0 < dest[2] < len(tab["secs"]):
+                continue
+            if not 0 < offset <= body["size"] - 4:
+                continue
+            owner = next((s for s in syms if s[1] == 2 and s[2] == sec["info"]
+                          and s[3] < offset and offset + 4 <= s[3] + s[4]), None)
+            opcode = data[body["off"] + offset - 1]
+            if owner and (owner[0], opcode, dest[0]) in approved:
+                struct.pack_into("<Q", data, at + 8, (info & ~0xffffffff) | PC32)
+                changed += 1
+    if changed:
+        obj.write_bytes(data)
+    return changed
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("object")
@@ -173,11 +331,22 @@ def main() -> int:
     obj = Path(args.object)
     target = Path(args.target) if args.target else obj.parent.parent.parent / "target" / obj.name
     exists = target.exists()
+    bind_builtins(obj, target if exists else None, {GUARD_SYMBOL: f"D_{args.guard:08X}"})
     n = bind(obj, target if exists else None, args.guard)
     relaxed = relax_got(obj, target if exists else None)
+    aliases_path = Path(__file__).with_name("builtin_symbols.json")
+    aliases = json.loads(aliases_path.read_text()) if aliases_path.exists() else {}
+    bind_builtins(obj, target if exists else None, aliases)
+    bind_local_branches(obj, target if exists else None)
+    # TLSGD resolver pairs are relaxed only for explicitly verified slots and same-function target evidence.
+    from tls_relax import relax_tls_gd_to_ie
+    slots_path = Path(__file__).with_name("tls_slots.json")
+    slots = json.loads(slots_path.read_text()) if slots_path.exists() else {}
+    tls = relax_tls_gd_to_ie(obj, target if exists else None, slots)
+    normalized = normalize_plt(obj)
     if not args.quiet:
         print(f"{obj}: bound {n} guard load(s) to 0x{args.guard:x}, relaxed {relaxed} GOT load(s)"
-              + ("" if exists else f" (no target object at {target})"))
+              + ("" if exists else f" (no target object at {target})") + f", relaxed {tls} TLSGD pair(s), normalized {normalized} PLT relocation(s)")
     return 0
 
 

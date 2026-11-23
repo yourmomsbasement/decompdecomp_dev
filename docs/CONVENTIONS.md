@@ -19,15 +19,15 @@ says how to send a change. Examples point at real code by file and name: search 
 | What agents read about a function | `app/engine/briefs.py` |
 | Claims, attempts, the judge's bookkeeping | `app/engine/judging.py`, under it `network.py` |
 | Compilers, ranges, suggestions | `app/engine/compilers.py`; the compiler map `compilermap.py`; range checks `app/rangecheck.py` |
-| C++ classes found in the code | `classes.py` |
-| Struct layouts guessed from the code | `structs.py` (the types), `arch/mips_fields.py` (MIPS's reader), `app/engine/layouts.py` (`guess_struct`, the brief's lines) |
+| C++ classes found in the code | `classes.py`; a PC program's (its RTTI's names, its fields from x86's reader): `consoles/pc/rtti.py` (`Console.classes`) |
+| Struct layouts guessed from the code | `structs.py` (the types), `arch/mips_fields.py`, `arch/x86_fields.py` (the readers), `app/engine/layouts.py` (`guess_struct`, the brief's lines; a project's: `Console.structs`) |
 | Free matches | twins `app/twins.py` (also across your games), autopilot `app/engine/autopilot.py`, the permuter `app/permute.py` (and its generator `permuter_gen.py`, run in decomp-permuter's environment; `permuter.py` the simple rewrites without it) |
 | Machine drafts | `seeds.py` (m2c, and C++ methods), drafted in the background by `app/drafts.py`; forks: `forks/drafts.py` |
 | Polishing matched code (names, types, comments that still match) | `app/readable.py` |
 | What agents learn, shared once two models agree | `app/knowledge.py` |
 | Saving a ROM project as plain files, and restoring one | `app/saves.py` |
 | Helper agents: starting and restarting them, their records | `app/agents.py`; their prompt: `WORK_PROMPT` in `app/tools.py` |
-| One agent (its command line, reading what it prints, its models; the API helper's own loop) | `agents/<id>.py`: `claude`, `codex`, `antigravity`, `opencode`, `api` |
+| One agent (its command line, reading what it prints, its models; the API helper's own loop) | `agents/<id>.py`: `claude`, `codex`, `antigravity`, `opencode`, `cursor`, `kimi`, `zcode`, `ohmy`, `api` |
 | What every agent has to say, and the list of agents | `agents/__init__.py`, the connector |
 | Look-alikes (`find_similar`) | `similarity.py` |
 | Decompiling together | `app/collab.py`, `app/engine/rooms.py`, `app/routes/rooms.py` |
@@ -35,7 +35,7 @@ says how to send a change. Examples point at real code by file and name: search 
 | The GUI | `app/static/`: `index.html`, `app.css`, and `js/` (nine plain scripts loaded in order, one per part of the GUI; `js/base.js` lists them; no build step). The notification centre is in `js/sidebar.js` |
 | Know-how agents read | `app/guide/*.md` (shared), `consoles/<id>/guides/*.md` (one console's), served by `guide(topic)` |
 | Compilers and tools themselves | `toolchains.toml` (pinned, with checksums), `toolchains.py` |
-| The app's window, tray, updates | `app/window.py` + `app/gtkwindow.py`, `app/tray.py`, `app/updates.py`; dev or release: `app/edition.py`; the `decomp` command `app/cli.py`; the apps-menu entry `app/launcher.py`; what the first start removes from older versions `app/cleanup.py` |
+| The app's window, tray, updates | `app/window.py` + `app/gtkwindow.py` + `app/macwindow.py` + `app/winwindow.py`, `app/tray.py`, `app/updates.py`; dev or release: `app/edition.py`; the `decomp` command `app/cli.py`; the apps-menu entry `app/launcher.py`; what the first start removes from older versions `app/cleanup.py` |
 
 A console's code stays in its folder and reaches the rest of the app only through the connector: the engine,
 briefs, twins, the agents' tools and prompts, the export and the GUI ask `consoles.get(platform)`, never `if
@@ -103,6 +103,47 @@ def try_compiler(self, agent, slug, function, compiler, flags="", source=""):
 - **Docs** (README, GUIDE, the guides for agents) use simplified English: short sentences, one instruction per
   sentence, the same word for the same thing.
 
+### Progress in dialogs and panels
+
+Any dialog, drawer, window or panel that shows progress text or logs while adding, installing, importing,
+building, updating or otherwise doing work also shows a progress bar. Logs explain what is happening; the bar
+shows that the operation is still running, including stretches when no new log lines arrive.
+
+Use the existing system in `app/static/js/base.js`: `beginWork(log, label, controls, completed)` creates the
+shared `.workbar` from `app/static/app.css`, adds an accessible status message, disables the supplied controls,
+and returns a cleanup function. `followJob(id, log)` follows the server's job and updates its log.
+`showJobError(log, message)` keeps an error visible in the panel. Do not create a separate animation or polling
+loop for a new foreground job. These helpers are already shared; extend them when another flow needs the same
+behaviour.
+
+```javascript
+const log = $("taskLog"), button = $("taskGo");
+const finish = beginWork(log, "Measuring project", [button], "Project measurement finished.");
+showJobError(log, "");
+try {
+  const { job } = await api("/api/fork/check", { method: "POST", body: { slug: S.slug } });
+  await followJob(job, log);
+} catch (error) {
+  showJobError(log, error.message);
+} finally {
+  finish();
+}
+```
+
+- Start the bar before the initial request, not after the server returns a job ID. Starting the operation can
+  itself take time. Keep it visible through the work and any final processing.
+- Always call the cleanup in `finally`: success, failure, cancellation and failure to start all clear the bar
+  and restore the controls. Keep the failure message and useful logs visible so the user can read and retry.
+- Keep references to the panel's own elements while awaiting work; the user may close or replace the dialog.
+- Use the indeterminate `.workbar` when the total is unknown. Do not invent a percentage from elapsed time or
+  the number of log lines. For a measured fraction, use the existing `.upbar` and real completed/total values.
+- Imports and saved-project restoration retain state across renders and have their own cancellation and upload
+  handling. Reuse their existing `.workbar` markup and state-driven visibility when working on those flows;
+  do not add a second bar alongside it. Bars have `role="progressbar"` and an action-specific `aria-label`;
+  an indeterminate bar has no `aria-valuenow`.
+- Cover changes to this lifecycle in `tests/gui_progress.js` (run through `tests/test_gui.py`); saved-project
+  restoration has its own cases in `tests/gui_restore.js`. Check delayed starts and every terminal outcome.
+
 ## 5. Errors and robustness
 
 - Catch the exceptions you expect and can say something about.
@@ -118,7 +159,10 @@ def try_compiler(self, agent, slug, function, compiler, flags="", source=""):
 
 ## 6. External tools and safety
 
-- Compilers and tools come only from the pinned toolchains (`toolchains.toml`), never from PATH.
+- Compilers and tools come only from the pinned toolchains (`toolchains.toml`), never from PATH. Except wine
+  (`wine.py`), for the packs marked `wine = true`: a Windows runtime the user's system installs and updates, with no
+  build to pin for every Linux distribution and Mac. It comes from `$DECOMPNET_WINE`, the PATH or wine.py's known
+  places; the compilers it runs stay pinned.
 - Proprietary compilers are installed only after the user accepts their licence in the app.
 - Heavy tools run through `limits.capped(argv)` (a memory cap) and with a timeout.
 - Agents may edit only source and header files: `EDITABLE` and `FORBIDDEN_PARTS` in `forks/project.py`.
@@ -171,7 +215,11 @@ not touch it.
 
 ## 11. Commits and releases
 
-- Work on `main`, or on a branch for something big. `main` is what users update from.
+- A change goes on a branch named `<type>/<short-name>`, the type one of `feat`, `fix`, `refactor`, `perf`, `docs`,
+  `test`, `ci`, `build`, `chore`, `revert` (`fix/ps2-long-symbol-names`). `main` is what users update from. CI
+   (`.github/workflows/labels.yml`) fails a pull request from any other branch, and labels it by the prefix.
+- An issue gets a label for its kind (`bug`, `enhancement`, `documentation`, `question`) and for each console and
+  system it's about (`gh label list`). The issue forms add them; an agent's `gh issue create` passes `--label`.
 - A commit's subject says what users (or contributors) get, in one sentence. The body says why.
 - A release bumps the version in four places together: `pyproject.toml`, `src/decompnet/__init__.py`,
   `site/public/install.sh`, `uv.lock`. Its commit reads

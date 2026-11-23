@@ -8,12 +8,13 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
 from decompnet import agents as kinds
 from decompnet import network, scoring
-from decompnet.agents import antigravity
+from decompnet.agents import antigravity, ohmy, opencode, zcode
 from decompnet.app import agents
 from decompnet.app.engine import RomNetwork
 
@@ -67,6 +68,319 @@ def test_opencode_errors_say_what_failed():
     assert kinds.get("antigravity").clean_stderr(agy) == "quota exhausted"
 
 
+def test_zcode_stream_json_is_read():
+    """zcode's --output-format stream-json: reasoning and text in deltas, a tool call, a failed tool result,
+    turn.failed, and the final result whose inputTokens include the cached input and cache writes."""
+    state: dict = {}
+    lines = [
+        {"type": "session.created", "sessionId": "sess_1", "payload": {"mode": "yolo"}},
+        {"type": "model.streaming", "payload": {"kind": "reasoning_delta", "delta": "The user wants"}},
+        {"type": "model.streaming", "payload": {"kind": "reasoning_delta", "delta": " to claim."}},
+        {"type": "model.streaming", "payload": {"kind": "reasoning_end"}},
+        {"type": "model.streaming", "payload": {"kind": "text_delta", "delta": "Claiming "}},
+        {"type": "model.streaming", "payload": {"kind": "text_delta", "delta": "the next one."}},
+        {"type": "model.streaming", "payload": {"kind": "text_end"}},
+        {"type": "model.streaming", "payload": {"kind": "tool_call", "toolName": "mcp__decomp__claim_function",
+                                                "input": {"count": 4}}},
+        {"type": "tool.updated", "payload": {"kind": "result", "result": {"success": False,
+                                                                           "error": "tool exploded"}}},
+        {"type": "turn.failed", "payload": {"error": {"message": "usage limit reached"}}},
+        {"type": "result", "sessionId": "sess_1", "usage": {"inputTokens": 100, "outputTokens": 10,
+                                                            "cacheReadTokens": 40, "cacheWriteTokens": 10,
+                                                            "modelRequestCount": 2}},
+    ]
+    out = [item for line in lines for item in kinds.get("zcode").parse_line(json.dumps(line), state)]
+    assert out == [("think", "The user wants to claim."), ("text", "Claiming the next one."),
+                   ("tool", "claim_function(4)"), ("error", "tool exploded"), ("error", "usage limit reached"),
+                   ("usage", json.dumps({"input": 50, "output": 10, "cache_read": 40, "cache_write": 10,
+                                         "turns": 2}))]
+    assert state["zcode_session"] == "sess_1"
+    assert kinds.get("zcode").parse_line(json.dumps({"type": "session.updated", "payload": {}})) == []
+    assert kinds.get("zcode").clean_stderr("Error: Model access is not configured. Run /login.") == \
+        "Model access is not configured. Run /login."
+    assert kinds.get("zcode").fatal("Unsupported reasoning effort: xhigh")
+
+
+def test_zcode_prompt_reaches_it_by_file_never_as_argv(tmp_path, monkeypatch):
+    """zcode has no stdin prompt: its prompt is a Markdown file the session attaches, so the text is never an
+    argument (and zcode cannot parse it as a slash command). Its settings file names only the app's MCP server."""
+    m = _manager(tmp_path, monkeypatch, "zcode")
+    s = agents.Session("zcode-1", "zcode", "z", "demo", "zcode-1",
+                       {"model": "account:zai-start-plan/GLM-5.3#high"})
+    work = tmp_path / "zcode"
+    work.mkdir()
+    cmd, env, stdin = m._command(s, "tok", work)
+    prompt = m.prompt(s)
+    assert stdin is None  # nothing for stdin: the prompt is in the attached file
+    assert (work / zcode.PROMPT_FILE).read_text(encoding="utf-8") == prompt
+    assert not any(prompt in arg or "line one" in arg for arg in cmd)
+    assert cmd[cmd.index("--attach") + 1] == str(work / zcode.PROMPT_FILE)
+    assert cmd[cmd.index("-p") + 1] == zcode.PROMPT_TEXT
+    assert cmd[cmd.index("--output-format") + 1] == "stream-json"
+    assert cmd[cmd.index("--mode") + 1] == "yolo"
+    denied = set(cmd[cmd.index("--disallowed-tools") + 1].split())
+    assert {"Read", "Write", "Edit", "Bash", "WebFetch", "WebSearch"} <= denied
+    assert cmd[cmd.index("--model") + 1] == "account:zai-start-plan/GLM-5.3"
+    assert cmd[cmd.index("--effort") + 1] == "high"
+    assert not any("tok" in arg for arg in cmd)
+    settings = json.loads((work / zcode.SETTINGS_FILE).read_text(encoding="utf-8"))
+    assert list(settings["mcp"]["servers"]) == [zcode.MCP_SERVER]
+    assert settings["mcp"]["servers"][zcode.MCP_SERVER] == {
+        "type": "http", "url": "http://127.0.0.1:6464/mcp",
+        "headers": {"Authorization": "Bearer tok"}}
+    assert settings["plugins"]["enabled"] is False and settings["skills"]["enabled"] is False
+    assert env["ZCODE_CLI_SETTINGS_FILE"] == str(work / zcode.SETTINGS_FILE)
+
+
+def test_zcode_refuses_a_prompt_it_cannot_attach(tmp_path, monkeypatch):
+    """Past zcode's 25,000-token / 256 KiB attachment caps it stops inlining the prompt and gives the model a
+    path placeholder or a partial view; Read is disallowed, so the helper would work without its instructions.
+    Just under the cap the prompt is written and attached; over it, the session start fails before writing."""
+    under = "x" * (zcode.ATTACHMENT_TOKENS * zcode.TOKEN_CHARS - zcode.TOKEN_CHARS)
+    over = "x" * (zcode.ATTACHMENT_TOKENS * zcode.TOKEN_CHARS + zcode.TOKEN_CHARS)
+    assert zcode.estimated_tokens(under) == zcode.ATTACHMENT_TOKENS - 1
+    assert zcode.estimated_tokens(over) == zcode.ATTACHMENT_TOKENS + 1
+    under_work = tmp_path / "zcode-under"
+    under_work.mkdir()
+    path = zcode.ZCODE.prompt_file(under_work, under)
+    assert path == under_work / zcode.PROMPT_FILE and path.read_text(encoding="utf-8") == under
+    cmd, _ = zcode.ZCODE.session_command("zcode", under_work, "http://127.0.0.1:1/mcp", "tok", "")
+    assert cmd[cmd.index("--attach") + 1] == str(path)
+    over_work = tmp_path / "zcode-over"
+    over_work.mkdir()
+    with pytest.raises(ValueError, match="too long for zcode"):
+        zcode.ZCODE.prompt_file(over_work, over)
+    assert not (over_work / zcode.PROMPT_FILE).exists()
+    # the session start itself raises Fatal with the same sentence, before a process is launched
+    m = _manager(tmp_path, monkeypatch, "zcode")
+    m.prompt = lambda session: over
+    command_work = tmp_path / "zcode-command"
+    command_work.mkdir()
+    with pytest.raises(agents.Fatal, match="too long for zcode"):
+        m._command(agents.Session("zcode-1", "zcode", "z", "demo", "zcode-1", {}), "tok", command_work)
+    assert not any(command_work.iterdir())  # no prompt, no settings: the session start wrote nothing
+
+
+def test_zcode_refuses_a_prompt_over_its_byte_cap(tmp_path, monkeypatch):
+    """The 256 KiB cap is separate from the token cap: zcode would read only a 2000-line partial view."""
+    monkeypatch.setattr(zcode, "ATTACHMENT_TOKENS", 10**9)  # isolate the byte guard
+    work = tmp_path / "zcode-bytes"
+    work.mkdir()
+    with pytest.raises(ValueError, match="too long for zcode"):
+        zcode.ZCODE.prompt_file(work, "x" * (zcode.ATTACHMENT_BYTES + 1))
+    assert not (work / zcode.PROMPT_FILE).exists()
+
+
+def test_an_over_long_zcode_prompt_pauses_without_retrying(tmp_path, monkeypatch):
+    """The guard raises Fatal from _command: the runner pauses with the sentence instead of counting fast failures
+    and starting again."""
+    _no_agent_settings(monkeypatch)
+    fake = tmp_path / "bin" / "zcode"
+    fake.parent.mkdir()
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    monkeypatch.setattr(agents, "_which", lambda cmd: str(fake))
+    net = _game(tmp_path)
+    m = agents.Manager(net, tmp_path, URL)
+    over = "x" * (zcode.ATTACHMENT_TOKENS * zcode.TOKEN_CHARS + zcode.TOKEN_CHARS)
+    m.prompt = lambda s: over
+    s = m._record("game", "zcode", "zcode-1", "zcode-1", {})
+    s.stop = Quick()
+    m._run(s)
+    assert s.state == "paused"
+    assert "too long for zcode" in s.why and "shorten" in s.why
+    assert s.runs == 1 and s.restarts == 0
+    assert s.stop.waits == []  # no backoff wait: Fatal broke the loop
+    rows = net.store.all("SELECT outcome FROM helper_sessions WHERE helper_id=?", s.id)
+    assert [r["outcome"] for r in rows] == ["paused"]
+    assert net.store.one("SELECT state FROM helpers WHERE id=?", s.id)["state"] == "paused"
+    assert any("paused:" in f["text"] and "too long for zcode" in f["text"] for f in s.feed)
+
+
+def test_omp_stream_json_is_read():
+    """omp 18's --mode json: a message's text, thinking and usage come with its message_end, tool calls with
+    tool_execution_start (omp names MCP tools mcp__decomp_claim_function), a failed tool as an error item, and the
+    end of the session once it went through."""
+    state: dict = {}
+    usage = {"input": 2380, "output": 92, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 2472,
+             "cost": {"input": 0.000357, "output": 5.52e-05, "cacheRead": 0, "cacheWrite": 0, "total": 0.0004122}}
+    lines = [
+        {"type": "session", "version": 3, "id": "s", "cwd": "/w"},
+        {"type": "agent_start"},
+        {"type": "turn_start"},
+        {"type": "message_start", "message": {"role": "user", "content": [{"type": "text", "text": "go"}]}},
+        {"type": "message_end", "message": {"role": "user", "content": [{"type": "text", "text": "go"}]}},
+        {"type": "message_start", "message": {"role": "assistant", "content": [{"type": "text", "text": "I"}]}},
+        {"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "delta": "I'll claim it."}},
+        {"type": "message_end", "message": {"role": "assistant", "stopReason": "toolUse", "usage": usage,
+                                            "content": [{"type": "text", "text": "Claiming the next one."},
+                                                        {"type": "toolCall", "name": "mcp__decomp_claim_function",
+                                                         "arguments": {"count": 4}}]}},
+        {"type": "tool_execution_start", "toolName": "mcp__decomp_claim_function",
+         "args": {"strategy": "easiest", "count": 4}},
+        {"type": "tool_execution_end", "toolName": "mcp__decomp_claim_function", "isError": True,
+         "result": {"content": [{"type": "text", "text": "Error: the tool exploded"}], "isError": True}},
+        {"type": "message_start", "message": {"role": "assistant", "content": []}},
+        {"type": "message_end", "message": {"role": "assistant", "stopReason": "stop", "usage": usage,
+                                            "content": [{"type": "thinking", "thinking": "The tool failed.",
+                                                         "thinkingSignature": "reasoning_content"},
+                                                        {"type": "text", "text": "It failed."}]}},
+        {"type": "agent_end", "isTerminal": True},
+    ]
+    out = [item for line in lines for item in kinds.get("omp").parse_line(json.dumps(line), state)]
+    spent = json.dumps({"usd": 0.0004122, "input": 2380, "output": 92, "turns": 1})
+    assert out == [("text", "Claiming the next one."), ("usage", spent),
+                   ("tool", "claim_function(easiest, 4)"), ("error", "Error: the tool exploded"),
+                   ("think", "The tool failed."), ("text", "It failed."), ("usage", spent),
+                   ("info", "session finished")]
+    # every one of omp's own error words: the message, then its stack and the lines of its bundle
+    assert kinds.get("omp").clean_stderr("error: No API key found for openai.") == \
+        "error: No API key found for openai."
+    assert kinds.get("omp").clean_stderr("16480 | ` + \"Then use /model\"") == ""
+    assert kinds.get("omp").clean_stderr("      at #$n (B:/~BUN/root/chunks/cli.js:16485:15)") == ""
+    assert kinds.get("omp").clean_stderr("Use /login, set an API key environment variable") == \
+        "Use /login, set an API key environment variable"
+
+
+def test_omp_a_failed_turn_is_an_error_and_not_a_finished_session():
+    state: dict = {}
+    line = json.dumps({"type": "message_end", "message": {
+        "role": "assistant", "stopReason": "error", "content": [],
+        "errorStatus": 401, "errorMessage": "401 Incorrect API key provided: sk-x"}})
+    out = kinds.get("omp").parse_line(line, state)
+    assert [k for k, _ in out] == ["error"] and "Incorrect API key" in out[0][1]
+    assert kinds.get("omp").parse_line(json.dumps({"type": "agent_end"}), state) == []
+
+
+def test_omp_sessions_read_only_through_decomp_and_write_no_secret_to_argv(tmp_path, monkeypatch):
+    """omp keeps its sign-in and its own mcp.json in one folder, so the session leaves the user's sign-in alone and
+    switches their own MCP servers off in its settings instead: the folder's .mcp.json names only the app's server,
+    with the token in the file (never on the command line, where every process can read it)."""
+    m = _manager(tmp_path, monkeypatch, "omp")
+    s = agents.Session("omp-1", "omp", "o", "demo", "omp-1",
+                       {"model": "opencode-go/deepseek-v4.1-flash#high"})
+    work = tmp_path / "omp"
+    work.mkdir()
+    cmd, env, stdin = m._command(s, "tok", work)
+    assert stdin == m.prompt(s) and not any("line one" in arg for arg in cmd)
+    assert cmd[:3] == [cmd[0], "-p", "--mode"] and cmd[cmd.index("--mode") + 1] == "json"
+    for flag in ("--no-session", "--no-extensions", "--no-skills", "--no-rules", "--no-context-files", "--no-lsp",
+                 "--no-tools", "--no-title"):
+        assert flag in cmd, flag
+    assert cmd[cmd.index("--model") + 1] == "opencode-go/deepseek-v4.1-flash"
+    assert cmd[cmd.index("--thinking") + 1] == "high"
+    assert not any("tok" in arg for arg in cmd)
+    settings = (work / ohmy.SETTINGS_FILE).read_text(encoding="utf-8")
+    assert "enabledProviders: []" in settings and "- native" in settings       # the user's own MCP servers: off
+    assert "enableProjectConfig: true" in settings                            # this folder's .mcp.json: on
+    assert "approvalMode: yolo" in settings and "backend: \"off\"" in settings  # no prompts, no memory
+    servers = json.loads((work / ohmy.MCP_FILE).read_text(encoding="utf-8"))["mcpServers"]
+    assert list(servers) == [ohmy.MCP_SERVER]
+    assert servers[ohmy.MCP_SERVER] == {"type": "http", "url": "http://127.0.0.1:6464/mcp",
+                                        "headers": {"Authorization": "Bearer tok"}}
+    assert env[ohmy.READY_ENV] == "1"  # a session that can't reach the app fails before its first turn
+
+
+def test_omp_takes_its_own_thinking_suffix_off_the_model(tmp_path, monkeypatch):
+    """omp's config default carries a thinking suffix ("provider/model:max"), and the launcher's effort comes as
+    "#high": either becomes --thinking, and the model stays the bare selector (so a helper's name has no suffix)."""
+    m = _manager(tmp_path, monkeypatch, "omp")
+    for model, name, effort in (("zai/glm-5.3:max", "zai/glm-5.3", "max"),
+                                ("zai/glm-5.3#low", "zai/glm-5.3", "low"),
+                                ("zai/glm-5.3:max#low", "zai/glm-5.3", "low"),
+                                ("opencode-go/deepseek-v4.1-flash", "opencode-go/deepseek-v4.1-flash", "")):
+        cmd, _, _ = m._command(agents.Session("omp-1", "omp", "o", "demo", "omp-1", {"model": model}), "t", tmp_path)
+        assert cmd[cmd.index("--model") + 1] == name, model
+        assert ("--thinking" in cmd) == bool(effort)
+        if effort:
+            assert cmd[cmd.index("--thinking") + 1] == effort
+
+
+def test_omp_models_come_from_its_json_catalog():
+    line = json.dumps({"models": [
+        {"provider": "zai", "kind": "chat", "selector": "zai/glm-5.3", "name": "GLM 5.3"},
+        {"provider": "zai", "kind": "chat", "selector": "zai/glm-5.3-flash", "name": "GLM 5.3 Flash"},
+        {"provider": "web", "kind": "search", "selector": "web/duckduckgo", "name": "DuckDuckGo"},
+        {"provider": "opencode-go", "kind": "chat", "selector": "opencode-go/deepseek-v4.1-flash",
+         "name": "DeepSeek V4.1 Flash"},
+        {"provider": "zai", "kind": "chat", "selector": "zai/glm-5.4", "name": "GLM 5.4"}]})
+    # one model per provider per round: `omp models` lists a provider's whole catalog in turn, and the launcher keeps
+    # only the first 200, which were all one provider's (nothing else could be picked)
+    assert ohmy.OMP.read_models([line]) == [
+        {"id": "zai/glm-5.3", "name": "GLM 5.3", "note": "zai"},
+        {"id": "opencode-go/deepseek-v4.1-flash", "name": "DeepSeek V4.1 Flash", "note": "opencode-go"},
+        {"id": "zai/glm-5.3-flash", "name": "GLM 5.3 Flash", "note": "zai"},
+        {"id": "zai/glm-5.4", "name": "GLM 5.4", "note": "zai"}]
+    assert ohmy.OMP.read_models(["not json"]) == [] and ohmy.OMP.read_models([]) == []
+
+
+def test_omp_default_model_is_the_one_in_its_own_settings(tmp_path, monkeypatch):
+    agent_home = tmp_path / "agent"
+    agent_home.mkdir()
+    (agent_home / "config.yml").write_text(
+        "theme:\n  dark: titanium\nmodelRoles:\n  smol: zai/glm-5.3-flash:auto\n"
+        "  default: opencode-go/deepseek-v4.1-flash:max\nmodelTags: {}\n", encoding="utf-8")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(agent_home))
+    assert ohmy.agent_dir() == agent_home
+    assert ohmy.OMP.config_model() == "opencode-go/deepseek-v4.1-flash:max"
+    (agent_home / "config.yml").write_text("modelRoles:\n  smol: zai/glm-5.3-flash\n", encoding="utf-8")
+    assert ohmy.OMP.config_model() is None
+    # a one-line flow mapping and a block opened by a comment are the same setting
+    (agent_home / "config.yml").write_text("modelRoles: {smol: zai/glm-5.3, default: zai/glm-5.4:high}\n")
+    assert ohmy.OMP.config_model() == "zai/glm-5.4:high"
+    (agent_home / "config.yml").write_text("modelRoles:  # who does what\n  default: 'zai/glm-5.4'  # quoted\n")
+    assert ohmy.OMP.config_model() == "zai/glm-5.4"
+    # omp reads config.yml, or config.yaml when there is no config.yml: a stale config.yaml never wins
+    (agent_home / "config.yml").write_text("modelRoles:\n  smol: zai/glm-5.3\n", encoding="utf-8")
+    (agent_home / "config.yaml").write_text("modelRoles:\n  default: stale/model\n", encoding="utf-8")
+    assert ohmy.OMP.config_model() is None
+    (agent_home / "config.yml").unlink()
+    assert ohmy.OMP.config_model() == "stale/model"
+
+
+def test_omp_settings_folder_is_the_one_omp_resolves(tmp_path, monkeypatch):
+    """omp joins PI_CONFIG_DIR to the home folder (even an absolute one), takes a named profile before
+    PI_CODING_AGENT_DIR, and treats an empty or `default` OMP_PROFILE as the default profile."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(ohmy.Path, "home", classmethod(lambda cls: tmp_path))
+    for name in ("PI_CODING_AGENT_DIR", "PI_CONFIG_DIR", "OMP_PROFILE"):
+        monkeypatch.delenv(name, raising=False)
+    assert ohmy.agent_dir() == tmp_path / ".omp" / "agent"
+    monkeypatch.setenv("PI_CONFIG_DIR", ".omp2")
+    assert ohmy.agent_dir() == tmp_path / ".omp2" / "agent"
+    monkeypatch.setenv("PI_CONFIG_DIR", str(tmp_path / "abs"))
+    # omp glues PI_CONFIG_DIR onto the home folder as text, so an absolute one nests instead of replacing it
+    nested = Path(str(tmp_path) + os.sep + str(tmp_path / "abs")) / "agent"
+    assert ohmy.agent_dir() == nested and ohmy.agent_dir() != (tmp_path / "abs" / "agent")
+    monkeypatch.delenv("PI_CONFIG_DIR")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "own"))
+    for profile in ("", "default"):
+        monkeypatch.setenv("OMP_PROFILE", profile)
+        assert ohmy.agent_dir() == tmp_path / "own"  # the default profile still uses PI_CODING_AGENT_DIR
+    monkeypatch.setenv("OMP_PROFILE", "work")
+    assert ohmy.agent_dir() == tmp_path / ".omp" / "profiles" / "work" / "agent"  # a profile ignores it
+
+
+@pytest.mark.parametrize("channel", ["stderr", "stdout"])
+def test_an_omp_nobody_signed_in_to_stops_and_says_so(tmp_path, monkeypatch, channel):
+    """omp says a lack of sign-in on both channels, and both must stop the helper at its first failure instead of
+    retrying it five times: `No default model selected. Use /login, ...` on stderr when nobody signed in, and a
+    failed request's `401 Incorrect API key provided: ...` as the `errorMessage` of a stdout `message_end`."""
+    manager = agents.Manager(RomNetwork(tmp_path / "app.db", tmp_path), tmp_path, "http://127.0.0.1:9/mcp")
+    if channel == "stderr":
+        code = "import sys; print('No default model selected. Use /login, set an API key environment variable'," \
+               " file=sys.stderr); raise SystemExit(1)"
+    else:
+        event = json.dumps({"type": "message_end", "message": {
+            "role": "assistant", "content": [], "stopReason": "error", "errorStatus": 401,
+            "errorMessage": "401 Incorrect API key provided: sk-x"}})
+        code = f"import sys; print({event!r}); raise SystemExit(1)"
+    monkeypatch.setattr(manager, "_command", lambda s, token, workdir: ([sys.executable, "-c", code], dict(os.environ), ""))
+    s = agents.Session("omp-1", "omp", "Oh My Pi #1", "game", "omp-1", {})
+    assert manager._run_cli(s, "token", tmp_path) is False
+    assert s.signed_out and "isn't signed in" in s.error and "omp login" in s.error
+
+
 def test_opencode_2_starts_and_its_quota_error_says_so(tmp_path, monkeypatch):
     """opencode 2.0 takes `--log-level error` only, earlier versions `ERROR` only, and either stops the other at once
     (an `InvalidValue` stack trace, shown with "run opencode auth login" though the user was signed in). The command
@@ -91,13 +405,23 @@ def test_a_used_up_plan_waits_instead_of_stopping():
     assert agents.no_credit("Insufficient Balance") and not agents.LIMIT.search("Insufficient Balance")
 
 
+def test_a_concurrency_limit_is_a_throttle_not_a_plan_limit():
+    """Z.ai's Start Plan takes one request at a time: a second zcode helper, or the ZCode app in use, gets
+    "concurrency limit exceeded". It clears in a minute, so it waits THROTTLE_WAIT, not the plan's 15 minutes."""
+    said = "concurrency limit exceeded"
+    assert agents.THROTTLED.search(said) and not agents.LIMIT.search(said)
+    assert agents.THROTTLED.search("concurrency-limit exceeded") and not agents.LIMIT.search("concurrency-limit exceeded")
+
+
 def _manager(tmp_path, monkeypatch, kind):
     (tmp_path / "bin").mkdir(exist_ok=True)
-    exe = tmp_path / "bin" / {"claude": "claude", "codex": "codex", "antigravity": "agy", "opencode": "opencode"}[kind]
+    exe = tmp_path / "bin" / {"claude": "claude", "codex": "codex", "antigravity": "agy", "opencode": "opencode",
+                              "zcode": "zcode", "omp": "omp"}[kind]
     exe.write_text("#!/bin/sh\n")
     exe.chmod(0o755)
     monkeypatch.setattr(agents, "_which", lambda cmd: str(exe))
     m = agents.Manager.__new__(agents.Manager)
+    m.options_now = lambda kind, options: options
     m.mcp_url, m.home = "http://127.0.0.1:6464/mcp", tmp_path
     m.prompt = lambda s: "line one\nline two with \"quotes\" & <ampersands>"
     return m
@@ -105,8 +429,9 @@ def _manager(tmp_path, monkeypatch, kind):
 
 def test_prompts_go_in_on_stdin_never_the_command_line(tmp_path, monkeypatch):
     """On Windows, npm installs agents as .cmd scripts: cmd.exe cuts a multi-line argument at its first line break
-    and caps the command line at 8191 characters."""
-    for kind in ("claude", "codex", "antigravity", "opencode"):
+    and caps the command line at 8191 characters. zcode has no stdin prompt: its prompt is a file, checked in
+    test_zcode_prompt_reaches_it_by_file_never_as_argv."""
+    for kind in ("claude", "codex", "antigravity", "opencode", "omp"):
         m = _manager(tmp_path, monkeypatch, kind)
         s = agents.Session(f"{kind}-1", kind, kind, "demo", f"{kind}-1", {"model": "some-model"})
         work = tmp_path / kind
@@ -127,6 +452,47 @@ def test_prompts_go_in_on_stdin_never_the_command_line(tmp_path, monkeypatch):
                                            "headers": {"Authorization": "Bearer tok"}}
 
 
+def test_the_windows_stdin_gate_survives_an_empty_prompt_but_not_a_prompt_file(tmp_path, monkeypatch):
+    """main always wrote (Windows' \\x01 gate +) the prompt, even when it was empty; winhelper.py waits for that gate
+    before starting the CLI. Only an agent that took its prompt by file writes nothing on stdin."""
+    class Stdin:
+        def __init__(self):
+            self.calls: list[str] = []
+            self.closed = False
+
+        def write(self, text):
+            self.calls.append(text)
+
+        def close(self):
+            self.closed = True
+
+    class Proc:
+        def __init__(self):
+            self.stdin = Stdin()
+
+    def written(prompt):
+        proc = Proc()
+        agents._feed_stdin(proc, prompt)
+        return "".join(proc.stdin.calls).encode("utf-8"), proc.stdin.closed
+
+    monkeypatch.setattr(agents.os, "name", "posix")
+    assert written("") == (b"", True)
+    assert written("line one\n") == (b"line one\n", True)
+    assert written(None) == (b"", True)  # a prompt-file agent: no prompt bytes, just close
+    monkeypatch.setattr(agents.os, "name", "nt")
+    assert written("") == (b"\x01", True)
+    assert written("line one\n") == (b"\x01line one\n", True)
+    assert written(None) == (b"\x01", True)  # the Windows gate only; zcode's prompt is in its file
+
+    # an empty prompt for a normal agent is a str (write the gate), not the None sentinel (no stdin)
+    m = _manager(tmp_path, monkeypatch, "claude")
+    m.prompt = lambda s: ""
+    work = tmp_path / "claude-empty"
+    work.mkdir()
+    _, _, stdin = m._command(agents.Session("claude-1", "claude", "c", "demo", "claude-1", {}), "tok", work)
+    assert stdin == ""
+
+
 def test_opencode_free_models_keep_their_tools_but_never_get_to_use_them(tmp_path, monkeypatch):
     """OpenCode Zen's free models refuse requests whose tools were taken out ("deny"); "ask" keeps them listed and
     `opencode run` rejects every ask. Models of other providers get "deny"."""
@@ -137,7 +503,10 @@ def test_opencode_free_models_keep_their_tools_but_never_get_to_use_them(tmp_pat
         work = tmp_path / f"oc-{rule}-{model.replace('/', '_')}"
         work.mkdir()
         m._command(s, "tok", work)
-        assert json.loads((work / "opencode.json").read_text())["permission"] == {"edit": rule, "bash": rule, "webfetch": rule}
+        config = json.loads((work / "opencode.json").read_text())
+        assert config["permission"] == {"edit": rule, "bash": rule, "webfetch": rule}
+        # a rejected ask ended the run: a free model's first `rg` ended its session, every session, 20 s in
+        assert config.get("experimental") == ({"continue_loop_on_deny": True} if rule == "ask" else None)
     # its own connection, with its own token, and nothing else: opencode 2's shared service ran the user's own
     # `decomp` server without the session's token, so every helper worked as the user's one chat agent
     for version, standalone in (("opencode v2.0.28", True), ("0.15.4", False)):  # opencode 2's shared service
@@ -157,6 +526,30 @@ def test_opencode_free_models_keep_their_tools_but_never_get_to_use_them(tmp_pat
     assert {"execute", "subagent", "external_directory"} <= {p["action"] for p in config["permissions"]
                                                             if p["effect"] == "deny"}
     assert config["mcp"]["servers"]["decompdecomp"]["codemode"] is False
+
+
+def test_opencode_2_helpers_get_a_plugin_that_waits_for_the_apps_tools(tmp_path, monkeypatch):
+    """#24: opencode 2 starts the first model request before its MCP tools are registered, so the helper's folder gets
+    a plugin that waits for the app's server once; older opencode keeps the config it had."""
+    m = _manager(tmp_path, monkeypatch, "opencode")
+    s = agents.Session("opencode-1", "opencode", "o", "demo", "opencode-1", {"model": "fake/fake"})
+    work = tmp_path / "oc-2"
+    work.mkdir()
+    monkeypatch.setitem(kinds.known_versions, "opencode", (0, "opencode v2.0.32"))
+    for _ in range(2):  # every session start writes the config and the plugin again
+        m._command(s, "tok", work)
+    config = json.loads((work / "opencode.json").read_text())
+    assert list(config["mcp"]["servers"]) == [opencode.MCP_SERVER]
+    assert config["plugins"] == [f"./{opencode.PLUGIN_DIR}"]  # once, however often a session starts
+    plugin = (work / opencode.PLUGIN_DIR / "index.js").read_text()
+    assert f"const SERVER = {json.dumps(opencode.MCP_SERVER)}" in plugin
+    assert f"const DEADLINE_MS = {opencode.MCP_WAIT_SECONDS * 1000}" in plugin
+    old = tmp_path / "oc-old"
+    old.mkdir()
+    monkeypatch.setitem(kinds.known_versions, "opencode", (0, "0.15.4"))
+    m._command(s, "tok", old)
+    assert "plugins" not in json.loads((old / "opencode.json").read_text())
+    assert not (old / opencode.PLUGIN_DIR).exists()
 
 
 def test_codex_helpers_cannot_search_the_web(tmp_path, monkeypatch):
@@ -212,12 +605,16 @@ def test_claude_offers_each_version_as_well_as_the_latest():
     assert agents.helper_name("claude", "opus", set()) == "claude-opus-1"  # the alias keeps its old record
 
 
-def test_every_helper_with_an_effort_offers_medium_to_max(tmp_path):
+def test_every_helper_with_an_effort_offers_the_levels_its_cli_supports(tmp_path):
     """The launcher offered max for opencode but not xhigh, xhigh for Codex but not max, and neither for the API
-    helper (a local llama.cpp model's template wants xhigh): each one that takes an effort offers all four now."""
+    helper (a local llama.cpp model's template wants xhigh): those offer all four now. zcode's GLM models offer
+    low/high/max only, so offering xhigh there would make every session fail on an unsupported effort."""
     for kind in kinds.AGENTS:
         if kind.takes_effort:
-            assert {"medium", "high", "xhigh", "max"} <= set(kind.describe()["efforts"]), kind.id
+            assert {"low", "high", "max"} <= set(kind.describe()["efforts"]), kind.id
+    for kind in ("claude", "codex", "opencode", "api"):
+        assert {"medium", "xhigh"} <= set(kinds.get(kind).efforts), kind
+    assert kinds.get("zcode").efforts == ("low", "high", "max")
     cmd, _ = kinds.get("codex").session_command("codex", tmp_path, URL, "token", "gpt-5.5#max")
     assert 'model_reasoning_effort="max"' in cmd
 
@@ -304,6 +701,164 @@ def test_helpers_are_records_that_outlive_the_app(tmp_path, quiet):
     assert other not in later.sessions and net.store.one("SELECT COUNT(*) AS n FROM helpers")["n"] == 1
 
 
+CLI_MODEL_FLAGS = {"antigravity": "--model", "claude": "--model", "codex": "-m", "cursor": "--model", "kimi": "-m",
+                   "opencode": "-m", "zcode": "--model"}
+CLI_EXECUTABLES = {"antigravity": "agy", "claude": "claude", "codex": "codex", "cursor": "cursor-agent",
+                   "kimi": "kimi.js", "opencode": "opencode", "zcode": "zcode"}
+
+
+def _stand_in_cli(tmp_path, monkeypatch, kind) -> None:
+    """A program standing in for an agent's CLI, found where the app looks: a session's command can then be read
+    without starting a real CLI (which starts the MCP servers in its own settings)."""
+    exe = tmp_path / "bin" / CLI_EXECUTABLES[kind]
+    exe.parent.mkdir(exist_ok=True)
+    if kind == "kimi":  # its launcher wants the npm build (a .js entry) with Node beside it; neither runs here
+        exe.write_text("#!/usr/bin/env node\n")
+        for node in ("node", "node.exe"):
+            (exe.parent / node).write_text("#!/bin/sh\n")
+            (exe.parent / node).chmod(0o755)
+    else:
+        exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+    monkeypatch.setattr(agents, "_which", lambda cmd: str(exe))
+
+
+def _command_model(m, sid: str, kind: str, tmp_path) -> str:
+    """The model the helper's next session command line names, "" when it names none."""
+    m.prompt = lambda s: "line one"
+    work = tmp_path / f"{kind}-{sid}-command"
+    work.mkdir(exist_ok=True)
+    cmd, _, _ = m._command(m.sessions[sid], "tok", work)
+    flag = CLI_MODEL_FLAGS[kind]
+    return cmd[cmd.index(flag) + 1] if flag in cmd else ""
+
+
+def _own_configs(tmp_path, monkeypatch) -> None:
+    """The agents' own settings read from this test's home, never the user's (and no Cursor keychain lookup)."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "home" / ".config"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "home" / ".codex"))
+    monkeypatch.setenv("CURSOR_API_KEY", "test-key")
+
+
+@pytest.mark.parametrize("kind", sorted(CLI_MODEL_FLAGS))
+def test_a_helper_started_on_the_clis_default_keeps_that_model_when_the_default_changes(kind, tmp_path, monkeypatch,
+                                                                                         quiet):
+    """#204: helpers started on the launcher's "Default · <model>" entry were named after that model but recorded no
+    model, so changing the CLI's default later switched a resumed helper to another model. The default it started on
+    is resolved and recorded now, and its command line still names it after the default has changed."""
+    _stand_in_cli(tmp_path, monkeypatch, kind)
+    _own_configs(tmp_path, monkeypatch)
+    agent = kinds.get(kind)
+    monkeypatch.setattr(agent, "config_model", lambda: "gemini-3.8-flash")
+    # The list its CLI last printed (`agy models` for Antigravity caches display names beside their ids); a start
+    # reads it cached and never runs the CLI: `agy models` starts the MCP servers in the user's settings.
+    monkeypatch.setitem(kinds._models, kind, (time.time(), [
+        {"id": "gemini-3.8-flash", "name": "Gemini 3.8 Flash (High)", "note": "test"},
+        {"id": "argon-4-medium", "name": "Argon 4 (Medium)", "note": "test"}]))
+    net = _game(tmp_path)
+    m = agents.Manager(net, tmp_path, URL)
+    (sid,) = m.start(kind, "game", 1, {})
+    assert m.sessions[sid].model == "gemini-3.8-flash"
+    row = net.store.one("SELECT model, options FROM helpers WHERE id=?", int(sid))
+    assert row["model"] == "gemini-3.8-flash"
+    assert json.loads(row["options"])["model"] == "gemini-3.8-flash"
+    m.stop()  # the app quits: the helper carries on when it starts again
+    monkeypatch.setattr(agent, "config_model", lambda: "argon-4-medium")  # chosen in the CLI meanwhile
+    later = agents.Manager(net, tmp_path, URL)
+    assert later.resume() == [sid]
+    assert _command_model(later, sid, kind, tmp_path) == "gemini-3.8-flash"
+    (new,) = later.start(kind, "game", 1, {})  # "Default" for a new helper is the default now
+    assert _command_model(later, new, kind, tmp_path) == "argon-4-medium"
+
+
+@pytest.mark.parametrize("kind", sorted(CLI_MODEL_FLAGS))
+def test_a_chosen_model_survives_resume_and_start_again(kind, tmp_path, monkeypatch, quiet):
+    """A helper started on a model the user chose keeps it when the app quits and it carries on, and when it is
+    started again by hand: every later session's command names the chosen model, whatever the CLI's default is."""
+    _stand_in_cli(tmp_path, monkeypatch, kind)
+    _own_configs(tmp_path, monkeypatch)
+    agent = kinds.get(kind)
+    monkeypatch.setattr(agent, "config_model", lambda: "cli-default")
+    net = _game(tmp_path)
+    m = agents.Manager(net, tmp_path, URL)
+    (sid,) = m.start(kind, "game", 1, {"model": "chosen-model"})
+    m.stop()
+    monkeypatch.setattr(agent, "config_model", lambda: "argon-4-medium")
+    later = agents.Manager(net, tmp_path, URL)
+    assert later.resume() == [sid]
+    assert _command_model(later, sid, kind, tmp_path) == "chosen-model"
+    later.stop(sid)  # stopped by you
+    monkeypatch.setattr(agent, "config_model", lambda: "another-default")
+    later.restart(sid)  # Start again
+    assert _command_model(later, sid, kind, tmp_path) == "chosen-model"
+
+
+@pytest.mark.parametrize("rows, pinned", [
+    ([{"id": "gemini-3.8-flash-high", "name": "Gemini 3.8 Flash (High)", "note": "gemini"}],
+     "gemini-3.8-flash-high"),
+    ([{"id": "another-model", "name": "Another Model", "note": "gemini"}], ""),
+    ([], ""),  # the list wasn't cached yet: nothing to map, so no --model (as before)
+])
+def test_antigravity_maps_the_display_name_its_settings_hold_to_the_slug_its_model_flag_takes(rows, pinned, tmp_path,
+                                                                                              monkeypatch, quiet):
+    """#204: Antigravity's settings keep a display name ("Gemini 3.8 Flash (High)"), while `agy --model` takes the
+    slug `agy models` lists. Starting on Default records and passes the slug; when the cached list hasn't the name,
+    it can't be mapped, so no --model is passed (as before). The helper's name is sensible in both cases."""
+    _stand_in_cli(tmp_path, monkeypatch, "antigravity")
+    _own_configs(tmp_path, monkeypatch)
+    ran = tmp_path / "bin" / "agy-ran"  # `agy models` starts the user's MCP servers: a start must never run it
+    exe = tmp_path / "bin" / CLI_EXECUTABLES["antigravity"]
+    exe.write_text('#!/bin/sh\ntouch "$(dirname "$0")/agy-ran"\n')
+    exe.chmod(0o755)
+    agent = kinds.get("antigravity")
+    monkeypatch.setattr(agent, "config_model", lambda: "Gemini 3.8 Flash (High)")
+    monkeypatch.setitem(kinds._models, "antigravity", (time.time(), rows))
+    net = _game(tmp_path)
+    m = agents.Manager(net, tmp_path, URL)
+    (sid,) = m.start("antigravity", "game", 1, {})
+    assert not ran.exists()
+    assert m.sessions[sid].model == pinned
+    assert m.sessions[sid].agent_name == "antigravity-gemini-3.8-flash-high-1"
+    row = net.store.one("SELECT model, options FROM helpers WHERE id=?", int(sid))
+    assert row["model"] == pinned
+    assert (json.loads(row["options"]).get("model") or "") == pinned
+    assert _command_model(m, sid, "antigravity", tmp_path) == pinned
+    # changing the CLI's default meanwhile never switches this helper: it keeps what it started on (or, unmapped,
+    # keeps starting on the CLI's default, as it did before)
+    m.stop()
+    monkeypatch.setattr(agent, "config_model", lambda: "Argon 4 (Medium)")
+    later = agents.Manager(net, tmp_path, URL)
+    assert later.resume() == [sid]
+    assert _command_model(later, sid, "antigravity", tmp_path) == pinned
+
+
+def test_remove_paused_stops_and_deletes_only_paused_helpers_on_the_project(tmp_path, quiet):
+    net = _game(tmp_path)
+    m = agents.Manager(net, tmp_path, URL)
+    paused_ids = [
+        m.start("claude", "game", 1, {"model": "paused-a"})[0],
+        m.start("claude", "game", 1, {"model": "paused-b"})[0],
+    ]
+    (working_id,) = m.start("claude", "game", 1, {"model": "working"})
+    (elsewhere_id,) = m.start("claude", "other", 1, {"model": "paused-elsewhere"})
+    for sid in paused_ids + [elsewhere_id]:
+        m.sessions[sid].state = "paused"
+        m._save(m.sessions[sid])
+    m.sessions[working_id].state = "working"
+    m._save(m.sessions[working_id])
+
+    assert m.remove_paused("game") == 2
+
+    assert all(sid not in m.sessions for sid in paused_ids)
+    assert working_id in m.sessions and m.sessions[working_id].state == "working"
+    assert elsewhere_id in m.sessions and m.sessions[elsewhere_id].state == "paused"
+    rows = net.store.all("SELECT id, state FROM helpers ORDER BY id")
+    assert {str(row["id"]): row["state"] for row in rows} == {
+        working_id: "working", elsewhere_id: "paused",
+    }
+
+
 def test_an_api_helper_starts_again_with_its_endpoints_key(tmp_path, quiet):
     """An API helper's key is never in its record: started again by hand, it gets it from its saved endpoint, and one
     whose endpoint is gone says so."""
@@ -330,6 +885,23 @@ def test_the_prompt_gives_the_compile_budget_the_guide_gives(tmp_path, monkeypat
                                                       "compiler": {"toolchain": "gcc-2.7.2-kmc"}})
     s = agents.Session("1", "claude", "claude-1", "game", "claude-1", {})
     assert network.stall_budget_text() in m._prompt(s) and "8 claims" in m._prompt(s)
+
+
+def test_the_prompt_only_names_the_tools_the_projects_console_offers(tmp_path, monkeypatch):
+    """A GameCube helper was told to join functions and a DS one to report function ends though neither console can:
+    the prompt says a capability tool only where the console has it (the same facts as its tool list)."""
+    net = _game(tmp_path)
+    m = agents.Manager(net, tmp_path, URL)
+    s = agents.Session("1", "claude", "claude-1", "game", "claude-1", {})
+    for platform, joins in (("gc", False), ("wii", False), ("nds", True), ("pc", True)):
+        monkeypatch.setattr(net, "overview", lambda slug, p=platform: {
+            "kind": "fork", "origin": "scratch", "title": "Game", "platform": p, "platform_name": p})
+        assert ("join_functions" in m._prompt(s)) is joins
+    for platform, structs in (("n64", True), ("gba", False), ("ps3", False)):
+        monkeypatch.setattr(net, "overview", lambda slug, p=platform: {
+            "kind": "rom", "title": "Game", "platform": p, "compiler": {"toolchain": "gcc-2.7.2-kmc"}})
+        text = m._prompt(s)
+        assert ("guess_struct" in text) is structs and "report_boundary" in text
 
 
 def test_a_project_started_from_scratch_isnt_called_a_public_decomp(tmp_path, monkeypatch):
@@ -502,7 +1074,10 @@ def test_when_a_usage_limit_resets_is_read_from_what_the_agent_said():
     sydney = datetime.fromtimestamp(reset("You've hit your session limit · resets 5am (Australia/Sydney)", now),
                                     ZoneInfo("Australia/Sydney"))
     assert (sydney.hour, sydney.minute) == (5, 0)
-    assert reset("quota resets at 2026-10-18T15:30:00Z", now) == datetime.fromisoformat("2026-10-18T15:30:00+00:00").timestamp()
+    # an ISO time in UTC, two and a half hours after `now` wherever the tests run: 15:30Z was in the past on a computer
+    # whose 13:00 is later than 15:30 UTC (America/New_York: 17:00 UTC), and a reset in the past is none
+    later = (noon + timedelta(hours=2, minutes=30)).astimezone(timezone.utc)
+    assert reset(f"quota resets at {later:%Y-%m-%dT%H:%M:%SZ}", now) == later.timestamp()
     for vague in ("quota exhausted", "resets 3", f"usage limit reached|{int(now) + 365 * 86400}"):
         assert reset(vague, now) is None, vague
 
@@ -535,6 +1110,9 @@ def test_quitting_ends_everything_a_helper_started(tmp_path):
             from .test_platform import _alive
 
             return _alive(pid)
+        if sys.platform == "darwin":
+            status = subprocess.run(["ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True)
+            return status.returncode == 0 and not status.stdout.strip().startswith("Z")
         try:
             return open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[0] != "Z"
         except OSError:
@@ -582,6 +1160,25 @@ def test_the_tests_never_run_an_agent_to_find_it(monkeypatch):
         raise AssertionError(f"ran {args[0]}")
     monkeypatch.setattr(agents.subprocess, "run", never)
     assert {row["id"] for row in agents.detect()} == {a.id for a in kinds.AGENTS}
+
+
+def test_a_helper_stops_when_all_that_is_open_is_what_it_said_no_c_makes(tmp_path, monkeypatch):
+    """The claim order never hands an agent back a function it said no C makes, so with only those open a session
+    can only find nothing to do: the helper stops at once and says what the user can do, where its sessions failed
+    one after another into a pause. Another helper, which hasn't said so, still works."""
+    _no_agent_settings(monkeypatch)
+    net = _game(tmp_path)
+    m = agents.Manager(net, tmp_path, URL)
+    m.prompt = lambda s: "task"
+    with net.store.tx() as db:
+        db.execute("UPDATE functions SET meta=? WHERE name='f0'",
+                   (json.dumps({"not_c": {"api-m-1": {"model": "m", "why": "hand-written", "t": 0}}}),))
+    s = m._record("game", "api", "api-m-1", "box #1", {"base_url": "http://mock/v1", "model": "m"})
+    s.stop = Quick()
+    m._run(s)
+    assert s.state == "stopped" and s.stopped_by == agents.BY_ITSELF and s.runs == 0
+    assert "nothing left it can do: the 1 open function is one it found no C makes" in s.why
+    assert m._ruled_out("game", "api-m-2") == 0  # (another helper's sessions go on)
 
 
 def test_the_api_helper_folds_each_finished_function_into_a_line(tmp_path, monkeypatch):
@@ -684,6 +1281,38 @@ def test_the_api_helper_sends_a_thinking_models_reasoning_back(tmp_path, monkeyp
     assert turns[0]["reasoning_content"] == "The smallest function first." and "reasoning_content" not in turns[1]
 
 
+
+def test_the_api_helper_asks_again_after_a_dropped_request_keeping_its_conversation(tmp_path, monkeypatch):
+    """#154: behind a laggy gateway, one 502 or dropped connection ended the session, and the next one started the
+    function over, again and again. They're asked again in place, after a wait, with the same conversation."""
+    import httpx
+
+    _no_agent_settings(monkeypatch)
+    net = _game(tmp_path, functions=1)
+    m = agents.Manager(net, tmp_path, URL)
+    m.prompt = lambda s: "task"
+    s = m._record("game", "api", "api-m-1", "box #1", {"base_url": "http://mock/v1", "model": "m", "per_session": 1,
+                                                       "context_tokens": 32768})
+    s.stop = Quick()
+    monkeypatch.setattr(agents.tools, "call", lambda net, agent, slug, name, args: "## CLAIMED: game/f0")
+    sent = []
+
+    def handler(request):
+        sent.append(json.loads(request.content)["messages"])
+        if len(sent) == 2:
+            return httpx.Response(502, text="Bad Gateway")
+        if len(sent) == 3:
+            raise httpx.ReadTimeout("the gateway took too long")
+        if len(sent) > 4:
+            s.stop.set()
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [
+            {"id": f"c{len(sent)}", "type": "function", "function": {"name": "claim_function", "arguments": "{}"}}]}}]})
+    real = httpx.Client
+    monkeypatch.setattr(httpx, "Client", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    m._run(s)
+    assert sent[1] == sent[2] == sent[3] and len(sent[1]) > len(sent[0])
+    assert s.stop.waits[:2] == [10, 20] and s.runs == 1
+
 def test_each_models_cost_per_match_cheapest_first(tmp_path, quiet):
     """The Agents view says what each model cost on a game, to tell which models to run more of: cheapest per match
     first, models that matched nothing last."""
@@ -697,6 +1326,126 @@ def test_each_models_cost_per_match_cheapest_first(tmp_path, quiet):
     # a model counted only in tokens isn't the cheapest: it comes after the priced ones
     assert [r["model"] for r in m.costs("game")] == ["deepseek-v4.1-flash", "claude-opus-5.5", "local-qwen", "muse-1.3"]
     assert m.costs("other") == []
+    assert all(r["advice"] == "" for r in m.costs("game"))  # long ago, and no model spinning
+
+
+def test_a_model_spinning_on_a_game_gets_advice_to_weigh_not_an_order(tmp_path, quiet):
+    """An Xbox game in one night: one model's helpers compiled 5,741 times for 10 matches ($138), another's 1,184
+    times for 26 ($199). Nothing told the user the first was spinning."""
+    import time
+
+    net = _game(tmp_path)
+    m = agents.Manager(net, tmp_path, URL)
+    now = time.time()
+    with net.store.tx() as db:
+        for model, usd, compiles, matches, at in (("claude-haiku", 138.1, 5741, 10, now - 3600),
+                                                  ("claude-opus", 199.3, 1184, 26, now - 3600),
+                                                  ("claude-haiku", 50.0, 9000, 400, now - 3 * 86400)):  # long ago
+            db.execute("INSERT INTO helper_sessions(helper_id, project, kind, model, agent, started_at, usd, compiles, "
+                       "matches) VALUES(1, 'game', 'claude', ?, 'a', ?, ?, ?, ?)", (model, at, usd, compiles, matches))
+    rows = {r["model"]: r for r in m.costs("game")}
+    said = rows["claude-haiku"]["advice"]
+    assert rows["claude-haiku"]["advice_model"] == "claude-haiku"  # the GUI dismisses this model's advice by name
+    assert said.startswith("In the last day claude-haiku's helpers here made 5,741 compiles for 10 matches, $13.81 a match")
+    assert "claude-opus's needed about 46 compiles a match, $7.67 a match" in said
+    assert "may be past what claude-haiku does well: claude-opus could get further, for less" in said
+    assert "You might give claude-haiku fewer helpers here." in said
+    assert rows["claude-opus"]["advice"] == "" and rows["claude-opus"]["advice_model"] == ""
+    # one model alone: no comparison, a stronger one in general; a model that does fine alone: nothing
+    alone = agents.spin_advice([{"kind": "claude", "model": "claude-haiku", "usd": 30.0, "compiles": 900, "matches": 0}])
+    assert alone[("claude", "claude-haiku")].endswith("for no matches. What's left of this game may be past what "
+                                                      "claude-haiku does well: a stronger model could get further.")
+    assert agents.spin_advice([{"kind": "api", "model": "m", "usd": 0, "compiles": 900, "matches": 30}]) == {}
+    assert agents.spin_advice([{"kind": "api", "model": "m", "usd": 0, "compiles": 150, "matches": 0}]) == {}  # too few
+
+
+def test_polishing_sessions_dont_make_a_model_look_like_its_spinning(tmp_path, quiet):
+    """A model run only to polish an Xbox game was told its 1,282 compiles of a day had made no match: polishing
+    compiles matched code and matches nothing new. Sessions keep their helper's task, those from before it was kept
+    too, and only decompiling ones count for the advice."""
+    import time
+
+    net = _game(tmp_path)
+    now = time.time()
+    with net.store.tx() as db:
+        db.execute(agents.SCHEMA[0])  # helpers
+        db.execute("DROP TABLE IF EXISTS helper_sessions")
+        db.execute(agents.SCHEMA[1].replace(", task TEXT NOT NULL DEFAULT ''", ""))  # before sessions kept their task
+        db.execute("INSERT INTO helpers(id, project, kind, model, name, label, options, state) VALUES "
+                   "(1, 'game', 'claude', 'sonnet', 'claude-sonnet-1', 's', '{\"model\": \"sonnet\", \"task\": \"readable\"}', "
+                   "'stopped'), (2, 'game', 'claude', 'opus', 'claude-opus-1', 'o', '{\"model\": \"opus\"}', 'stopped'), "
+                   "(4, 'game', 'claude', 'haiku', 'claude-haiku-1', 'h', '', 'stopped')")  # options no JSON: none
+        for helper, model, agent, usd, compiles, matches in (
+                (1, "sonnet", "claude-sonnet-1", 20.0, 1282, 0), (2, "opus", "claude-opus-1", 104.4, 650, 10),
+                (4, "haiku", "claude-haiku-1", 1.0, 10, 0)):
+            db.execute("INSERT INTO helper_sessions(helper_id, project, kind, model, agent, started_at, usd, compiles, "
+                       "matches) VALUES(?, 'game', 'claude', ?, ?, ?, ?, ?, ?)", (helper, model, agent, now - 3600, usd,
+                                                                                  compiles, matches))
+    m = agents.Manager(net, tmp_path, URL)
+    assert {r["model"]: r["task"] for r in net.store.all("SELECT model, task FROM helper_sessions")} == \
+        {"sonnet": "readable", "opus": "", "haiku": ""}
+    rows = {r["model"]: r for r in m.costs("game")}
+    assert rows["sonnet"]["advice"] == "" and rows["sonnet"]["compiles"] == 1282  # still in what it spent
+    # a decompiling helper of the same model, spinning: that one counts
+    with net.store.tx() as db:
+        db.execute("INSERT INTO helper_sessions(helper_id, project, kind, model, agent, started_at, compiles, matches) "
+                   "VALUES(3, 'game', 'claude', 'sonnet', 'b', ?, 900, 0)", (now - 60,))
+    said = {r["model"]: r for r in m.costs("game")}["sonnet"]["advice"]
+    assert said.startswith("In the last day sonnet's helpers here made 900 compiles for no matches")
+
+
+def test_a_session_says_the_task_its_helper_was_started_with(tmp_path, quiet):
+    """The advice reads the task each session wrote when it began: a polishing helper's sessions say readable, a
+    decompiling helper's say nothing. Every session inserted by hand, a _session_begin that wrote "" passed."""
+    net = _game(tmp_path)
+    m = agents.Manager(net, tmp_path, URL)
+    for name, options, task in (("claude-opus-1", {"model": "opus", "task": "readable"}, "readable"),
+                                ("claude-opus-2", {"model": "opus"}, "")):
+        s = m._record("game", "claude", name, "opus", options)
+        row = m._session_begin(s)
+        assert net.store.one("SELECT task FROM helper_sessions WHERE id=?", row)["task"] == task
+    assert [r["task"] for r in net.store.all("SELECT task FROM helper_sessions ORDER BY id")] == ["readable", ""]
+
+
+def test_a_reused_helper_id_doesnt_give_an_old_session_another_helpers_task(tmp_path, quiet):
+    """helpers.id has no AUTOINCREMENT, so a removed helper's id goes to the next helper: matching an old session by
+    id alone made a sonnet session stand as a new polishing helper's, hiding the sonnet helper's spinning. A session
+    matches its helper by id, project and name."""
+    net = _game(tmp_path)
+    now = time.time()
+    with net.store.tx() as db:
+        db.execute(agents.SCHEMA[0])  # helpers
+        db.execute("DROP TABLE IF EXISTS helper_sessions")
+        db.execute(agents.SCHEMA[1].replace(", task TEXT NOT NULL DEFAULT ''", ""))  # before sessions kept their task
+        db.execute("INSERT INTO helpers(id, project, kind, model, name, label, options, state) VALUES "
+                   "(1, 'game', 'claude', 'haiku', 'claude-haiku-1', 'h', '{\"model\": \"haiku\"}', 'stopped'), "
+                   "(2, 'game', 'claude', 'sonnet', 'claude-sonnet-1', 's', '{\"model\": \"sonnet\"}', 'stopped')")
+        db.execute("INSERT INTO helper_sessions(helper_id, project, kind, model, agent, started_at, compiles, matches) "
+                   "VALUES(2, 'game', 'claude', 'sonnet', 'claude-sonnet-1', ?, 900, 0)", (now - 3600,))
+        db.execute("DELETE FROM helpers WHERE id=2")  # its record is removed
+        rid = db.execute("INSERT INTO helpers(project, kind, model, name, label, options, state) VALUES "
+                         "('game', 'claude', 'opus', 'claude-opus-1', 'o', '{\"model\": \"opus\", \"task\": "
+                         "\"readable\"}', 'stopped')").lastrowid
+        assert rid == 2  # SQLite gives the removed helper's id to the new polishing helper
+    m = agents.Manager(net, tmp_path, URL)
+    assert net.store.one("SELECT task FROM helper_sessions WHERE model='sonnet'")["task"] == ""
+    said = {r["model"]: r for r in m.costs("game")}["sonnet"]["advice"]
+    assert said.startswith("In the last day sonnet's helpers here made 900 compiles for no matches")
+
+
+def test_a_session_whose_helper_is_gone_has_no_task_to_take(tmp_path, quiet):
+    """A session from before tasks were kept whose helper's record was removed has none to take: it stays blank, so
+    it counts as decompiling rather than borrowing another helper's task."""
+    net = _game(tmp_path)
+    now = time.time()
+    with net.store.tx() as db:
+        db.execute(agents.SCHEMA[0])  # helpers
+        db.execute("DROP TABLE IF EXISTS helper_sessions")
+        db.execute(agents.SCHEMA[1].replace(", task TEXT NOT NULL DEFAULT ''", ""))  # before sessions kept their task
+        db.execute("INSERT INTO helper_sessions(helper_id, project, kind, model, agent, started_at, compiles, matches) "
+                   "VALUES(7, 'game', 'claude', 'sonnet', 'claude-sonnet-1', ?, 900, 0)", (now - 3600,))
+    agents.Manager(net, tmp_path, URL)
+    assert net.store.one("SELECT task FROM helper_sessions")["task"] == ""
 
 
 def test_codex_and_api_helpers_take_an_effort_too(tmp_path, monkeypatch):

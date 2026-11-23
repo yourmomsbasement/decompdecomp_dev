@@ -15,20 +15,23 @@ function renderAgentsPage() {
         ${(a.models || []).length ? `<details class="models"><summary>${a.models.length} model${a.models.length === 1 ? "" : "s"}</summary><div class="model-chips">${a.models.map((m) => `<span class="chip-s mono" title="${esc(m.note || "")}">${esc(m.name)}</span>`).join("")}</div></details>` : ""}
         <p class="muted small">${esc(a.signin)}</p>`
       : `<p class="muted small">${a.needs ? `Needs ${esc(a.needs)} first. ` : ""}Or install it yourself:</p>${cmdBox(a.install)}`}
+      ${a.uses_accounts ? `<details class="models"><summary>Additional accounts</summary><div id="agentAccounts-${esc(a.id)}"></div></details>` : ""}
       <pre class="joblog" data-ilog="${esc(a.id)}" hidden></pre></div>`).join("");
   wireCopies($("agList"));
   $("agList").querySelectorAll("[data-inst]").forEach((b) => {
     b.onclick = async () => {
       const log = $("agList").querySelector(`[data-ilog="${b.dataset.inst}"]`);
-      showJobError(log, ""); b.disabled = true;
+      showJobError(log, "");
+      const finish = beginWork(log, "Installing agent", [b], "Agent installed.");
       try {
         const { job } = await api("/api/agents/install", { method: "POST", body: { kind: b.dataset.inst } });
         await followJob(job, log);
         toast("Installed.", "match");
         showAgentsPage();
-      } catch (e) { showJobError(log, e.message); b.disabled = false; }
+      } catch (e) { showJobError(log, e.message); b.disabled = false; } finally { finish(); }
     };
   });
+  rows.filter((a) => a.uses_accounts).forEach((a) => renderAgentAccounts(a.id));
   const eps = S.st.settings.endpoints || [];
   const card = (e) => `<div class="ep-card" data-id="${esc(e.id || "")}">
       ${e.id ? `<div class="ar-head"><b>${esc(e.name)}</b><span class="muted small mono">${esc(e.model)} · ${esc(hostOf(e.base_url))}</span></div>` : `<div class="ar-head"><b>A new endpoint</b></div>`}
@@ -60,10 +63,79 @@ function renderAgentsPage() {
   });
   if ($("epAdd")) $("epAdd").onclick = () => { S.addingEndpoint = true; renderAgentsPage(); };
 }
+function accountUsageText(row) {
+  return row ? `${Number(row.tokens).toLocaleString()} tokens · ${money(row.usd)} reported cost` : "No recorded usage yet";
+}
+function renderAgentAccounts(kind) {
+  const box = $(`agentAccounts-${kind}`);
+  const accounts = (S.st.settings.agent_accounts || []).filter((a) => a.kind === kind);
+  const usage = (S.st.account_usage || []).filter((r) => r.kind === kind);
+  box.innerHTML = `<div class="account-list"><div class="account-item"><div><b>Default sign-in</b><span>Uses your existing login</span></div></div>
+    ${accounts.map((p) => `<button class="account-item account-link" data-account-open="${esc(p.id)}" type="button"><div><b>${esc(p.name)}</b>
+      <span>${accountUsageText(usage.find((r) => r.account_id === p.id))}</span></div><span aria-hidden="true">›</span></button>`).join("")}</div>
+    <button class="ghost small-btn" data-account-add type="button">+ Add account</button>`;
+  box.querySelectorAll("[data-account-open]").forEach((button) => {
+    button.onclick = () => openAgentAccount(kind, button.dataset.accountOpen);
+  });
+  box.querySelector("[data-account-add]").onclick = () => openAgentAccount(kind);
+}
+function openAgentAccount(kind, id = "") {
+  const agent = S.st.agents.find((a) => a.id === kind);
+  const account = (S.st.settings.agent_accounts || []).find((a) => a.kind === kind && a.id === id);
+  const usage = (S.st.account_usage || []).filter((r) => r.kind === kind);
+  const labelHelp = "This is a label used only in decompdecomp to help you recognize the account. It does not change your sign-in or the account name with your provider.";
+  const body = dialog(account ? account.name : `Add ${agent.name} account`, account ? `
+    <label class="field"><span>Account label</span><input data-account-name value="${esc(account.name)}" maxlength="80" autocomplete="off"></label>
+    <p class="muted small">${labelHelp}</p>
+    <button class="primary" data-account-rename type="button">Save label</button>
+    <p>Run this command in a terminal, then sign in with <code>/login</code>. Use <code>/status</code> to check the account.</p>
+    ${cmdBox(account.signin)}
+    <label class="field"><span>Configuration directory</span><code>${esc(account.config_dir)}</code></label>
+    <p>${accountUsageText(usage.find((r) => r.account_id === id))}</p>
+    <p class="muted small">Usage covers finished sessions in decompdecomp across your projects. Reported cost is a model estimate, not your subscription bill or remaining allowance.</p>
+    <p class="muted small">Removing this account stops its helpers. Login files and recorded usage are kept.</p>
+    <p class="bad small" data-account-error hidden></p>
+    <button class="ghost danger" data-account-remove type="button">Remove account and stop its helpers</button>` : `
+    <p>Keep another subscription login separate from your default account. After adding it, you’ll get a command to sign in.</p>
+    <label class="field"><span>Account label</span><input data-account-name placeholder="A name you’ll recognize" maxlength="80" autocomplete="off"></label>
+    <p class="muted small">${labelHelp}</p>
+    <details><summary>Use an existing configuration directory</summary><label class="field"><span>Directory (optional)</span><input data-account-dir placeholder="Absolute path to an existing account directory"></label></details>
+    <p class="muted small">Leave the directory blank to create a separate sign-in. Credentials stay with ${esc(agent.name)}.</p>
+    <p class="bad small" data-account-error hidden></p>
+    <div class="row"><button class="primary" data-account-save type="button">Add account</button><button class="ghost" data-close type="button">Cancel</button></div>
+    ${usage.some((r) => r.account_id && !(S.st.settings.agent_accounts || []).some((a) => a.id === r.account_id)) ? `<details><summary>Removed accounts’ usage</summary>${usage.filter((r) => r.account_id && !(S.st.settings.agent_accounts || []).some((a) => a.id === r.account_id)).map((r) => `<p><b>${esc(r.name)}</b><br>${accountUsageText(r)}</p>`).join("")}</details>` : ""}`, "agent-account");
+  const save = async (button, remove = false) => {
+    button.disabled = true;
+    const error = body.querySelector("[data-account-error]");
+    error.hidden = true;
+    const before = new Set((S.st.settings.agent_accounts || []).map((a) => a.id));
+    try {
+      S.st.settings = await api("/api/agent-accounts", { method: "POST", body: remove ? { remove: id } : account ? { id, name: body.querySelector("[data-account-name]").value } : {
+        kind, name: body.querySelector("[data-account-name]").value, config_dir: body.querySelector("[data-account-dir]").value } });
+      renderAgentAccounts(kind);
+      // A save can finish after this drawer was closed or replaced. Never reopen it over another task.
+      if (!$("dialog").hidden && $("dialogBody") === body && body.querySelector(remove ? "[data-account-remove]" : account ? "[data-account-rename]" : "[data-account-save]") === button) {
+        if (remove) closeDialog();
+        else if (account) openAgentAccount(kind, id);
+        else {
+          const added = S.st.settings.agent_accounts.find((a) => a.kind === kind && !before.has(a.id));
+          if (added) openAgentAccount(kind, added.id);
+        }
+      }
+    } catch (e) { error.textContent = e.message; error.hidden = false; } finally { button.disabled = false; }
+  };
+  if (account) {
+    const rename = body.querySelector("[data-account-rename]"), remove = body.querySelector("[data-account-remove]");
+    rename.onclick = () => save(rename);
+    remove.onclick = () => save(remove, true);
+  } else {
+    const add = body.querySelector("[data-account-save]");
+    add.onclick = () => save(add);
+  }
+}
 $("agRefresh").onclick = showAgentsPage;
 
 /* ------------------------------------------------------------------ compilers & tools page */
-const TOOL_GROUPS = [["", "All"], ["N64", "N64"], ["PS2", "PS2"], ["GameCube/Wii", "GameCube, Wii"], ["PC", "PC"], ["tool", "Tools"]];
 let toolFilter = "";
 async function showToolsPage() {
   show("toolsPage");
@@ -72,15 +144,95 @@ async function showToolsPage() {
 }
 function renderTools() {
   const all = S.st.toolchains;
-  const group = (t) => t.platform || "tool";  // a compiler or a pack of them says its platform (toolchains.toml)
-  $("toolChips").innerHTML = TOOL_GROUPS.map(([k, label]) => `<button class="chip ${toolFilter === k ? "on" : ""}" data-g="${k}" type="button">${label} <span>${k ? all.filter((t) => group(t) === k).length : all.length}</span></button>`).join("");
+  const group = (t) => t.platform || "tool";  // a compiler or a pack of them says its platform (toolchains.toml, kits/)
+  // a chip per platform the list has, in its order (a console added later has its own), then the tools
+  const groups = [["", "All"], ...[...new Set(all.map(group))].filter((g) => g !== "tool").map((g) => [g, g.replace("/", ", ")]),
+    ["tool", "Tools"]];
+  $("toolChips").innerHTML = groups.map(([k, label]) => `<button class="chip ${toolFilter === k ? "on" : ""}" data-g="${k}" type="button">${label} <span>${k ? all.filter((t) => group(t) === k).length : all.length}</span></button>`).join("");
   $("toolChips").querySelectorAll("[data-g]").forEach((b) => { b.onclick = () => { toolFilter = b.dataset.g; renderTools(); }; });
   const rows = all.filter((t) => !toolFilter || group(t) === toolFilter);
-  $("toolGrid").innerHTML = rows.map((t) => `<div class="tool-card ${t.installed ? "ok" : ""}">
-      <div class="tc-top"><b>${esc(t.name)}</b>${t.license === "proprietary" ? `<span class="chip-s warn">proprietary</span>` : ""}${t.platform ? `<span class="chip-s">${esc(t.platform)}</span>` : ""}</div>
+  const vm = S.st.linux_vm;
+  const vmCard = vm && (!toolFilter || rows.some((t) => t.linux_vm)) ? `<div class="tool-card ${vm.ready ? "ok" : ""}"><div class="tc-top"><b>Local Linux compiler runner</b><span class="chip-s">macOS</span></div>
+    <p class="muted small">Runs Linux-only compiler packs in a dedicated Colima VM. Compiles stay local and have no network access.</p>
+    <p class="small">${vm.ready ? "✓ Ready" : esc(vm.why)}</p>
+    <button class="ghost small-btn" id="prepareLinuxVm" type="button">${vm.ready ? "Check Linux runner" : "Prepare Linux runner"}</button></div>` : "";
+  $("toolGrid").innerHTML = vmCard + rows.map((t) => `<div class="tool-card ${t.installed ? "ok" : ""}">
+      <div class="tc-top"><b>${esc(t.name)}</b>${t.license === "proprietary" ? `<span class="chip-s warn">proprietary</span>` : ""}${t.platform ? `<span class="chip-s">${esc(t.platform)}</span>` : ""}${t.linux_vm ? `<span class="chip-s">Linux VM</span>` : ""}</div>
       <p class="muted small">${esc(t.use)}</p>
-      <div class="row">${!t.supported ? `<span class="muted small">not available for this computer</span>` : t.installed ? `<span class="ok-mark">✓ installed</span>` : `<button class="ghost small-btn" data-tc="${esc(t.id)}" data-prop="${t.license === "proprietary" ? 1 : ""}" type="button">Install</button>`}</div></div>`).join("");
+      ${(t.copies || []).map((c) => `<div class="row copy"><span class="grow copy-text"><span class="ok-mark">✓ ${esc(c.build || "your copy")}</span>`
+        + `${c.verified ? `<span class="muted small">${esc(c.verified)}</span>` : ""}`
+        // (the folder's last parts: a full path is long; it's on hover)
+        + `<span class="muted small copy-path" title="${esc(c.folder)}">…/${esc(c.folder.split(/[\\/]/).slice(-3).join("/"))}</span></span>`
+        + `<button class="ghost small-btn" data-remove="${esc(t.id)}" data-folder="${esc(c.folder)}" type="button">Remove</button></div>`).join("")}
+      <div class="row">${!t.supported ? `<span class="muted small">not available for this computer</span>`
+        : t.local ? `<span class="grow"></span><button class="ghost small-btn" data-local="${esc(t.id)}" type="button">${t.installed ? "Add a copy" : "Choose your folder"}</button>`
+        : t.installed ? `<span class="ok-mark">✓ installed</span>`
+        : `${t.changed ? `<span class="muted small grow">changed since you installed it</span>` : ""}`
+          + `<button class="ghost small-btn" data-tc="${esc(t.id)}" data-prop="${t.license === "proprietary" ? 1 : ""}"`
+          + ` type="button">${t.changed ? "Install again" : "Install"}</button>`}</div></div>`).join("");
+  if ($("prepareLinuxVm")) $("prepareLinuxVm").onclick = prepareLinuxVm;
   $("toolGrid").querySelectorAll("[data-tc]").forEach((b) => { b.onclick = () => { b.disabled = true; installToolchain(b.dataset.tc, !!b.dataset.prop).finally(() => { b.disabled = false; }); }; });
+  $("toolGrid").querySelectorAll("[data-local]").forEach((b) => { b.onclick = () => useLocalToolchain(b.dataset.local); });
+  $("toolGrid").querySelectorAll("[data-remove]").forEach((b) => {
+    b.onclick = async () => {
+      b.disabled = true;
+      try { await api("/api/toolchain/remove", { method: "POST", body: { id: b.dataset.remove, folder: b.dataset.folder } }); await loadState(); renderTools(); }
+      catch (e) { toast(e.message, "err"); b.disabled = false; }
+    };
+  });
+}
+/* A local toolchain (a kit: the Xbox XDK, Visual C++): nothing is downloaded; decompdecomp checks the user's own
+   folder and reads it where it is. Each copy is listed (its build, whether decompdecomp knows it) with Remove; "Add a
+   copy" adds another. The folder and the licence are asked for in the tool's card (prompt() and confirm() are cramped for a
+   Windows path, and some browsers block them). */
+function useLocalToolchain(id) {
+  const t = (S.st.toolchains || []).find((x) => x.id === id) || {};
+  const card = $("toolGrid").querySelector(`[data-local="${CSS.escape(id)}"]`)?.closest(".tool-card");
+  if (!card || card.querySelector(".local-form")) return;
+  const form = document.createElement("form");
+  form.className = "local-form";
+  form.innerHTML = `<label class="field"><span>The folder of your own copy (the one holding the files it needs, or the folder above it)</span>
+      <input name="folder" type="text" spellcheck="false" placeholder="C:\\Program Files\\Microsoft Visual Studio"></label>
+    ${t.license === "proprietary" ? `<label class="check"><input type="checkbox" name="accept"><span>This is proprietary software. decompdecomp reads your copy where it is and never copies or uploads it. I accept that.</span></label>` : ""}
+    <div class="row"><button class="small-btn" type="submit">Use this folder</button><button class="ghost small-btn" type="button" data-cancel>Cancel</button></div>
+    <pre class="joblog" hidden></pre>`;
+  card.appendChild(form);
+  const input = form.querySelector("[name=folder]");
+  input.focus();
+  form.querySelector("[data-cancel]").onclick = () => form.remove();
+  form.onsubmit = async (ev) => {
+    ev.preventDefault();
+    const folder = input.value.trim();
+    if (!folder) { input.focus(); return; }
+    const accept = form.querySelector("[name=accept]");
+    if (accept && !accept.checked) { toast("Tick the box to accept the licence first.", "err"); return; }
+    form.querySelector("[type=submit]").disabled = true;
+    const log = form.querySelector(".joblog");
+    log.hidden = false;
+    const finish = beginWork(log, "Checking your folder", [], "Your copy is set up.");
+    try {
+      const { job } = await api("/api/toolchain", { method: "POST", body: { id, accept_license: true, folder } });
+      await followJob(job, log);
+      toast("Your copy is set up.", "match");
+      await loadState();
+      renderTools();
+    } catch (e) {
+      showJobError(log, e.message);
+      form.querySelector("[type=submit]").disabled = false;
+    } finally { finish(); }
+  };
+}
+
+async function prepareLinuxVm() {
+  const body = dialog("Prepare Linux compiler runner", `<pre class="joblog tall" id="linuxVmLog"></pre>`);
+  const log = body.querySelector("#linuxVmLog");
+  const finish = beginWork(log, "Preparing local Linux runner", [], "Linux runner ready.");
+  try {
+    const { job } = await api("/api/linux-vm", { method: "POST", body: {} });
+    await followJob(job, log);
+    await loadState();
+    renderTools();
+  } catch (e) { showJobError(log, e.message); } finally { finish(); }
 }
 
 /* ------------------------------------------------------------------ settings page */
@@ -128,6 +280,14 @@ async function showSettingsPage() {
   wireCopies($("setComputer"));
   $("themeSeg").querySelectorAll("[data-theme]").forEach((b) => { b.onclick = () => { setTheme(b.dataset.theme); $("themeSeg").querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b)); }; });
   const save = (body, msg) => api("/api/settings", { method: "POST", body }).then((s) => { S.st.settings = s; toast(msg); }).catch((e) => toast(esc(e.message), "err"));
+  $("romLibrary").value = st.settings.rom_library || "";
+  $("romLibrarySave").onclick = () => save({ rom_library: $("romLibrary").value.trim() }, "ROM library saved.");
+  $("romLibraryPick").onclick = async () => {
+    try {
+      const { path } = await api("/api/pick", { method: "POST", body: { kind: "folder", title: "ROM library folder" } });
+      if (path) $("romLibrary").value = path;
+    } catch (e) { toast(esc(e.message), "err"); }
+  };
   $("perSession").onchange = () => save({ per_session: Number($("perSession").value) }, "Saved.");
   $("autopilotSet").onchange = () => save({ autopilot: $("autopilotSet").checked }, "Saved.");
   $("budgetSet").onchange = () => save({ budget_usd: Number($("budgetSet").value) || 0 }, "Budget saved.");
@@ -172,8 +332,10 @@ function offerUpdate() {
     closeAll();
   };
   body.querySelector("#upGo").onclick = async (e) => {
-    e.target.disabled = true;
-    try { await api("/api/update", { method: "POST", body: { apply: true } }); } catch (err) { e.target.disabled = false; return toast(esc(err.message), "err"); }
+    const log = document.createElement("pre");
+    log.className = "joblog"; body.append(log);
+    const finish = beginWork(log, "Starting update", [e.target], "Update started.");
+    try { await api("/api/update", { method: "POST", body: { apply: true } }); } catch (err) { e.target.disabled = false; showJobError(log, err.message); return; } finally { finish(); }
     showUpdating();
   };
 }
@@ -199,29 +361,35 @@ async function showUpdating() {
   const was = { version: S.st ? S.st.version : "", build: S.st ? S.st.build || "" : "" };
   dialog("Updating decompdecomp", `<p id="upStep">Installing the update…</p><pre class="joblog tall" id="upLog"></pre>
     <p class="muted small">This tab reloads by itself once the new version is running.</p>`);
+  const log = $("upLog");
+  const finish = beginWork(log, "Updating decompdecomp", [], "Update installed. Reloading the app.");
   let away = 0;
-  for (;;) {
-    await sleep(1000);
-    let u = null;
-    try { u = await api("/api/update"); away = 0; } catch { away++; }
-    const job = (u && u.job) || {};
-    if (u && $("upLog")) { $("upLog").textContent = (job.log || []).join("\n"); $("upLog").scrollTop = $("upLog").scrollHeight; }
-    if (job.state === "error") {
-      S.updating = false;
-      if ($("upStep")) $("upStep").textContent = `The update didn't go through: ${job.error}`;
-      return;
+  try {
+    for (;;) {
+      await sleep(1000);
+      let u = null;
+      try { u = await api("/api/update"); away = 0; } catch { away++; }
+      const job = (u && u.job) || {};
+      if (u && $("upLog")) { $("upLog").textContent = (job.log || []).join("\n"); $("upLog").scrollTop = $("upLog").scrollHeight; }
+      if (job.state === "error") {
+        S.updating = false;
+        showJobError(log, `The update didn't go through: ${job.error}`);
+        if ($("upStep")) $("upStep").textContent = `The update didn't go through: ${job.error}`;
+        return;
+      }
+      if (job.state === "restarting" && $("upStep")) $("upStep").textContent = "Restarting…";
+      try {
+        const h = await (await fetch("/health", { cache: "no-store" })).json();
+        if (h.version !== was.version || (h.build || "") !== was.build) { finish(); location.reload(); return; }
+      } catch { /* not back yet */ }
+      if (away > 180) {
+        S.updating = false;
+        showJobError(log, "The update could not finish restarting. Start decompdecomp again.");
+        if ($("upStep")) $("upStep").textContent = "decompdecomp didn't come back after the update. Start it again (decompdecomp in your apps, or the decomp command).";
+        return;
+      }
     }
-    if (job.state === "restarting" && $("upStep")) $("upStep").textContent = "Restarting…";
-    try {
-      const h = await (await fetch("/health", { cache: "no-store" })).json();
-      if (h.version !== was.version || (h.build || "") !== was.build) { location.reload(); return; }
-    } catch { /* not back yet */ }
-    if (away > 180) {
-      S.updating = false;
-      if ($("upStep")) $("upStep").textContent = "decompdecomp didn't come back after the update. Start it again (decompdecomp in your apps, or the decomp command).";
-      return;
-    }
-  }
+  } finally { finish(); S.updating = false; }
 }
 $("navUpdate").onclick = () => (updateInfo && updateInfo.available ? offerUpdate() : checkUpdate(true, true));
 

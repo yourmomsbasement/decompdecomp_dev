@@ -7,20 +7,40 @@ writes them), for objdiff to compare with what src/ compiles to.
 functions.json (written by decompdecomp from Ghidra's analysis) says where each function is in the .exe and where its
 code refers to addresses: calls, jumps and data addresses become relocations, as in a compiled object, so a function
 matches whatever names your C uses for them. Each function gets a section of its own, as MSVC's /Gy makes them.
+The game's own DLLs are programs of the project too (functions.json's "modules"): a DLL's source files are in a
+folder of its name (src/auto/<module>/), and its functions are cut out of it at the address the project gives it
+(its preferred one, unless the program or another DLL has that: then moved by its base relocations, as Windows
+moves it). A 64-bit game's (functions.json's "machine": "x64") are AMD64 objects, with x64's relocations.
 Standard library only. Made by decompdecomp.
 """
 
 import hashlib
 import json
+import re
 import struct
 import sys
 from pathlib import Path
 
-DIR32, REL32 = 0x06, 0x14
+DIR32, REL32 = 0x06, 0x14  # (32-bit x86)
+ADDR64, REL32_64, REL32_64_LAST = 1, 4, 9  # (x64: a pointer; rip-relative, with 0 to 5 bytes after the 4)
+MACHINES = {"x86": 0x14C, "x64": 0x8664}  # functions.json's "machine" (none: x86) -> the objects'
+DATA = re.compile(r"_?D_[0-9A-F]{8,16}$|__imp_|__ImageBase$")  # what isn't a function among the symbols
 CODE = 0x60500020  # code, readable, executable, 16-byte aligned
+# in a Windows program: where the PE header is, then in its optional header the image base (PE32's: 4 bytes at 28;
+# PE32+'s, a 64-bit program's: 8 bytes at 24) and the base relocations' directory (136; 152); each relocation
+# block's entries are 16 bits, the type in the top 4 (HIGHLOW: a 32-bit address; DIR64: a 64-bit one)
+PE_OFFSET_AT, OPTIONAL_HEADER_AT, IMAGE_BASE_AT, BASE_RELOCATIONS_AT = 0x3C, 0x18, 28, 136
+PE32_PLUS, IMAGE_BASE_64_AT, BASE_RELOCATIONS_64_AT = 0x20B, 24, 152
+SECTION_COUNT_AT, OPTIONAL_HEADER_SIZE_AT, SECTION_HEADER_BYTES = 6, 20, 40
+HIGHLOW, DIR64, RELOC_BLOCK_HEADER_BYTES = 3, 10, 8
 
 
-def coff(functions: list[dict], exe: bytes) -> bytes:
+def x64(info: dict) -> bool:
+    """Whether the project's programs are 64-bit (functions.json's "machine")."""
+    return info.get("machine") == "x64"
+
+
+def coff(functions: list[dict], exe: bytes, machine: str = "x86") -> bytes:
     symbols: list[tuple[str, int, int, int, int]] = []  # (name, value, section, type, storage class)
     externs: dict[str, int] = {}
     sections = []
@@ -39,9 +59,11 @@ def coff(functions: list[dict], exe: bytes) -> bytes:
             else:
                 if name not in externs:
                     externs[name] = len(symbols)
-                    symbols.append((name, 0, 0, 0x20 if rtype == REL32 else 0, 2))
+                    called = rtype == REL32 if machine == "x86" else \
+                        REL32_64 <= rtype <= REL32_64_LAST and not DATA.match(name)
+                    symbols.append((name, 0, 0, 0x20 if called else 0, 2))
                 index, inline = externs[name], addend
-            struct.pack_into("<i", code, off, inline)
+            struct.pack_into("<q" if machine == "x64" and rtype == ADDR64 else "<i", code, off, inline)
             relocs += struct.pack("<IIH", off, index, rtype)
         sections.append((bytes(code), bytes(relocs), len(fn["relocs"])))
 
@@ -64,19 +86,70 @@ def coff(functions: list[dict], exe: bytes) -> bytes:
                                count, 0, CODE)
         body += code + relocs
         at += len(code) + len(relocs)
-    return struct.pack("<HHIIIHH", 0x14C, len(sections), 0, at, len(symbols), 0, 0) + headers + body + table + strings
+    return struct.pack("<HHIIIHH", MACHINES[machine], len(sections), 0, at, len(symbols), 0, 0) + headers + body + \
+        table + strings
+
+
+def rebase(data: bytes, base: int) -> bytes:
+    """The program as Windows loads it at `base` instead of the address its header prefers: every address its base
+    relocations name moved by the difference, and its header saying the new base."""
+    out = bytearray(data)
+    pe = struct.unpack_from("<I", out, PE_OFFSET_AT)[0]
+    opt = pe + OPTIONAL_HEADER_AT
+    wide = struct.unpack_from("<H", out, opt)[0] == PE32_PLUS
+    form, base_at, mask = ("<Q", IMAGE_BASE_64_AT, (1 << 64) - 1) if wide else ("<I", IMAGE_BASE_AT, 0xFFFFFFFF)
+    delta = (base - struct.unpack_from(form, out, opt + base_at)[0]) & mask
+    if not delta:
+        return data
+    struct.pack_into(form, out, opt + base_at, base)
+    count, opt_size = (struct.unpack_from("<H", out, pe + at)[0] for at in (SECTION_COUNT_AT, OPTIONAL_HEADER_SIZE_AT))
+    sections = [struct.unpack_from("<III", out, opt + opt_size + SECTION_HEADER_BYTES * i + 12) for i in range(count)]
+
+    def offset(rva: int):  # its place in the file, or None (sections: va, bytes in the file, where in the file)
+        return next((at + rva - va for va, size, at in sections if va <= rva < va + size), None)
+    rva, size = struct.unpack_from("<II", out, opt + (BASE_RELOCATIONS_64_AT if wide else BASE_RELOCATIONS_AT))
+    done = 0
+    while done + RELOC_BLOCK_HEADER_BYTES <= size and (block := offset(rva + done)) is not None:
+        page, length = struct.unpack_from("<II", out, block)
+        if length < RELOC_BLOCK_HEADER_BYTES:
+            break
+        for k in range(RELOC_BLOCK_HEADER_BYTES, length - 1, 2):
+            entry = struct.unpack_from("<H", out, block + k)[0]
+            if entry >> 12 == HIGHLOW and (at := offset(page + (entry & 0xFFF))) is not None:
+                struct.pack_into("<I", out, at, (struct.unpack_from("<I", out, at)[0] + delta) & 0xFFFFFFFF)
+            elif entry >> 12 == DIR64 and (at := offset(page + (entry & 0xFFF))) is not None:
+                struct.pack_into("<Q", out, at, (struct.unpack_from("<Q", out, at)[0] + delta) & mask)
+        done += length
+    return bytes(out)
+
+
+def programs(info: dict) -> dict:
+    """Each program of the project by the folder its source files are in ("" for the .exe's): (its file, its
+    SHA-1, the address the project gives it; None: where its header says)."""
+    out = {"": (info["exe"], info.get("sha1"), None)}
+    for m in info.get("modules", []):
+        out[m["name"]] = (m["exe"], m["sha1"], m["image_base"])
+    return out
+
+
+def module(unit: str) -> str:
+    """The program a unit is of: a DLL's are in its folder (hw/text_10001000), the .exe's in none."""
+    return unit.rsplit("/", 1)[0] if "/" in unit else ""
 
 
 def main() -> None:
     config, out = Path(sys.argv[1]), Path(sys.argv[2])
     info = json.loads(config.read_text(encoding="utf-8"))
-    exe = Path(info["exe"]).read_bytes()
-    if hashlib.sha1(exe).hexdigest() != info["sha1"]:
-        sys.exit(f"{info['exe']} isn't the copy this project was made from (its SHA-1 should be {info['sha1']})")
-    out.mkdir(parents=True, exist_ok=True)
+    loaded = {}
+    for name, (path, sha1, base) in programs(info).items():
+        data = Path(path).read_bytes()
+        if hashlib.sha1(data).hexdigest() != sha1:
+            sys.exit(f"{path} isn't the copy this project was made from (its SHA-1 should be {sha1})")
+        loaded[name] = data if base is None else rebase(data, base)
     for unit, functions in info["units"].items():
-        data = coff(functions, exe)
+        data = coff(functions, loaded[module(unit)], "x64" if x64(info) else "x86")
         path = out / f"{unit}.obj"
+        path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists() or path.read_bytes() != data:  # unchanged objects keep their time: nothing rebuilds
             path.write_bytes(data)
 

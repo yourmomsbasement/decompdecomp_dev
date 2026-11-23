@@ -1,14 +1,13 @@
 """Start a PlayStation 4 decompilation from scratch: a project made for the user's own eboot.elf, judged by objdiff.
 
-An eboot is an ELF64 with Sony's own e_type (0xFE10) and no section headers at all: code and data are only reachable
-through the program headers, so this reads the image the way the loader does. Everything is linked at 0, which is
-what makes the addresses in the code comparable with a relocatable object's.
+An eboot is an ELF64 with Sony's own e_type. Section headers can be absent, so code and data are read through
+the loader segments. Delinked objects retain each function's original byte span and reference identities.
 
 - `read_elf` / `ELF`: the file's PT_LOAD segments, entry point, address→offset.
 - `map_functions`: the functions of the game, from a `functions.jsonl` map next to the file (what the reverse
-  engineering of inFAMOUS Second Son produced: {"a": text offset hex, "s": size, "n": name, "i": import NIDs}),
+  engineering map produced: {"a": text offset hex, "end": exclusive end hex, "n": name}),
   else from Ghidra's analysis.
-- `analyse`: each function's extent, symbol (`func_00000320`, data `D_0009866D0`) and relocations, read with
+- `analyse`: each function's extent, symbol (`func_00000320`, data `D_00002000`) and relocations, read with
   capstone: calls and jumps to other functions, rip-relative data addresses, absolute immediates in the image.
 - `units`: source files, runs of about 4 KiB of neighbouring functions.
 - `create`: the project itself (project_template/), built once with the pinned clang.
@@ -16,6 +15,7 @@ what makes the addresses in the code comparable with a relocatable object's.
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import os
@@ -24,6 +24,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from decompnet.hostenv import NO_WINDOW
 from ...forks.project import ForkError
 
 PT_LOAD = 1
+PT_SCE_RELRO = 0x61000010  # loader-mapped, file-backed read-only data (including GOT slots)
 PF_X = 0x1
 EM_X86_64 = 62
 HEAD_BYTES = 64
@@ -42,6 +44,7 @@ HEAD_BYTES = 64
 # ELF64 relocation types this writes into the target objects (objdiff masks the bytes they fill, so a function's
 # absolute address in the game and the C's symbol both compare as "relocated")
 R_X86_64_64, R_X86_64_PC32, R_X86_64_PLT32, R_X86_64_32, R_X86_64_32S = 1, 2, 4, 10, 11
+R_X86_64_PC8 = 15
 
 UNIT_BYTES = 0x1000
 TEMPLATE = Path(__file__).with_name("project_template")
@@ -57,7 +60,7 @@ ERROR_TAIL = 1500
 
 TYPES_H = """/* Basic types for this decompilation (x86-64, clang 5.0.2, written in C). Agents add structs and prototypes here
  * or in new headers next to it. The game's functions are func_<address> and its data D_<address>: write them with
- * those names, as C, and the build gives them the original's symbols. Data: `extern int D_9866D0;`. */
+ * those names, as C, and the build gives them the original's symbols. Data: `extern int D_00002000;`. */
 #ifndef COMMON_H
 #define COMMON_H
 
@@ -121,7 +124,8 @@ class ELF:
 
     def read(self, addr: int, n: int) -> bytes:
         off = self.offset(addr)
-        return b"" if off is None else self.data[off:off + n]
+        segment = self.segment_at(addr)
+        return b"" if off is None or n < 0 else self.data[off:off + min(n, segment.filesz - (addr - segment.va))]
 
     def contains(self, addr: int) -> bool:
         s = self.segment_at(addr)
@@ -139,32 +143,41 @@ def read_elf(data: bytes) -> ELF:
     e_type = struct.unpack_from("<H", data, 16)[0]
     entry, phoff = struct.unpack_from("<QQ", data, 24)
     phentsize, phnum = struct.unpack_from("<HH", data, 54)
-    if not phoff or not phnum or phoff + phentsize * phnum > len(data):
+    if phentsize < 56 or not phoff or not phnum or phoff + phentsize * phnum > len(data):
         raise ForkError("this ELF's program headers are missing or past the end of the file")
     segments = []
     for i in range(phnum):
         at = phoff + phentsize * i
         p_type, p_flags, p_offset, p_vaddr, _, p_filesz, p_memsz, _ = struct.unpack_from("<IIQQQQQQ", data, at)
-        if p_type != PT_LOAD:
+        if p_type not in (PT_LOAD, PT_SCE_RELRO):
             continue
+        if p_filesz > p_memsz or (p_filesz and p_offset + p_filesz > len(data)):
+            raise ForkError("this ELF has a truncated or invalid load segment")
         segments.append(Segment(p_vaddr, p_offset, p_filesz, p_memsz, p_flags))
     if not segments:
         raise ForkError("this ELF has no PT_LOAD segments")
     return ELF(data, entry, e_type, segments)
 
 
+def host_error() -> str:
+    """The public compiler and generated builds run only inside the Linux x86-64 app."""
+    from ... import toolchains
+
+    if toolchains.current_platform() == toolchains.LINUX:
+        return ""
+    return ("PS4 projects need the Linux app on x86-64. On Windows, run the Linux app inside WSL 2; "
+            "the Windows and macOS apps cannot build PS4 projects.")
+
+
 def clang_path() -> Path | None:
-    """The pinned clang 5.0.2 this project builds with: DECOMP_PS4_CLANG, or one of the places it is installed."""
-    for candidate in (os.environ.get("DECOMP_PS4_CLANG"), "/opt/llvm-5.0.2-globalguard/bin/clang",
-                      "/opt/clang-5.0.2/bin/clang", shutil.which("clang-5.0"), shutil.which("clang-5.0.2")):
-        if candidate and Path(candidate).is_file():
-            return Path(candidate)
-    for pattern in ("*/.hermes/cache/scratch/clangs/clang+llvm-5.0.2*/bin/clang",
-                    "*/dev/clangs/clang+llvm-5.0.2*/bin/clang"):
-        hits = sorted(Path("/home").glob(pattern))
-        if hits:
-            return hits[0]
-    return None
+    """Only the registered, checksum-verified compiler; never a host clang from PATH."""
+    from ... import toolchains
+
+    if error := host_error():
+        raise ForkError(error)
+    if toolchains.installed("clang-5.0.2") is None:
+        return None
+    return toolchains.binary("clang-5.0.2")
 
 
 def write_atomic(path: Path, text: str) -> None:
@@ -178,11 +191,11 @@ def game_info(path: Path) -> dict:
     data = path.read_bytes()
     elf = read_elf(data)
     stem = re.sub(r"[^a-z0-9]+", "", path.stem.lower()) or "game"
-    title = path.stem if path.stem.lower() != "eboot" else (path.parent.name or path.stem)
+    title = path.stem if path.stem.lower() != "eboot" else "PS4 game"
     return {"platform": "ps4", "id": stem, "title": title, "region": "PS4",
             "sha1": hashlib.sha1(data).hexdigest(), "entry": elf.entry, "e_type": elf.e_type,
             "segments": len(elf.segments),
-            "compiler": "clang-5.0.2", "compiler_why": "the game's code is clang's, pinned by fingerprint"}
+            "compiler": "clang-5.0.2", "compiler_why": "starting compiler; verify its version and flags against the game"}
 
 
 # ---------------------------------------------------------------------------------------------------- functions
@@ -196,26 +209,28 @@ class Function:
     relocs: list[tuple[int, int, str | None, int]] = field(default_factory=list)  # (offset, type, symbol, addend)
 
 
-_NOP_BYTES = frozenset({0x90, 0xCC})  # one-byte nop and int3: what alignment padding is made of
-_NOP_PARTS = frozenset({0x90, 0xCC, 0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00})  # the 1..11-byte nop encodings clang emits
-
 
 def is_padding(blob: bytes) -> bool:
     """A run that is nothing but alignment nops. Function maps list some of these as functions because a scan saw
     a call or a boundary there; no C can be them, since even an empty function is a `ret`."""
     if not blob or len(blob) > 64:
         return False
-    if all(b in _NOP_BYTES for b in blob):
-        return True
-    return b"\x0f\x1f" in blob and all(b in _NOP_PARTS for b in blob)
+    instructions = list(capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64).disasm(blob, 0))
+    return (sum(ins.size for ins in instructions) == len(blob)
+            and all(ins.mnemonic in ("nop", "int3") for ins in instructions))
 
 
-def map_functions(game: Path, text: Segment, data: bytes | None = None) -> list[dict] | None:
+def map_functions(game: Path, text: Segment, data: bytes | None = None, *, log=print) -> list[dict] | None:
     """The game's functions from a functions.jsonl beside it (offsets in the executable segment), else None.
     With `data`, entries that are only alignment padding are dropped: they are not functions and no C is them."""
-    candidates = [game.parent / "functions.jsonl", game.parent / "functions" / "functions.jsonl",
-                  game.with_suffix(".functions.jsonl"), *sorted(game.parent.glob("*/functions.jsonl")),
-                  *sorted(game.parent.glob("*/*/functions.jsonl"))]
+    candidates = [game.with_suffix(".functions.jsonl"), game.parent / "functions.jsonl",
+                  game.parent / "functions" / "functions.jsonl"]
+    extras = sorted(p for p in game.parent.iterdir() if p.is_file()
+                    and (p.name.lower().endswith(".functions.jsonl") or p.name.lower() == "functions.jsonl"))
+    if not any(p.is_file() for p in candidates):
+        if len(extras) > 1:
+            raise ForkError("more than one function map is beside this program: keep one, or name it functions.jsonl")
+        candidates.extend(extras)
     for candidate in candidates:
         if not candidate.is_file():
             continue
@@ -228,16 +243,33 @@ def map_functions(game: Path, text: Segment, data: bytes | None = None) -> list[
             try:
                 row = json.loads(line)
                 start = int(row["a"], 16)
-                size = int(row["s"])
+                # The legacy s field counts body addresses, not its span when blocks have gaps.
+                # Fall back to Ghidra rather than manufacturing a truncated target.
+                if "end" not in row:
+                    log(f"{candidate}: legacy function map has no end addresses; using Ghidra")
+                    return None
+                end_value = row["end"]
+                end = int(end_value, 16) if isinstance(end_value, str) else int(end_value)
+                size = end - start
             except (ValueError, KeyError, TypeError):
                 continue
-            if size <= 0:
-                continue
+            if start < 0 or size <= 0 or start + size > text.filesz:
+                raise ForkError(f"{candidate}: function extent is outside the executable segment")
             if data is not None and is_padding(data[text.offset + start: text.offset + start + size]):
                 padding += 1
                 continue
+            try:
+                ranges = []
+                for a, b in row.get("ranges", []):
+                    lo, hi = (int(v, 16) if isinstance(v, str) else int(v) for v in (a, b))
+                    if lo < 0 or hi <= lo or hi > text.filesz:
+                        raise ValueError("range outside code")
+                    ranges.append([text.va + lo, text.va + hi])
+            except (ValueError, TypeError, OverflowError):
+                raise ForkError(f"{candidate}: invalid function body ranges; use [start, end] offsets inside the executable segment") from None
             out.append({"entry": text.va + start, "end": text.va + start + size,
-                        "name": row.get("n") or "", "source": "map", "imports": row.get("i") or []})
+                        "name": row.get("n") or "", "source": "map",
+                        "ranges": ranges})
         if padding:
             log(f"the map lists {padding} entries that are only alignment padding: dropped, they are not functions")
         if out:
@@ -249,24 +281,50 @@ def _symbol_for(addr: int, names: dict[int, str]) -> str:
     return names.get(addr) or f"D_{addr:08X}"
 
 
-def analyse(elf: ELF, found: list[dict]) -> list[Function]:
+def analyse(elf: ELF, found: list[dict], *, log=print) -> list[Function]:
     """Every function's extent, name and relocations, from the map's (or Ghidra's) function list."""
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
     md.detail = True
-    text = elf.text
     rows: dict[int, dict] = {}
     for r in found:
         start = int(r["entry"])
-        if r.get("thunk") or not elf.contains(start) or elf.offset(start) is None:
+        if not elf.contains(start) or not elf.segment_at(start).flags & PF_X:
             continue
         rows[start] = r
     starts = sorted(rows)
+    # Alignment-only map entries do not delimit another function's body.
+    boundaries = [s for s in starts if not is_padding(elf.read(s, int(rows[s].get("end") or s + 1) - s))]
     names = {s: f"func_{s:08X}" for s in starts}
+    used = set(names.values())
+    for start in starts:
+        name = rows[start].get("name", "") if rows[start].get("source") == "map" else ""
+        if isinstance(name, str) and name and _IDENT.fullmatch(name) and name not in used:
+            used.discard(names[start])
+            names[start] = name
+            used.add(name)
     out = []
-    for i, start in enumerate(starts):
-        limit = min(starts[i + 1] if i + 1 < len(starts) else text.end, text.end)
-        end = max(start + 1, min(int(rows[start].get("end") or limit), limit))
-        code = elf.read(start, end - start)
+    for start in starts:
+        next_index = bisect.bisect_right(boundaries, start)
+        segment = elf.segment_at(start)
+        file_end = segment.va + segment.filesz
+        limit = min(boundaries[next_index], file_end) if next_index < len(boundaries) else file_end
+        end = int(rows[start].get("end") or limit)
+        body_ranges = rows[start].get("ranges")
+        if body_ranges:
+            # Ghidra includes shared tails belonging to earlier/later functions. Keep the
+            # entry's local extent; references to those other bodies remain relocations.
+            local = [[max(lo, start), min(hi, limit)] for lo, hi in body_ranges if hi > start and lo < limit]
+            if not local:
+                log(f"skipping function 0x{start:X}: no body at its entry")
+                continue
+            if any(hi > limit for lo, hi in body_ranges if hi > start and lo < limit):
+                log(f"trimming overlapping body at 0x{start:X} to 0x{limit:X}")
+            end = max(hi for lo, hi in local)
+        elif end > limit:
+            log(f"trimming overlapping function at 0x{start:X} to 0x{limit:X}")
+            end = limit
+        if end <= start or end > file_end:
+            raise ForkError(f"invalid function extent at 0x{start:X}: end 0x{end:X}")
         fn = Function(start, end - start, names[start])
 
         def symbol(addr: int, start: int = start, end: int = end) -> tuple[str, int]:
@@ -274,10 +332,18 @@ def analyse(elf: ELF, found: list[dict]) -> list[Function]:
                 return "", addr - start  # inside this function: a label, not a relocation
             return _symbol_for(addr, names), 0
 
-        insn_starts: set[int] = set()
-        for ins in md.disasm(code, start):
-            insn_starts.add(ins.address - start)
-        for ins in md.disasm(code, start):
+        ranges = local if body_ranges else [[start, end]]
+        instructions = []
+        for lo, hi in ranges:
+            if hi > end or hi <= lo:
+                raise ForkError(f"invalid body range for function 0x{start:X}")
+            # Ghidra can include a shared return belonging to an earlier function.
+            # This symbol starts at entry; its outgoing branch remains a relocation.
+            if hi <= start:
+                continue
+            lo = max(lo, start)
+            instructions.extend(md.disasm(elf.read(lo, hi - lo), lo))
+        for ins in instructions:
             at = ins.address - start
             ops = ins.operands
             if (x86.X86_GRP_CALL in ins.groups or x86.X86_GRP_JUMP in ins.groups) and ops \
@@ -286,14 +352,19 @@ def analyse(elf: ELF, found: list[dict]) -> list[Function]:
                 if not start <= target < end and elf.contains(target):
                     name, _ = symbol(target)
                     # PC32, not PLT32: objdiff's x86 reader rejects PLT32 as an inline relocation
-                    fn.relocs.append((at + ins.size - 4, R_X86_64_PC32, name, 0))
+                    if ins.imm_size not in (1, 4):
+                        raise ForkError(f"unsupported branch displacement at 0x{ins.address:X}")
+                    kind = R_X86_64_PC8 if ins.imm_size == 1 else R_X86_64_PC32
+                    fn.relocs.append((at + ins.imm_offset, kind, name, -ins.imm_size))
                 continue
             for op in ops:
                 if op.type == x86.X86_OP_MEM and op.mem.base == x86.X86_REG_RIP and ins.disp_size == 4:
                     target = ins.address + ins.size + op.mem.disp
-                    if elf.contains(target):
+                    # BSS has runtime addresses but no file bytes. Relocate references to
+                    # mapped memory without making those addresses readable from the ELF.
+                    if elf.segment_at(target) is not None:
                         name, addend = symbol(target)
-                        fn.relocs.append((at + ins.disp_offset, R_X86_64_PC32, name, addend))
+                        fn.relocs.append((at + ins.disp_offset, R_X86_64_PC32, name, addend - (ins.size - ins.disp_offset)))
                 elif op.type == x86.X86_OP_IMM:
                     # a 64-bit immediate (movabs) that names a function or lands in the data segment is an address:
                     # relocate it (its field is 2 bytes into the instruction, never at a boundary, which is what
@@ -304,38 +375,22 @@ def analyse(elf: ELF, found: list[dict]) -> list[Function]:
                             (op.imm in names or (seg is not None and not seg.flags & PF_X)):
                         name, addend = symbol(op.imm)
                         fn.relocs.append((at + ins.imm_offset, R_X86_64_64, name, addend))
-        # a relocation at an instruction's first byte reads as inline data to objdiff's x86 reader (it refuses
-        # those), and those offsets are the reader's, not a field: leave the bytes as they are
-        fn.relocs = [r for r in fn.relocs if r[0] not in insn_starts]
         fn.relocs.sort()
         out.append(fn)
     return out
 
 
 
-def prune_unit_relocs(elf: ELF, functions: list[Function]) -> None:
-    """Drop relocations that land on an instruction's first byte, read as objdiff reads the unit: it disassembles a
-    whole source file's section in one stream, so an offset that looks like a field inside one function can be the
-    first byte of an instruction once the file's bytes are read from its start. objdiff refuses those ("unsupported
-    inline x86 relocation"), and a field there would zero a byte the instruction needs."""
-    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
-    start = functions[0].addr
-    end = max(fn.addr + fn.size for fn in functions)
-    starts = {i.address - start for i in md.disasm(elf.read(start, end - start), 0)}
-    for fn in functions:
-        base = fn.addr - start
-        fn.relocs = [r for r in fn.relocs if base + r[0] not in starts]
-
-
 GAP_BYTES = 0x400  # a hole this big between functions means another region of code, not padding
 
 
-def units(functions: list[Function]) -> dict[str, list[Function]]:
+def units(functions: list[Function], elf: ELF | None = None) -> dict[str, list[Function]]:
     """Source files: runs of neighbouring functions of about UNIT_BYTES each."""
     out: dict[str, list[Function]] = {}
     cur: list[Function] = []
     for fn in functions:
-        if cur and (fn.addr + fn.size - cur[0].addr > UNIT_BYTES or fn.addr - (cur[-1].addr + cur[-1].size) > GAP_BYTES):
+        if cur and (fn.addr + fn.size - cur[0].addr > UNIT_BYTES or fn.addr - (cur[-1].addr + cur[-1].size) > GAP_BYTES
+                    or (elf is not None and elf.offset(fn.addr) - elf.offset(cur[-1].addr) != fn.addr - cur[-1].addr)):
             out[f"text_{cur[0].addr:08X}"] = cur
             cur = []
         cur.append(fn)
@@ -367,7 +422,7 @@ def read_data(root: Path, manifest: dict, name: str, length: int = READ_DEFAULT_
     """The bytes at a D_<address> of the user's copy, the addresses its words point to, and a string or floats."""
     m = re.fullmatch(r"_?D_([0-9A-Fa-f]{6,8})|(?:0x)?([0-9A-Fa-f]{6,8})", name)
     if m is None:
-        raise ForkError(f"`{name}` isn't data by address: PS4 data is named D_<address> (D_9866D0)")
+        raise ForkError(f"`{name}` isn't data by address: PS4 data is named D_<address> (D_00002000)")
     addr = int(m.group(1) or m.group(2), 16)
     elf = _program(root, manifest)
     seg = elf.segment_at(addr)
@@ -408,6 +463,9 @@ def rename(fp, version: str, old: str, new: str) -> dict:
             if fn.get("name") == old:
                 fn["name"] = new
                 hit = True
+            for reloc in fn.get("relocs", []):
+                if reloc[2] == old:
+                    reloc[2] = new
     if not hit:
         raise ForkError(f"{old} isn't a function in config/{version}/functions.json: only the game's functions "
                         f"(func_<address>) can be renamed for now, not its data")
@@ -426,14 +484,31 @@ def _run(cmd: list[str], root: Path, what: str, log) -> None:
         raise ForkError(f"{what} failed:\n{tail[-ERROR_TAIL:]}")
 
 
+def ghidra_functions(game: Path, elf: ELF) -> list[dict]:
+    """Stock Ghidra needs a standard ELF type; only its disposable input is changed (#92)."""
+    from ...forks import ghidra
+    from . import ET_SCE_DYNEXEC, ET_SCE_EXEC
+
+    if elf.e_type not in (ET_SCE_EXEC, ET_SCE_DYNEXEC):
+        return ghidra.functions(game)
+    with tempfile.TemporaryDirectory(prefix="decomp-ps4-") as tmp:
+        target = Path(tmp) / game.name
+        data = bytearray(elf.data)
+        struct.pack_into("<H", data, 16, 3 if elf.e_type == ET_SCE_DYNEXEC else 2)
+        target.write_bytes(data)
+        return ghidra.functions(target)
+
+
 def create(root: Path, game: Path, *, compiler: str | None = None, log=print) -> dict:
     """Make the project in `root` (which must not exist yet) and build it once. Returns facts about the game."""
     from ...forks import ghidra
 
     clang = clang_path()
     if clang is None:
-        raise ForkError("PS4 projects build with clang 5.0.2, pinned by fingerprint: point DECOMP_PS4_CLANG at it, "
+        raise ForkError("PS4 projects need the pinned Clang 5.0.2: install it in Compilers & tools, "
                         "then try again")
+    if compiler not in (None, "clang-5.0.2"):
+        raise ForkError(f"unsupported PS4 compiler {compiler!r}; choose clang-5.0.2")
     info = game_info(game)
     version = info["id"]
     data = game.read_bytes()
@@ -441,23 +516,21 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print) ->
     text = elf.text
     log(f"reading {game.name}: {len(elf.segments)} segments, code at 0x{text.va:X} ({text.filesz} bytes)")
 
-    found = map_functions(game, text, data)
+    found = map_functions(game, text, data, log=log)
     if found:
         log(f"using the function map beside the game: {len(found)} functions")
     else:
         if not ghidra.available():
             raise ForkError("no functions.jsonl map beside the game and no Ghidra to find them: put one there "
-                            "({\"a\": offset hex, \"s\": size, \"n\": name} per line) or install Ghidra in Setup")
+                            "({\"a\": offset hex, \"end\": exclusive end hex, \"n\": name} per line) or install Ghidra in Setup")
         log(f"analysing {game.name} with Ghidra (finds every function; a big game takes a few minutes)")
-        found = ghidra.functions(game)
+        found = ghidra_functions(game, elf)
         if not found:
             raise ForkError("neither a function map nor Ghidra found functions in this program")
-    functions = analyse(elf, found)
+    functions = analyse(elf, found, log=log)
     if not functions:
         raise ForkError("the function map gave no function in this program's code")
-    groups = units(functions)
-    for fns in groups.values():
-        prune_unit_relocs(elf, fns)
+    groups = units(functions, elf)
     log(f"{len(functions)} functions in {len(groups)} source files")
 
     shutil.copytree(TEMPLATE, root)
@@ -472,7 +545,7 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print) ->
     conf = root / "config" / version
     conf.mkdir(parents=True)
     (conf / "functions.json").write_text(json.dumps({
-        "elf": f"orig/{version}.elf", "sha1": info["sha1"], "image_base": 0, "entry": elf.entry,
+        "target_format_version": 4, "elf": f"orig/{version}.elf", "sha1": info["sha1"], "image_base": min(s.va for s in elf.segments), "entry": elf.entry,
         "text": {"va": text.va, "offset": text.offset, "size": text.filesz},
         "units": {u: [{"name": f.name, "addr": f.addr, "offset": elf.offset(f.addr), "size": f.size,
                        "relocs": [list(r) for r in f.relocs]} for f in fns] for u, fns in groups.items()},
@@ -486,7 +559,7 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print) ->
     log(f"{len(groups)} source files for agents to write into")
 
     args = ["--clang", str(clang)]
-    for cmd in ([sys.executable, "tools/configure.py", version, *args], ["ninja", "prepare"]):
+    for cmd in ([sys.executable, "tools/configure.py", version, *args], [str(Path(sys.executable).with_name("ninja")) if Path(sys.executable).with_name("ninja").is_file() else "ninja", "prepare"]):
         _run(cmd, root, "the first build", log)
     if not (root / "objdiff.json").exists():
         raise ForkError("the first build finished without writing objdiff.json")
@@ -497,7 +570,7 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print) ->
         "setup": [["python", "tools/configure.py", version, *args], ["ninja", "prepare"]],
     }, indent=2), encoding="utf-8")
     (root / ".gitignore").write_text("# made from your copy of the game, or by the build\norig/\nbuild/\nbuild.ninja\n"
-                                     ".ninja_*\nobjdiff.json\n__pycache__/\n.decomp-wtf/\n", encoding="utf-8")
+                                     ".ninja_*\nbuild.ninja.lock\nobjdiff.json\n__pycache__/\n.decomp-wtf/\n", encoding="utf-8")
     (root / "README.md").write_text(f"""# {info['title']} decompilation
 
 Started from scratch with [decompdecomp](https://github.com/n-delic/decompdecomp): the game's functions are cut out of
@@ -507,9 +580,8 @@ your own `eboot.elf` into ELF64 objects and compared, function by function, with
 2. `python tools/configure.py {version} --clang <clang 5.0.2>`, then `ninja`.
 3. Decompiled code goes in `src/`; `objdiff.json` shows each function's progress.
 
-Compiler: clang 5.0.2 with `-O2 -mavx -fno-omit-frame-pointer -fPIE -mllvm -x86-use-vzeroupper=0`, which is what the
-game was built with as far as measurement can tell (14/20 hand-transcribed functions byte-identical, 18/20 the same
-instruction set). `config/{version}/functions.json` holds every function's address, size, symbol and relocations.
+Compiler: the pinned public clang 5.0.2 with the PS4 target and freestanding headers.
+See `tools/compiler_flags.py` for the starting flags; verify them against this game. `config/{version}/functions.json` holds every function's address, size, symbol and relocations.
 """, encoding="utf-8")
     if shutil.which("git"):
         for cmd in (["git", "init", "-q", "-b", "main"], ["git", "add", "-A"],
@@ -518,3 +590,53 @@ instruction set). `config/{version}/functions.json` holds every function's addre
             subprocess.run(cmd, cwd=root, capture_output=True, creationflags=NO_WINDOW)
     return {"platform": "ps4", "id": version, "title": info["title"], "compiler": "clang-5.0.2",
             "sources": len(groups), "sha1": info["sha1"]}
+
+
+def prune_unit_relocs(elf, functions):
+    """Compatibility hook: keep all independently decoded operand relocations."""
+    return None
+
+
+def split_source(fp, version: str, source: str, at: str, new: str) -> dict:
+    """Partition function records without changing original addresses, bytes or relocations.
+
+    ForkEngine moves the C, rebuilds both files and rolls this configuration back if a protected match is lost.
+    Inheriting the old compiler/flags makes the split neutral before a new compiler is tested on the new file.
+    """
+    if not re.fullmatch(r"[\w-]+", version or ""):
+        raise ForkError("give a valid project version")
+    old_path, new_path = Path(source), Path(new)
+    if any(p.parent != Path("src/auto") or p.suffix != ".c" or not re.fullmatch(r"[\w-]+", p.stem)
+           for p in (old_path, new_path)):
+        raise ForkError("PS4 source splits use C files directly in src/auto")
+    root = Path(fp.root)
+    path = root / "config" / version / "functions.json"
+    text = path.read_text(encoding="utf-8")
+    cfg = json.loads(text)
+    groups = cfg.get("units", {})
+    old, dest = old_path.stem, new_path.stem
+    if old not in groups or dest in groups or (root / new_path).exists():
+        raise ForkError("the old source must exist in the config and the new source must be unused")
+    functions = groups[old]
+    index = next((i for i, fn in enumerate(functions) if fn["name"] == at), -1)
+    if index <= 0:
+        raise ForkError("split at a function after the source file's first function")
+    settings_path = root / "tools" / "compiler_units.json"
+    settings_text = settings_path.read_text(encoding="utf-8") if settings_path.exists() else "{}\n"
+    settings = json.loads(settings_text)
+    if dest in settings:
+        raise ForkError("the new source already has compiler settings; choose another name")
+    groups[old], groups[dest] = functions[:index], functions[index:]
+    saved = {path: text}
+    if old in settings:
+        settings[dest] = settings[old]
+        saved[settings_path] = settings_text
+    try:
+        if settings_path in saved:
+            write_atomic(settings_path, json.dumps(settings, indent=1) + "\n")
+        write_atomic(path, json.dumps(cfg, indent=1) + "\n")
+    except OSError:
+        for changed, previous in saved.items():
+            write_atomic(changed, previous)
+        raise
+    return saved

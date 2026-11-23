@@ -4,12 +4,14 @@ function by any name an agent uses for it, and the identities of the agents that
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import secrets
 import threading
 from pathlib import Path
 
-from ... import consoles
+from ... import consoles, hostenv
 from ...network import Agent, Network, NetworkError, hash_token
 from ...rom import split
 from ...rom.symbols import Symbol, SymbolTable
@@ -52,6 +54,8 @@ class Core(Network):
         self.permuter = Permuter(self)
         from ..rangecheck import RangeChecks
         self.rangechecks = RangeChecks(self)
+        from ..filecompilers import FileCompilers
+        self.filecompilers = FileCompilers(self)
         from ..knowledge import Knowledge
         self.knowledge = Knowledge(self)
         from ..readable import Readability
@@ -59,6 +63,15 @@ class Core(Network):
         from ..drafts import Drafter
         self.drafter = Drafter(self)
         self.find_moved_projects()
+        from ..progress import Progress
+        self.progress = Progress(self)
+
+    def _project(self, slug: str | None):
+        row = super()._project(slug)
+        if hasattr(self, "progress") and self.project_missing(row) is None:
+            self.progress.sync(row["slug"])
+            row = super()._project(row["slug"])
+        return row
 
     @staticmethod
     def cfg(proj) -> dict:
@@ -84,9 +97,32 @@ class Core(Network):
             here = self.workspace / row["slug"]
             if row["root"] and not Path(row["root"]).exists() and here.is_dir():
                 with self.store.tx() as db:
+                    cfg = json.loads(db.execute("SELECT config FROM projects WHERE id=?", (row["id"],)).fetchone()["config"])
+                    old_root = Path(row["root"])
+                    for key in ("progress_folder", "save_folder"):
+                        if cfg.get(key) and Path(cfg[key]).is_relative_to(old_root):
+                            cfg[key] = str(here / Path(cfg[key]).relative_to(old_root))
+                        db.execute("UPDATE projects SET config=? WHERE id=?", (json.dumps(cfg), row["id"]))
                     db.execute("UPDATE projects SET root=? WHERE id=?", (str(here), row["id"]))
                 moved.append(row["slug"])
         return moved
+
+    def project_missing(self, proj) -> str | None:
+        """Why the project's folder isn't on disk, in a sentence, or None when it is there.
+
+        Its folder holds the game and everything made from it, so a project without one can't be opened; its database
+        records are all that is left, and removing the project is the way out. A folder that moved within this
+        workspace is found again by its name first (find_moved_projects): that project isn't missing any more."""
+        root = str(proj["root"] or "")
+        if root and Path(root).is_dir():
+            return None
+        if root and self.find_moved_projects():
+            row = self.store.one("SELECT root FROM projects WHERE id=?", proj["id"])
+            if row is not None and row["root"] and Path(row["root"]).is_dir():
+                return None
+        where = f": {hostenv.shown_path(root)}" if root else ""
+        return (f"Its folder is missing{where}. Put it back where it was (with the game in it), or remove the project "
+                "from decompdecomp: its matches and notes go with its database records.")
 
     def is_rom(self, proj) -> bool:
         return self.cfg(proj).get("kind") == "rom"
@@ -143,8 +179,16 @@ class Core(Network):
         if project_id in self._sym_override:
             return self._sym_override[project_id]
         if project_id not in self._syms:
-            rows = self.store.all("SELECT name, address, size, kind FROM symbols WHERE project_id=?", project_id)
-            self._syms[project_id] = SymbolTable([Symbol(r["name"], r["address"], r["size"], r["kind"]) for r in rows])
+            rows = self.store.all("SELECT s.name, s.address, s.size, s.kind, f.id IS NOT NULL AS fn FROM symbols s "
+                                  "LEFT JOIN functions f ON f.project_id=s.project_id AND f.name=s.name "
+                                  "WHERE s.project_id=?", project_id)
+            table = SymbolTable([Symbol(r["name"], r["address"], r["size"], r["kind"]) for r in rows])
+            # One name per address, as before; a function's own name that the address's other name hid still
+            # resolves. Function names are unique, so two at one address are overlay twins (#117 review).
+            for r in rows:
+                if r["fn"] and r["name"] not in table.by_name:
+                    table.alias(Symbol(r["name"], r["address"], r["size"], r["kind"]))
+            self._syms[project_id] = table
         return self._syms[project_id]
 
     def _rom(self, proj) -> tuple[bytes, list[split.Segment]]:
@@ -155,20 +199,34 @@ class Core(Network):
             self._roms[proj["id"]] = (rom, segs)
         return self._roms[proj["id"]]
 
-    def reader(self, proj):
+    def reader(self, proj, fn=None):
+        """Read helpers and constants from the caller's overlay, then unambiguous shared segments."""
         rom, segs = self._rom(proj)
+        preferred = []
+        if fn is not None and fn["rom_offset"] is not None:
+            preferred = [s for s in segs if s.contains(fn["vram"], fn["size"]) and
+                         s.rom_start + fn["vram"] - s.vram == fn["rom_offset"]]
 
         def read(addr: int, n: int) -> bytes | None:
-            for seg in segs:
-                if seg.contains(addr, n):
-                    at = seg.rom_start + addr - seg.vram
-                    return rom[at:at + n]
+            candidates = [s for s in preferred if s.contains(addr, n)]
+            if not candidates:
+                candidates = [s for s in segs if s.contains(addr, n)]
+            offsets = {s.rom_start + addr - s.vram for s in candidates}
+            # None means unbacked memory to the linker and skips verification. Ambiguity must fail instead.
+            if fn is not None and len(offsets) > 1:
+                raise NetworkError(f"Cannot verify bytes at 0x{addr:X}: multiple ROM overlays cover this address "
+                                   "and the caller's ROM offset does not select one.")
+            if candidates:
+                at = candidates[0].rom_start + addr - candidates[0].vram
+                return rom[at:at + n]
             return None
         return read
 
     def _function(self, name: str, project: str | None):
         """Functions can also be named by address (0x80001234), handy for agents reading assembly, and the way
         agents write names they read elsewhere (see _loose_functions)."""
+        if project:
+            self._project(project)
         m = _ADDRESS.match(name.strip()) if name else None
         if m:
             proj = self._project(project)
@@ -224,9 +282,10 @@ class Core(Network):
         like = sym.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         rows = self.store.all(
             "SELECT * FROM functions WHERE project_id=? AND (name=? OR substr(name,1,?)=? "
-            "OR json_extract(meta,'$.symbol')=? OR substr(json_extract(meta,'$.demangled'),1,?)=? "
+            "OR json_extract(meta,'$.symbol')=? OR json_extract(meta,'$.real')=? "  # (a PC game's: rename_symbol)
+            "OR substr(json_extract(meta,'$.demangled'),1,?)=? "
             "OR json_extract(meta,'$.demangled') LIKE ? ESCAPE '\\') ORDER BY name",
-            proj["id"], sym, len(sym) + 1, sym + "@", sym, len(sym) + 1, sym + "(", f"% {like}(%")
+            proj["id"], sym, len(sym) + 1, sym + "@", sym, sym, len(sym) + 1, sym + "(", f"% {like}(%")
         if not rows and "::" not in sym and len(sym) >= 4:  # a method by its own name: Class::sym
             rows = self.store.all("SELECT * FROM functions WHERE project_id=? AND json_extract(meta,'$.demangled') "
                                   "LIKE ? ESCAPE '\\' ORDER BY name", proj["id"], f"%::{like}(%")
@@ -269,11 +328,19 @@ class Core(Network):
             cfg = json.loads(db.execute("SELECT config FROM projects WHERE id=?", (proj["id"],)).fetchone()["config"])
             change(cfg)
             db.execute("UPDATE projects SET config=? WHERE id=?", (json.dumps(cfg), proj["id"]))
+        self.progress.sync(slug, force=True)
         return cfg
 
     def local_agent(self, name: str) -> tuple[Agent, str]:
         """An agent identity for one runner on this machine (created on first use)."""
         row = self.store.one("SELECT id FROM agents WHERE name=?", name)
+        # Saves can credit room members (@name) or older helpers with long names. Those labels aren't valid
+        # new runner names; keep existing identities, and give new ones a stable name without merging credits.
+        if row is None and (not name or len(name) > 40 or not all(c.isalnum() or c in "-_." for c in name)):
+            suffix = hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
+            label = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-._") or "restored"
+            name = f"{label[:27]}-{suffix}"
+            row = self.store.one("SELECT id FROM agents WHERE name=?", name)
         if row is not None:
             token = "dn_" + secrets.token_urlsafe(24)
             with self.store.tx() as db:

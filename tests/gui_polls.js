@@ -36,15 +36,22 @@ function fetch(url) {
 }
 
 const toasts = [], errors = [];
+const savedLocal = new Map();  // localStorage: the GUI keeps its own choices there (base.js, pages.js, agents.js)
 process.on("unhandledRejection", (e) => errors.push(String(e && e.stack || e)));
 const ctx = {
   console, fetch, Promise, Map, Set, JSON, Math, Date, Object, Array, String, Number, Symbol, Error, RegExp, Uint8Array, URLSearchParams,
   setTimeout: () => 0, clearTimeout: () => {}, setInterval: () => 0, clearInterval: () => {},
-  requestAnimationFrame: () => 0, performance: { now: () => 0 }, localStorage: stub(), navigator: stub(), URLSearchParams,
+  requestAnimationFrame: () => 0, performance: { now: () => 0 }, navigator: stub(), URLSearchParams,
+  localStorage: {
+    getItem: (key) => (savedLocal.has(String(key)) ? savedLocal.get(String(key)) : null),
+    setItem: (key, value) => savedLocal.set(String(key), String(value)),
+    removeItem: (key) => savedLocal.delete(String(key)),
+  },
   matchMedia: () => stub(), getComputedStyle: () => stub(), location: { hash: "", href: "" }, confirm: () => false,
   addEventListener: () => {}, scrollTo: () => {}, devicePixelRatio: 1, document: stub(),
 };
 ctx.window = ctx;
+ctx.costs = [];  // /api/modelcosts rows: the model advice check below sets them
 const now = Date.now() / 1000;
 const overview = (slug) => ({
   slug, title: slug, kind: "rom", platform: "ps2", platform_name: "PlayStation 2", ready: true, rom: { game_code: "X" },
@@ -61,6 +68,7 @@ answers["/api/agents/detected"] = () => [];
 answers["/api/mapcolumns"] = () => ({ keys: ["vram", "cc", "ccx"], rows: [] });
 answers["/api/knowledge"] = () => ({ auto: false, items: [] });
 answers["/api/stats"] = () => ({ agents: [], matches_per_hour: new Array(24).fill(0), compiles_last_hour: 0 });
+answers["/api/modelcosts?slug="] = () => ctx.costs;
 answers["/api/project?slug="] = (url) => overview(url.split("=")[1]);
 answers["/api/map?slug="] = () => ({ sig: "s", keys: ["name", "vram"], rows: [] });
 answers["/api/live?slug=a"] = () => live("a", []);
@@ -73,6 +81,8 @@ answers["/api/events"] = (url) => {
   return after == null ? { last, events: [] } : { last, events: feed.filter((e) => e.id > Number(after)) };
 };
 
+// the server's consoles (/api/state's), as tests/test_gui.py's fixture describes them: the drop's pack table is theirs
+ctx.SERVER_CONSOLES = JSON.parse(process.env.GUI_CONSOLES || "[]");
 vm.createContext(ctx);
 // GUI_JS: another copy of the scripts (an older one, to see the test fail there)
 const js = process.env.GUI_JS || path.join(__dirname, "..", "src", "decompnet", "app", "static", "js");
@@ -114,6 +124,28 @@ const settle = async () => { for (let i = 0; i < SETTLE_TICKS; i++) await tick()
   await settle();
   const notes = vm.runInContext("N.live.map((x) => x.el.innerHTML.replace(/<[^>]+>/g, '').replace(/\\s+/g, ' ').trim())", ctx);
   const unread = vm.runInContext("N.unread", ctx);
+  // a 32-bit Windows program's first 0x400 bytes, made by hand: the DOS header, a Rich header of [product id, build,
+  // files] entries XORed with its key, the PE header with the linker's [major, minor] version (h.used: its length)
+  vm.runInContext(`function pcProgram(rich, linker) {
+    const key = [0x5a, 0x17, 0x3c, 0x91], bytes = [0x4d, 0x5a, ...new Array(0x3e + 0x40).fill(0)];
+    if (rich.length) {
+      const plain = [..."DanS"].map((c) => c.charCodeAt(0)).concat(new Array(12).fill(0));
+      for (const [product, build, count] of rich) {
+        const w = [((product << 16) | build) >>> 0, count];
+        for (const v of w) plain.push(v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, v >>> 24);
+      }
+      bytes.push(...plain.map((b, i) => b ^ key[i % 4]), 0x52, 0x69, 0x63, 0x68, ...key);
+    }
+    while (bytes.length % 8) bytes.push(0);
+    const pe = bytes.length;
+    bytes.push(0x50, 0x45, 0, 0, 0x4c, 0x01, 3, 0, ...new Array(12).fill(0), 0xe0, 0, 0x02, 0x01);
+    bytes.push(0x0b, 0x01, ...linker, ...new Array(0xe0 - 4).fill(0));
+    const h = new Uint8Array(0x400);
+    h.set(bytes);
+    h[0x3c] = pe;
+    h.used = bytes.length;
+    return h;
+  }`, ctx);
   // the page's small pure helpers, for tests of their own
   const checks = vm.runInContext(`({
     repo: ["", "hello", "git@github.com:zeldaret/oot.git", "https://example.com/owner/repo", "https://github.com/zeldaret/oot",
@@ -134,11 +166,118 @@ const settle = async () => { for (let i = 0; i < SETTLE_TICKS; i++) await tick()
       S.ov = before;
       return { guest, host, alone };
     })(),
+    ps4: (() => {
+      const h = new Uint8Array(64), dv = new DataView(h.buffer);
+      h.set([0x7f, 0x45, 0x4c, 0x46, 2, 1]);
+      dv.setUint16(18, 62, true);
+      const file = { name: "eboot.elf", size: 256 };
+      return [0xfe10, 0xfe04, 2, 0xfe18].map((type) => {
+        dv.setUint16(16, type, true);
+        return identifyHead(h, file)?.platform ?? null;
+      });
+    })(),
     dropped: (() => {
       const head = (at, text) => { const h = new Uint8Array(0x10000); [...text].forEach((c, i) => (h[at + i] = c.charCodeAt(0))); return h; };
       const file = { name: "SLUS_000.01", size: 0x10000 };
       return [identifyHead(head(0, "PS-X EXE"), file).platform, identifyHead(head(0x9319, "CD001"), file).platform,
               platformName("playstation"), notSupported(head(0, "PS-X EXE"), file)];
+    })(),
+    // Windows programs: a 64-bit one (which the PC console starts now), one for another processor, a 32-bit one, a
+    // DOS one, and a 64-bit one whose optional header is a 32-bit program's (a damaged header)
+    windows: [0x8664, 0xaa64, 0x14c, null, -0x8664].map((machine) => {
+      const h = new Uint8Array(0x200), dv = new DataView(h.buffer);
+      h.set([0x4d, 0x5a]);
+      if (machine !== null) {
+        dv.setUint32(0x3c, 0x80, true); h.set([0x50, 0x45, 0, 0], 0x80); dv.setUint16(0x84, Math.abs(machine), true);
+      }
+      if (machine === 0x14c || machine === -0x8664) dv.setUint16(0x98, 0x10b, true);
+      if (machine === 0x8664) {  // PE32+: its entry at 0x1000, its image base the usual 0x140000000
+        dv.setUint16(0x98, 0x20b, true); dv.setUint32(0xa8, 0x1000, true);
+        dv.setUint32(0xb0, 0x40000000, true); dv.setUint32(0xb4, 1, true);
+      }
+      const file = { name: "game.exe", size: 0x200 };
+      const info = identifyHead(h, file);
+      return [info?.platform ?? null, notSupported(h, file),
+              info && [info.order, hex8(info.entry), info.pack, packOf(info), info.target]];
+    }),
+    // the Visual C++ pack a dropped program asks for, from its Rich header or linker version: [head as hex, pack, what
+    // the drop says]. tests/test_gui.py asks scratch.describe about the same bytes
+    pcPack: (S.st = { ...(S.st || {}), consoles: SERVER_CONSOLES }, [
+             [[0xab, 40219, 503], [0xaa, 40219, 171], [0x30, 9044, 121], [0x9d, 40219, 1]],
+             [[0x0a, 8047, 169], [0x0b, 8966, 148], [0x0b, 8447, 38], [0x13, 8034, 23]],
+             [[0x5d, 3077, 40], [0x5f, 3077, 300], [0x78, 50727, 1]],  // 2003's code, linked by 2005's linker
+             [[0x6d, 50727, 30], [0x0b, 8168, 10]],  // no linker entry: the version that built the most files
+             [], [[0x01, 0, 5]],
+             [[0x105, 27027, 300], [0x102, 27027, 1]],  // 2017's own build
+             [[0x105, 24210, 300], [0x102, 24210, 1]],  // 2015's: the nearest pack, 2017's
+             [[0xe1, 40629, 300], [0xde, 40629, 1]],  // 2013's: still 2010's
+             [], [[0x105, 30137, 300], [0x102, 30137, 1]]].map((rich, k) => {
+      const h = pcProgram(rich, { 4: [9, 0], 9: [14, 16] }[k] || [6, 0]);
+      const info = identifyHead(h, { name: "game.exe", size: 0x400 });
+      const hex = [...h.slice(0, h.used)].map((b) => b.toString(16).padStart(2, "0")).join("");
+      return [hex, info.pack, packOf(info), info.target];
+    })),
+    // a PSP's UMD image and programs are told apart from the PS2's; what can't be read yet says what to do instead
+    psp: (() => {
+      const head = (writes) => {
+        const h = new Uint8Array(0x9400), dv = new DataView(h.buffer);
+        writes.forEach(([at, v]) => (typeof v === "string" ? [...v].forEach((c, i) => (h[at + i] = c.charCodeAt(0))) : dv.setUint32(at, v, true)));
+        return h;
+      };
+      const iso = { name: "game.iso", size: 0x9400 }, elf = (type, flags) => head([[0, "\x7fELF"], [5, "\x01"], [16, type], [18, "\x08"], [36, flags]]);
+      const umd = head([[0x8001, "CD001"], [0x8008, "PSP GAME                        "]]);
+      const ps2 = head([[0x8001, "CD001"], [0x8008, "PLAYSTATION                     "]]);
+      const cso = head([[0, "CISO"], [4, 0x18], [8, 0x4000000], [16, 0x800]]);
+      const zso = head([[0, "ZISO"], [4, 0x18], [8, 0x4000000], [16, 0x800]]);
+      const gcCiso = head([[0, "CISO"], [4, 0x200000], [8, 0x00010101]]);
+      const pbp = head([[0, "\0PBP"]]);
+      const platform = (h, f = iso) => identifyHead(h, f)?.platform ?? null;
+      return {
+        platforms: [platform(umd), platform(ps2), platform(gcCiso), platform(cso, { name: "game.cso", size: 0x9400 }),
+                    platform(elf(0xffa0, 0x10a23001)), platform(elf(2, 0x10a23001)), platform(elf(2, 0x20924001))],
+        said: [notSupported(zso, { name: "game.bin", size: 0x9400 }), notSupported(pbp, { name: "EBOOT.PBP", size: 0x9400 })],
+        cso: identifyHead(cso, { name: "game.cso", size: 0x9400 })?.order ?? null,
+        name: platformName("playstation"),
+      };
+    })(),
+    // the import offers every compiler of the game's console this computer lacks (every PlayStation's for a disc not read yet)
+    missing: (() => {
+      const before = S.st;
+      S.st = { consoles: [{ id: "ps", aliases: [], installable: ["gcc-2.7.2-psx", "gcc-2.6.3-psx"] },
+                          { id: "ps2", aliases: [], installable: ["ee-gcc-2.96", "mwcps2-3.0.1"] },
+                          { id: "nds", aliases: [], installable: [] }],
+               toolchains: [{ id: "gcc-2.7.2-psx", installed: true }, { id: "gcc-2.6.3-psx", installed: false },
+                            { id: "ee-gcc-2.96", installed: false }, { id: "mwcps2-3.0.1", installed: false, license: "proprietary" }] };
+      const out = [missingCompilers("ps2").map((t) => t.id), missingCompilers("playstation").length, missingCompilers("nds").length];
+      S.st = before;
+      return out;
+    })(),
+    // a GBA cartridge: the ARM branch at 0, the fixed 0x96 at 0xB2 and the complement checksum at 0xBD
+    gba: (() => {
+      const h = new Uint8Array(0x200), dv = new DataView(h.buffer);
+      dv.setUint32(0, 0xea00002e, true);  // b 0x080000C0
+      [..."DEMOQUEST\0\0\0"].forEach((c, i) => { h[0xa0 + i] = c.charCodeAt(0); });
+      [..."ADQE"].forEach((c, i) => { h[0xac + i] = c.charCodeAt(0); });
+      h[0xb2] = 0x96;
+      let sum = 0x19;
+      for (let i = 0xa0; i < 0xbd; i++) sum += h[i];
+      h[0xbd] = (-sum) & 0xff;
+      const file = { name: "game.gba", size: 0x200 };
+      const good = identifyHead(h, file);
+      h[0xbd] ^= 1;
+      return { good: good && [good.platform, good.code, good.title], broken: identifyHead(h, file), said: notSupported(h, file) };
+    })(),
+    // a PS3's decrypted program is a big-endian ELF64 PowerPC executable; its encrypted EBOOT.BIN (a SELF) says what to do
+    ps3: (() => {
+      const h = new Uint8Array(0x9400), dv = new DataView(h.buffer);
+      [..."\x7fELF"].forEach((c, i) => { h[i] = c.charCodeAt(0); });
+      h[4] = 2; h[5] = 2;
+      dv.setUint16(16, 2); dv.setUint16(18, 21); dv.setBigUint64(24, 0x13000n);
+      const self = new Uint8Array(0x9400);
+      [..."SCE\0"].forEach((c, i) => { self[i] = c.charCodeAt(0); });
+      const good = identifyHead(h, { name: "EBOOT.ELF", size: 0x9400 });
+      return { good: good && [good.platform, good.order, good.entry], self: identifyHead(self, { name: "EBOOT.BIN", size: 0x9400 }),
+               said: notSupported(self, { name: "EBOOT.BIN", size: 0x9400 }) };
     })(),
     // tests/test_ds.py's header, whose checksum (0xB4DE) the server's crc16 computed: the page agrees on what's a DS ROM
     nds: (() => {
@@ -168,6 +307,23 @@ const settle = async () => { for (let i = 0; i < SETTLE_TICKS; i++) await tick()
       return [searchFunctions(fns, "ma", false), searchFunctions(fns, "main", true), searchFunctions(fns, "mai", false).length,
               searchFunctions(fns, "zzz", false)].map((r) => (Array.isArray(r) ? r.map((f) => f.name) : r));
     })(),
+    // Polish is offered once half the game's own code matches: set-aside functions count on neither side
+    polish: [{ functions: 274, set_aside: 241, matched: 33 }, { functions: 274, set_aside: 0, matched: 33 },
+             { functions: 5, set_aside: 5, matched: 0 }, null].map(polishOffered),
+    // #118: a project from another tool names a compiler decompdecomp doesn't have: the banner says so, instead of
+    // taking it for a compiler with no build for this computer
+    unknownCompiler: (() => {
+      const before = S.ov, original = document.getElementById;
+      const notice = { hidden: null, className: null, innerHTML: "", _html: null, _working: false };
+      document.getElementById = (id) => (id === "compilerNotice" ? notice : original(id));
+      S.ov = { slug: "a", kind: "rom", matched: 0, compiler: { toolchain: "msvcxx-x86_64", name: "msvcxx-x86_64",
+        flags: ["/O2"], installed: false, supported: false, known: false, missing: [] } };
+      renderCompilerNotice(S.ov);
+      const said = { hidden: notice.hidden, className: notice.className, text: String(notice.innerHTML).replace(/<[^>]+>/g, "") };
+      document.getElementById = original;
+      S.ov = before;
+      return said;
+    })(),
     autopilot: burstLines([
       { id: 1, slug: "a", project: "Demo", kind: "match", agent: "autopilot", detail: "func_1", created_at: 100 },
       { id: 2, slug: "a", project: "Demo", kind: "match", agent: "autopilot", detail: "func_2", created_at: 101 },
@@ -175,6 +331,174 @@ const settle = async () => { for (let i = 0; i < SETTLE_TICKS; i++) await tick()
       { id: 4, slug: "a", project: "Demo", kind: "match", agent: "claude-1", detail: "func_3", created_at: 103 },
       { id: 5, slug: "a", project: "Demo", kind: "autopilot", agent: "", detail: "0 of 1 functions matched from machine drafts", created_at: 104 },
     ]).map((g) => noteHtml(g).replace(/<[^>]+>/g, "")),
+    // #99: the app's own workers' claims outlive a stopped helper (the permuter's by half an hour) and one helper
+    // going between waiting and working mustn't swap the rows
+    agents: (() => {
+      const was = { sessions: S.sessions, claims: S.claims };
+      const claim = (agent) => ({ name: "func_1", agent });
+      S.sessions = [];
+      S.claims = ["permuter", "@permuter", "decompdecomp", "@autopilot"].map(claim);
+      const ownOnly = workingAgents().n;
+      S.claims = [claim("alex.claude-1")];
+      const outside = workingAgents().n;
+      S.claims = [claim(null), claim(undefined)];
+      const nameless = workingAgents().n;
+      const at = (label, state, task = "decompile") => ({ id: label, label, state, task });
+      const flip = (first, second) => [at("alpha", first), at("beta", second)].sort(sessionOrder).map((s) => s.label);
+      const flipped = flip("waiting", "working"), again = flip("working", "waiting");
+      const rows = [at("stopped-one", "stopped"), at("working-one", "working"), at("polishing", "waiting", "readable"),
+                    at("paused-one", "paused", "readable")].sort(sessionOrder).map((s) => s.label);
+      S.sessions = was.sessions; S.claims = was.claims;
+      return { ownOnly, outside, nameless, flipped, again, rows };
+    })(),
   })`, ctx);
+  // #131: model advice shows, can be dismissed by model, stays hidden when its counts move, returns for another
+  // model or after a day, and is remembered per project
+  const advice = await vm.runInContext(`(async () => {
+    const was = { slug: S.slug, costsAt: S.costsAt, costsSlug: S.costsSlug, modelAdvice: S.modelAdvice };
+    const box = { hidden: null };
+    const text = { innerHTML: "", _html: null };
+    const close = { onclick: null };
+    const original = document.getElementById;
+    const realNow = Date.now;
+    let now = 1_700_000_000_000;
+    Date.now = () => now;
+    document.getElementById = (id) => id === "modelAdvice" ? box : id === "modelAdviceText" ? text : id === "modelAdviceClose" ? close : original(id);
+    close.onclick = dismissModelAdvice;
+    try {
+      const render = async (slug, model, sentence) => {
+        S.slug = slug;
+        costs = [{ kind: "api", model, matches: 1, usd: 1, tokens: 10, compiles: 100, advice: sentence, advice_model: model }];
+        S.costsAt = 0; S.costsSlug = "";
+        await renderCosts(true);
+        return { hidden: box.hidden, text: text.innerHTML };
+      };
+      const shown = await render("advice-a", "model-a", "model-a: 100 compiles, give it fewer helpers");
+      close.onclick();
+      const dismissed = { hidden: box.hidden, stored: dismissedModelAdvice("advice-a") };
+      const sameModel = await render("advice-a", "model-a", "model-a: 900 compiles, give it fewer helpers");
+      const otherProject = await render("advice-b", "model-a", "model-a: 900 compiles, give it fewer helpers");
+      const otherModel = await render("advice-a", "model-b", "model-b: a stronger model could get further");
+      now += MODEL_ADVICE_MS + 1;
+      const expired = await render("advice-a", "model-a", "model-a: 900 compiles, give it fewer helpers");
+      return { shown, dismissed, sameModel, otherProject, otherModel, expired };
+    } finally {
+      Date.now = realNow;
+      document.getElementById = original;
+      costs = [];
+      Object.assign(S, was);
+    }
+  })()`, ctx);
+  checks.advice = advice;
+  // #205: the owner's order for helpers is a project setting; the select saves it and puts the server's answer back
+  // when the save is refused
+  checks.claimOrder = await vm.runInContext(`(async () => {
+    const was = { slug: S.slug, ov: S.ov, api, toast };
+    const elements = {};
+    const original = document.getElementById;
+    const notes = [];
+    document.getElementById = (id) => {
+      if (id !== "claimOrder" && id !== "claimOrderHint") return original(id);
+      return elements[id] || (elements[id] = { value: "", textContent: "" });
+    };
+    const calls = [];
+    try {
+      toast = (html) => notes.push(String(html));
+      S.slug = "a"; S.ov = { slug: "a", kind: "rom", claim_order: "" };
+      api = async (url, opts) => { calls.push([url, opts]); return { ...S.ov, claim_order: opts.body.order }; };
+      await setClaimOrder("untried");
+      const saved = { url: calls[0][0], body: calls[0][1].body, value: elements.claimOrder.value };
+      api = async () => { throw new Error("The project is read-only."); };
+      await setClaimOrder("hardest");
+      return { saved, reverted: elements.claimOrder.value, text: elements.claimOrderHint.textContent, notes };
+    } finally {
+      api = was.api; toast = was.toast; S.slug = was.slug; S.ov = was.ov;
+      document.getElementById = original;
+    }
+  })()`, ctx);
+  // a project whose folder was deleted: its home card says so and Remove sends its database records away
+  checks.missingProject = await vm.runInContext(`(async () => {
+    const was = { projects: S.projects, dialog, api, showHome, loadNav, toast };
+    const go = { onclick: null }, body = { title: "", text: "" }, calls = [], notes = [];
+    const original = document.getElementById;
+    document.getElementById = (id) => (id === "rmMissingGo" ? go : original(id));
+    try {
+      S.projects = [{ slug: "gone", title: "Gone <Game>", platform_short: "N64",
+        missing: "Its folder is missing: /tmp/gone. Put it back where it was, or remove the project from decompdecomp." }];
+      const html = missingProjectHtml(S.projects[0]);
+      dialog = (title, text) => { body.title = title; body.text = text; return body; };
+      api = async (url, options) => { calls.push([url, options]); return { ok: true }; };
+      showHome = async () => { calls.push(["home"]); };
+      loadNav = () => { calls.push(["nav"]); };
+      toast = (html) => notes.push(String(html));
+      removeMissingProject(S.projects[0]);
+      await go.onclick();
+      return { html, title: body.title, text: body.text, calls, notes };
+    } finally {
+      S.projects = was.projects; dialog = was.dialog; api = was.api;
+      showHome = was.showHome; loadNav = was.loadNav; toast = was.toast;
+      document.getElementById = original;
+    }
+  })()`, ctx);
+  // a 2017 game's program dropped before the page's state arrived (review of #138): pickFile waits for the state,
+  // whose PC table names the pack (it was offered 6.0-7.1's), and the import's dialog lists that 32-bit program's
+  // own compilers, never the 64-bit one (setupCompilers, compilerFits)
+  const state = answers["/api/state"];
+  answers["/api/state"] = () => ({ ...state(), consoles: ctx.SERVER_CONSOLES });
+  checks.pcDrop = await vm.runInContext(`(async () => {
+    const was = S.st, original = document.getElementById, pick = { innerHTML: "" };
+    document.getElementById = (id) => (id === "compilerPick" ? pick : original(id));
+    try {
+      S.st = null;
+      const h = pcProgram([[0x105, 27027, 300], [0x102, 27027, 1]], [14, 16]);
+      await pickFile({ name: "game.exe", size: h.length, slice: () => ({ arrayBuffer: async () => h.buffer }) });
+      const options = [...String(pick.innerHTML).matchAll(/<option value="([^"]*)"/g)].map((m) => m[1]);
+      return { pack: picked.info.pack, options };
+    } finally {
+      document.getElementById = original;
+      S.st = was;
+    }
+  })()`, ctx);
+  checks.ps4Drop = await vm.runInContext(`(async () => {
+    const was = S.st, original = document.getElementById, oldPicked = picked;
+    const nodes = {};
+    document.getElementById = (id) => nodes[id] || (nodes[id] = { hidden: false, checked: false, innerHTML: "", textContent: "", value: "", insertAdjacentHTML() {} });
+    try {
+      const h = new Uint8Array(64), dv = new DataView(h.buffer);
+      h.set([0x7f, 0x45, 0x4c, 0x46, 2, 1]); dv.setUint16(16, 0xfe10, true); dv.setUint16(18, 62, true);
+      const out = [];
+      for (const installed of [false, true]) {
+        const con = { ...SERVER_CONSOLES.find((c) => c.id === "ps4"), import_error: "" };
+        S.st = { consoles: [con], toolchains: [{ id: "mwcc", license: "proprietary", installed }] };
+        await pickFile({ name: "eboot.elf", size: h.length, slice: () => ({ arrayBuffer: async () => h.buffer }) }, [{ name: "game.functions.jsonl", size: 20 }]);
+        $("own").checked = true; updateAnalyse();
+        out.push({ pack: packOf(picked.info), consent: !$("mwConsent").hidden, disabled: $("analyse").disabled,
+                   note: $("compilerNote").textContent, extras: picked.extras.map((f) => f.name) });
+      }
+      S.st.consoles[0] = { ...S.st.consoles[0], import_error: "Run the Linux app inside WSL 2." };
+      setupCompilers(picked.info); updateAnalyse();
+      return { drops: out, unsupported: { disabled: $("analyse").disabled, note: $("compilerNote").textContent, consent: !$("mwConsent").hidden } };
+    } finally { document.getElementById = original; S.st = was; picked = oldPicked; }
+  })()`, ctx);
+  answers["/api/state"] = state;
+  // an Xbox program (XBEH, base address on a 4 KiB boundary), an XISO and a full dump's disc, and the 360's XEX2 refused
+  checks.xbox = await vm.runInContext(`(async () => {
+      const xbe = new Uint8Array(0x200), dv = new DataView(xbe.buffer);
+      [..."XBEH"].forEach((c, i) => { xbe[i] = c.charCodeAt(0); });
+      dv.setUint32(0x104, 0x10000, true);
+      const file = { name: "default.xbe", size: 0x200 };
+      const good = identifyHead(xbe, file);
+      dv.setUint32(0x104, 0x10001, true);
+      const disc = (at) => ({ name: "game.iso", size: at + 0x800, slice: (a, b) => ({ arrayBuffer: async () => {
+        const out = new Uint8Array(b - a);
+        if (a === at) [..."MICROSOFT*XBOX*MEDIA"].forEach((c, i) => { out[i] = c.charCodeAt(0); });
+        return out.buffer;
+      } }) });
+      const x360 = new Uint8Array(0x200);
+      [..."XEX2"].forEach((c, i) => { x360[i] = c.charCodeAt(0); });
+      return { good: good && [good.platform, good.order], misaligned: identifyHead(xbe, file),
+               iso: (await identifyXboxDisc(disc(0x10000)))?.platform, dump: (await identifyXboxDisc(disc(0x18310000)))?.platform,
+               plain: await identifyXboxDisc(disc(0x20000)), x360: notSupported(x360, { name: "a.xex" }) };
+    })()`, ctx);
   process.stdout.write(JSON.stringify({ toasts, notes, unread, errors, checks }));
 })().catch((e) => { console.error(e); process.exit(1); });

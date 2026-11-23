@@ -10,8 +10,7 @@ import secrets
 import time
 
 from ...network import NetworkError
-from ...rom import split
-from ...rom.symbols import Symbol
+from ...rom.symbols import AUTO_NAME, Symbol
 
 
 class RoomMixin:
@@ -20,6 +19,14 @@ class RoomMixin:
 
         proj = self._project(slug)
         cfg = json.loads(proj["config"])  # a copy of its own: changed below
+        old_link = cfg.get("link") or {}
+        same_room = old_link.get("room") == info.get("room") and (
+            str(old_link.get("url") or "").rstrip("/") == str(info.get("url") or "").rstrip("/"))
+        queued = old_link.get("saved_progress") if same_room else None
+        info = dict(info)
+        info.pop("saved_progress", None)
+        if queued:
+            info["saved_progress"] = queued
         cfg["link"] = info
         with self.store.tx() as db:
             db.execute("UPDATE projects SET config=? WHERE id=?", (json.dumps(cfg), proj["id"]))
@@ -118,8 +125,10 @@ class RoomMixin:
     def apply_remote_best(self, slug: str, vram: int, score: int, source: str) -> None:
         proj = self._project(slug)
         with self.store.tx() as db:
-            db.execute("UPDATE functions SET best_score=?, best_source=? WHERE project_id=? AND vram=? AND status='open' "
-                       "AND (best_score IS NULL OR best_score > ?)", (score, source, proj["id"], vram, score))
+            db.execute("UPDATE functions SET best_score=?, best_source=?, "
+                       "last_improved=CASE WHEN ? < COALESCE(n_insns,0)*100 THEN ? ELSE last_improved END "
+                       "WHERE project_id=? AND vram=? AND status='open' AND (best_score IS NULL OR best_score > ?)",
+                       (score, source, score, time.time(), proj["id"], vram, score))
 
     def apply_remote_note(self, slug: str, host_id: int, vram: int | None, text: str, agent_name: str, created_at: float) -> None:
         proj = self._project(slug)
@@ -148,48 +157,143 @@ class RoomMixin:
         """Mirror the room's splits and names. The host already regression-tested them on the same ROM."""
         proj = self._project(slug)
         pid = proj["id"]
-        local = {r["vram"]: r for r in self.store.all("SELECT * FROM functions WHERE project_id=?", pid)}
+        console = self.console(proj)
+        local = {r["id"]: r for r in self.store.all("SELECT * FROM functions WHERE project_id=?", pid)}
+        by_vram: dict[int, list] = {}
+        for row in local.values():
+            by_vram.setdefault(row["vram"], []).append(row)
+        # Every name a function gave up, as {name it had before this call: name it has now}. The C that says the
+        # old names (its own, its callers', the headers) is rewritten once at the end, from the database, so a
+        # function renamed twice in one call (stepped aside, then given the host's name) ends up right (#107 review).
+        moves: dict[str, str] = {}
+
+        def rename(row, new: str) -> None:
+            old = row["name"]
+            with self.store.tx() as db:
+                db.execute("UPDATE functions SET name=? WHERE id=?", (new, row["id"]))
+            followed = [k for k, v in moves.items() if v == old]
+            for k in followed:
+                moves[k] = new
+            if not followed:
+                moves[old] = new
+            local[row["id"]] = renamed = {**row, "name": new}
+            by_vram[row["vram"]] = [renamed if i["id"] == row["id"] else i for i in by_vram[row["vram"]]]
+            self._syms.pop(pid, None)
+
+        def free_name(name: str, keep_id: int | None) -> None:
+            """#107: the host's layout is authoritative, so another local function holding `name` steps aside to its
+            address's default name (func_XXXXXXXX, _2, _3... when an overlay twin has that) instead of failing the
+            unique name. Its symbol follows here, its C at the end."""
+            for row in [r for r in local.values() if r["name"] == name and r["id"] != keep_id]:
+                base = f"func_{row['vram']:08X}"
+                spare, n = base, 2
+                while any(r["name"] == spare for r in local.values()) or self.store.one(
+                        "SELECT 1 FROM symbols WHERE project_id=? AND name=?", pid, spare):
+                    spare, n = f"{base}_{n}", n + 1
+                with self.store.tx() as db:
+                    db.execute("UPDATE symbols SET name=? WHERE project_id=? AND name=?", (spare, pid, name))
+                rename(row, spare)
+
+        try:
+            self._mirror_layout(proj, console, functions, symbols, local, by_vram, rename, free_name)
+        finally:
+            self._rename_in_code(pid, moves)
+
+    def _mirror_layout(self, proj, console, functions, symbols, local, by_vram, rename, free_name) -> None:
+        pid = proj["id"]
         for f in sorted(functions, key=lambda f: f["vram"]):
-            if f["vram"] in local:
+            at = by_vram.get(f["vram"], [])
+            if any(row["name"] == f["name"] for row in at):
                 continue
-            owner = next((r for r in local.values() if r["vram"] < f["vram"] < r["vram"] + r["size"]), None)
-            if owner is None or owner["status"] == "matched":
+            if at:
+                # The address belongs to another overlay's function (or a renamed one): never guess which to split.
                 continue
-            rf = self._parse_asm(owner["name"], owner["asm"], owner["unit"])
+            owners = [r for r in local.values() if r["vram"] < f["vram"] < r["vram"] + r["size"]]
+            if len(owners) != 1 or owners[0]["status"] == "matched":
+                continue
+            owner = owners[0]
             try:
-                head, tail = split.split_function(rf, f["vram"], f["name"])
+                head, tail = console.split_function(owner, f["vram"], f["name"])
             except ValueError:
                 continue
+            free_name(f["name"], None)
             syms = self.symbols(pid)
             syms.add(Symbol(f["name"], f["vram"], tail.size, "func"))
             th, tt = self._make_target(proj, head, syms), self._make_target(proj, tail, syms)
             with self.store.tx() as db:
                 db.execute("UPDATE functions SET size=?, n_insns=?, target=?, relocs=?, asm=?, seed=NULL WHERE id=?",
-                           (head.size, len(head.lines), th.code, json.dumps(th.to_json()), self._asm_source(head), owner["id"]))
-                db.execute("INSERT INTO functions(project_id,name,size,n_insns,target,relocs,asm,seed,unit,vram,rom_offset) "
-                           "VALUES(?,?,?,?,?,?,?,?,?,?,?)", (pid, f["name"], tail.size, len(tail.lines), tt.code,
-                                                            json.dumps(tt.to_json()), self._asm_source(tail), None,
-                                                            owner["unit"], f["vram"], tail.rom))
+                           (head.size, console.function_insns(head), th.code, json.dumps(th.to_json()),
+                            console.function_asm(head), owner["id"]))
+                meta = console.function_meta(tail)
+                tail_id = db.execute(
+                    "INSERT INTO functions(project_id,name,size,n_insns,target,relocs,asm,seed,unit,vram,rom_offset,"
+                    "status,meta) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (pid, f["name"], tail.size, console.function_insns(tail), tt.code,
+                     json.dumps(tt.to_json()), console.function_asm(tail), None, owner["unit"], f["vram"], tail.rom,
+                     console.function_status(tail), json.dumps(meta) if meta else None)).lastrowid
                 db.execute("INSERT OR REPLACE INTO symbols(project_id,name,address,size,kind) VALUES(?,?,?,?,?)",
                            (pid, f["name"], f["vram"], tail.size, "func"))
-            local = {r["vram"]: r for r in self.store.all("SELECT * FROM functions WHERE project_id=?", pid)}
+            local[owner["id"]] = {**owner, "size": head.size}
+            local[tail_id] = {**owner, "id": tail_id, "name": f["name"], "vram": f["vram"], "size": tail.size}
+            by_vram.setdefault(f["vram"], []).append(local[tail_id])
         self._xrefs.pop(pid, None)
-        syms = self.symbols(pid)
         for sym in symbols:
-            current, off = syms.name_at(sym["address"])
-            if off == 0 and current == sym["name"]:
+            at = by_vram.get(sym["address"], [])
+            twins = len(at) > 1
+            if twins:
+                # Overlays share the address: the host says which of them it named by its unit (layout_symbols). An
+                # older host doesn't, and renaming the address would rename all of them.
+                at = [row for row in at if sym.get("unit") is not None and row["unit"] == sym["unit"]]
+            if len(at) != 1 or at[0]["name"] == sym["name"]:
                 continue
-            old = current if off == 0 else f"D_{sym['address']:08X}"
-            word = re.compile(rf"\b{re.escape(old)}\b")
+            row = at[0]
+            free_name(sym["name"], row["id"])
+            old = row["name"]
+            stale = {old, sym["name"]}
+            if not twins:  # the one function's address: whatever symbol names it goes
+                current, off = self.symbols(pid).name_at(sym["address"])
+                if off == 0:
+                    stale.add(current)
             with self.store.tx() as db:
-                db.execute("DELETE FROM symbols WHERE project_id=? AND (name=? OR name=?)", (pid, old, sym["name"]))
+                db.executemany("DELETE FROM symbols WHERE project_id=? AND name=?", [(pid, n) for n in stale])
                 db.execute("INSERT INTO symbols(project_id,name,address,size,kind) VALUES(?,?,?,?,?)",
                            (pid, sym["name"], sym["address"], sym["size"], sym["kind"]))
-                db.execute("UPDATE functions SET name=? WHERE project_id=? AND vram=?", (sym["name"], pid, sym["address"]))
-                for r in db.execute("SELECT id, matched_source, best_source FROM functions WHERE project_id=? AND "
-                                    "(matched_source IS NOT NULL OR best_source IS NOT NULL)", (pid,)).fetchall():
-                    db.execute("UPDATE functions SET matched_source=?, best_source=? WHERE id=?",
-                               (word.sub(sym["name"], r["matched_source"]) if r["matched_source"] else None,
-                                word.sub(sym["name"], r["best_source"]) if r["best_source"] else None, r["id"]))
-            self._syms.pop(pid, None)
-            syms = self.symbols(pid)
+            rename(row, sym["name"])
+
+    def _rename_in_code(self, pid: int, moves: dict[str, str]) -> None:
+        """Rewrite every matched and best source, and every header, from the names functions had to the names they
+        have now: a function that stepped aside and its callers must say its new name, as rename_symbols does, or a
+        match is stale and a save writes the wrong C (#107 review)."""
+        moves = {old: new for old, new in moves.items() if old != new}
+        if not moves:
+            return
+        word = re.compile(r"\b[A-Za-z_]\w*\b")
+        swap = lambda text: word.sub(lambda m: moves.get(m.group(0), m.group(0)), text) if text else text
+        with self.store.tx() as db:
+            for r in db.execute("SELECT id, matched_source, best_source FROM functions WHERE project_id=? AND "
+                                "(matched_source IS NOT NULL OR best_source IS NOT NULL)", (pid,)).fetchall():
+                matched, best = swap(r["matched_source"]), swap(r["best_source"])
+                if (matched, best) != (r["matched_source"], r["best_source"]):
+                    db.execute("UPDATE functions SET matched_source=?, best_source=? WHERE id=?", (matched, best, r["id"]))
+            for unit in {""} | self._unit_contexts(pid):
+                last = db.execute("SELECT header FROM context_versions WHERE project_id=? AND unit=? "
+                                  "ORDER BY version DESC LIMIT 1", (pid, unit)).fetchone()
+                if last is None or swap(last["header"]) == last["header"]:
+                    continue
+                db.execute("INSERT INTO context_versions(project_id,version,header,agent_id,message,created_at,unit) "
+                           "VALUES(?,?,?,?,?,?,?)", (pid, self._next_version(db, pid), swap(last["header"]), None,
+                                                     "names follow the shared layout", time.time(), unit))
+
+    def layout_symbols(self, pid: int) -> list[dict]:
+        """The names given in a project, for a room's state and a save. A name one of several functions at an
+        address holds (overlays share addresses) also says that function's unit, so the other side names the same
+        one (#107 review); elsewhere the list is as it always was."""
+        twins = {r["name"]: r["unit"] for r in self.store.all(
+            "SELECT name, unit FROM functions WHERE project_id=? AND vram IN "
+            "(SELECT vram FROM functions WHERE project_id=? GROUP BY vram HAVING COUNT(*) > 1)", pid, pid)}
+        out = []
+        for r in self.store.all("SELECT name, address, size, kind FROM symbols WHERE project_id=?", pid):
+            if AUTO_NAME.match(r["name"]):
+                continue
+            out.append(dict(r) | ({"unit": twins[r["name"]]} if r["name"] in twins else {}))
+        return out

@@ -10,6 +10,7 @@ single match.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -20,14 +21,29 @@ import struct
 import subprocess
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
-from .. import arch, consoles, similarity, toolchains
-from ..forks import csource, datadiff, drafts, dtksplits, ghidra, objdiff
-from ..forks.objdiff import ObjdiffError
-from ..forks.project import EDITABLE, GAME, PROGRAM, SCOPES, STATE, ForkError, ForkProject
+from .. import arch, classes, coffobj, consoles, similarity, structs, toolchains
+from ..forks import (
+    convention,
+    csource,
+    datadiff,
+    drafts,
+    dtksplits,
+    ghidra,
+    ltcg,
+    methods,
+    objdiff,
+    standins,
+    target_validation,
+    unresolved,
+)
+from ..forks.objdiff import MappingConflict, ObjdiffError
+from ..forks.project import EDITABLE, GAME, PROGRAM, SCOPES, STATE, ForkError, ForkProject, project_macro
 from ..hostenv import NO_WINDOW
 from ..network import (
     GAME_CODE,
@@ -43,8 +59,9 @@ from ..network import (
     set_aside,
 )
 from ..rom import RomError
-from ..scoring import percent_text
+from ..scoring import percent_text, render_rows
 from ..textedit import replace_once
+from . import function_parts
 
 _REPO = re.compile(r"^(https://(github\.com|gitlab\.com|codeberg\.org|git\.[\w.-]+)/[\w.-]+/[\w.-]+?)(\.git)?/?$")
 # A match has to come from C/C++: no inline assembly, asm functions, asm includes or embedded binaries.
@@ -64,8 +81,16 @@ _CHEAT = re.compile(r"\b(__asm__|__asm|asm|_asm)\b|INCLUDE_ASM|GLOBAL_ASM|INCLUD
 _REGVAR = re.compile(r"\b(?:asm|__asm__|__asm)\s*\(\s*\"\$?[a-z]{1,2}\d{0,2}\"\s*\)", re.I)
 
 
+# A typed extern with an assembler *name* changes linkage only; it emits no assembly.
+# Keep this grammar narrow so instruction strings/extended asm still fail the check.
+_LINKAGE_DECL = re.compile(
+    r'\bextern\s+__typeof__\s*\(\s*[A-Za-z_]\w*\s*\)\s+[A-Za-z_]\w*\s+'
+    r'__asm__\s*\(\s*"[A-Za-z_]\w*"\s*\)\s*'
+    r'__attribute__\s*\(\(\s*visibility\s*\(\s*"hidden"\s*\)\s*\)\)\s*;')
+
+
 def _strip_comments(code: str) -> str:
-    return _REGVAR.sub(" ", re.sub(r"//[^\n]*|/\*.*?\*/", " ", code, flags=re.S))
+    return _REGVAR.sub(" ", _LINKAGE_DECL.sub(" ", re.sub(r"//[^\n]*|/\*.*?\*/", " ", code, flags=re.S)))
 
 
 def _slug(text: str) -> str:
@@ -144,6 +169,71 @@ class _TreeLock:
                 self._cond.notify_all()
 
 
+BATCH_UNITS = 16  # units one run of a project's build takes at most
+
+
+class _UnitBuilds:
+    """One project's unit builds, which take turns (ninja's log is the tree's): the builds asked for while one runs
+    go together in the next run (ForkProject.build_units), as many as BATCH_UNITS. The four permuter workers and the
+    agents of a project took turns one unit at a time: on an x86 game's LTCG units 8 built one by one took 5.6 s,
+    in one run 1.3 s. A build asked for while a run is going waits for the next run: what that run builds may be
+    an older copy of its file. Whoever finds no run going builds the next batch, its own build among them or not."""
+
+    @dataclass(eq=False)
+    class _Ask:
+        unit: object
+        result: tuple[bool, str] | None = None
+        error: BaseException | None = None
+        shared: bool = False  # the error is the whole run's, raised in each of its threads
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._queue: list = []
+        self._running = False
+
+    def build(self, unit, run) -> tuple[bool, str]:
+        """`unit` built in the next run of `run` (units -> one (ok, log) each, in order)."""
+        ask = self._Ask(unit)
+        with self._cond:
+            self._queue.append(ask)
+        while True:
+            with self._cond:
+                while ask.result is None and ask.error is None and self._running:
+                    self._cond.wait()
+                if ask.result is not None or ask.error is not None:
+                    break
+                self._running = True
+                batch, self._queue = self._queue[:BATCH_UNITS], self._queue[BATCH_UNITS:]
+            try:
+                results = run([a.unit for a in batch])
+                if len(results) != len(batch):
+                    raise RuntimeError(f"a build of {len(batch)} units said {len(results)} results")
+                for a, r in zip(batch, results):
+                    if isinstance(r, BaseException):  # its own build raised (build_units): its caller's alone
+                        a.error, a.shared = r, False
+                    else:
+                        a.result = r
+            except BaseException as e:  # each of the batch hears it, as a build of its own would have raised it
+                for a in batch:
+                    a.error, a.shared = e, True
+            finally:
+                with self._cond:
+                    self._running = False
+                    self._cond.notify_all()
+        if ask.error is None:
+            return ask.result
+        if not ask.shared:
+            raise ask.error
+        # each thread raises a copy of its own: raising the one exception in every thread of the batch writes each
+        # one's frames into its traceback, side by side (one that can't be copied still is, but nothing else of it
+        # is changed)
+        try:
+            mine = copy.copy(ask.error)
+        except Exception:  # noqa: BLE001
+            raise ask.error  # noqa: B904
+        raise mine.with_traceback(None) from ask.error
+
+
 def _tail(log: str, lines: int = 14) -> str:
     """The end of a build log, where the reason is."""
     return "\n".join(log.strip().splitlines()[-lines:])
@@ -182,6 +272,14 @@ def _digest(code: str) -> str:
     return hashlib.sha1(re.sub(r"\s+", " ", code).strip().encode()).hexdigest()
 
 
+def ltcg_unresolved(base: Path) -> list[str]:
+    """What a unit's last harness link left unresolved (dll2coff's <object>.ltcg.json): not written yet."""
+    try:
+        return list(json.loads(base.with_suffix(".ltcg.json").read_text(encoding="utf-8")).get("unresolved") or [])
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
 def _set_aside(fp: ForkProject) -> dict[str, str]:
     """Symbol -> why it's set aside, for functions a project says aren't the game's own (library code, middleware,
     an SDK, the C runtime): config/<version>/set_aside.json, or the file the manifest names (`set_aside`)."""
@@ -210,6 +308,7 @@ _INCLUDE_LINE = re.compile(r'^#\s*include\s*"[^"]+"\s*$')
 _ASM_KEYS = ("asm_twin", "asm_code")  # meta saying a function is hand-written assembly (kept by sync)
 # kept by sync too: the agents' verdicts that no C makes it (red in the map), and the user giving it back to them
 # (or the next check would set it aside again)
+GHIDRA_DRAFT_INSNS = 10  # autopilot tries Ghidra's drafts of functions smaller than this (autopilot_prepare)
 _KEPT_KEYS = (*_ASM_KEYS, "not_c", "reopened")
 _ASM_DEF = re.compile(r"\s*(?:(?:static|inline|extern)\s+)*asm\b")
 _MSVC_C = re.compile(r"[_@]([A-Za-z_]\w*?)(?:@\d+)?")  # how MSVC decorates a C function's name (PC, Xbox)
@@ -282,6 +381,12 @@ def _headers_defining(fp: ForkProject, rel: str, include_lines: list[str], names
     return out
 
 
+def _module(unit: str) -> str:
+    """The module a unit's file belongs to: its name's first folder ("game/text_10001000": a PC game's DLL; a
+    GameCube REL's), none for the program's own (a PC program's "text_00401000"), so a split moves its functions."""
+    return unit.split("/", 1)[0] if "/" in unit else ""
+
+
 def _data_symbols(target: Path | None) -> set[str]:
     """The data symbols of a target object: objdiff's report counts data in a code section as a function (a DS
     program's BuildInfo, the SDK's build information with its RSA text, sits in .text), and agents tried to write it
@@ -301,20 +406,46 @@ _QUOTED_INCLUDE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.M)
 MAX_HEADERS = 64  # headers permuter_header follows from one file
 
 
+def _without_attributes(text: str) -> str:
+    """`text` without its `__attribute__((...))`s, whose parentheses are balanced by hand."""
+    out, i = [], 0
+    while (at := text.find("__attribute__", i)) >= 0:
+        out.append(text[i:at])
+        pos = text.find("(", at)
+        if pos < 0:
+            return "".join(out) + text[at:]
+        depth = 0
+        while pos < len(text):
+            depth += (text[pos] == "(") - (text[pos] == ")")
+            if depth == 0:
+                break
+            pos += 1
+        i = pos + 1
+    return "".join(out) + text[i:]
+
+
 def _without_bodies(text: str) -> str:
     """A C file with each function's body cut to `;` (its definition becomes its prototype): its declarations, as
-    a parser needs them to read one of its functions."""
-    clean, out, i, depth, start = csource._blank(text), [], 0, 0, None
+    a parser needs them to read one of its functions. A body is a `{` after a declaration ending in `)`, its
+    attributes aside: `typedef struct __attribute__((packed)) {...} T;` read as a function had its fields cut, and
+    decomp-permuter read none of its file's functions (on a PS4 game, a 99.7% near miss whose last rows were a swap
+    of two registers, the permuter's very job, never got a single variant)."""
+    clean, out, i, depth, start, head = csource._blank(text), [], 0, 0, None, 0
     for k, c in enumerate(clean):
         if c == "{":
-            if depth == 0 and clean[:k].rstrip().endswith(")"):  # a body, not a struct's or an initializer's
-                start = k
+            declared = _without_attributes(clean[head:k]).strip()
+            if depth == 0 and declared.endswith(")") and not re.match(r"typedef\b", declared):
+                start = k  # a body, not a struct's or an initializer's
             depth += 1
         elif c == "}":
             depth -= 1
             if depth == 0 and start is not None:
                 out += [text[i:start], ";"]
                 i, start = k + 1, None
+            if depth == 0:
+                head = k + 1
+        elif c == ";" and depth == 0:
+            head = k + 1
     return "".join(out) + text[i:]
 
 
@@ -360,14 +491,17 @@ def _file_scope_lines(text: str) -> list[str]:
 
 
 def _pragmas_around(text: str, lo: int, hi: int) -> tuple[int, int]:
-    """Widen a definition's span over the #pragma lines right above and below it (its wrapper)."""
-    start = lo
+    """Widen a definition's span over the #pragma lines right above and below it (its wrapper), and the comment
+    between them and the definition (a polish puts one there: stopping at it left the file's #pragma push behind, never
+    popped, when the next rewrite came without the comment)."""
+    start = above = csource.comment_above(text, lo)
     while start > 0:
         prev = text.rfind("\n", 0, start - 1) + 1
         line = text[prev:start].strip()
         if not _PRAGMA.match(line):
             break
         start = prev
+    start = start if start < above else lo
     end = hi
     while end < len(text):
         nl = text.find("\n", end)
@@ -402,23 +536,66 @@ def _renamed_note(d) -> str:
             "game links by name: use the original's names (or rename the symbol everywhere) so the code links.")
 
 
+def _rewrite(path: Path, text: str) -> None:
+    """`path.write_text(text, encoding="utf-8")`, the same bytes, writing only from the first 4 KB block that differs.
+    A compile writes the agent's version of a unit's source and an undo writes the original back: a dtk unit can be
+    a megabyte, and only the part from the changed function on is new. An unchanged file is only touched, so a build
+    still sees it as new."""
+    data = text.replace("\n", os.linesep).encode("utf-8")  # as text mode writes it
+    try:
+        with open(path, "r+b") as f:
+            old = f.read()
+            if old == data:
+                os.utime(path)
+                return
+            at = 0
+            while old[at:at + 4096] == data[at:at + 4096]:
+                at += 4096
+            f.seek(at)
+            f.write(data[at:])
+            f.truncate()
+    except FileNotFoundError:
+        path.write_bytes(data)
+
+
+def _config_stamp(root: Path, globs: tuple[str, ...]) -> tuple | None:
+    """When each file a project's compilers and file ranges are read from last changed: objdiff.json (its source
+    files) and the console's (Console.compiler_config). None while one changed just now: a second write within the
+    file system's clock tick could leave the same stamp (git's "racy" files)."""
+    out, recent = [], time.time_ns() - 2_000_000_000
+    for path in (root / "objdiff.json", *(p for glob in globs for p in sorted(root.glob(glob)))):
+        try:
+            info = path.stat()
+        except OSError:
+            out.append((path, None))
+            continue
+        if info.st_mtime_ns > recent:
+            return None
+        out.append((path, info.st_mtime_ns, info.st_size, info.st_ino))
+    return tuple(out)
+
+
 class ForkEngine:
     def __init__(self, net):
         self.net = net
         self._trees: dict[int, _TreeLock] = defaultdict(_TreeLock)  # project id -> its source tree's lock
         self._unit_locks: dict[tuple[int, str], threading.RLock] = defaultdict(threading.RLock)
         self._build_locks: dict[int, threading.Lock] = defaultdict(threading.Lock)  # one build at a time per tree
+        self._unit_builds: dict[int, _UnitBuilds] = defaultdict(_UnitBuilds)
         self._git_locks: dict[int, threading.Lock] = defaultdict(threading.Lock)
         self._mlock = threading.Lock()
-        # (project id, unit) -> (sha1 of its source, base object mtime, {function: match %}): what objdiff said
-        # the last time it measured the unit, so a compile doesn't need a second objdiff run to know the baseline
-        self._scores: dict[tuple[int, str], tuple[str, int | None, dict]] = {}
-        self._index: dict[int, dict] = {}  # project id -> {unit: {"mtime", "order", "ops"}}
+        # Historical observations for conservative protection only. A baseline always rebuilds and remeasures;
+        # source/mtime cache hits cannot establish unchanged compiler or original-target evidence.
+        self._scores: dict[tuple[int, str], tuple[str, str | None, dict]] = {}
+        self._trials: dict[tuple[int, str], bool] = {}
+        self._index: dict[int, dict] = {}  # project id -> {unit: {"digest", "order", "ops"}}
         self._indexing: set[int] = set()
+        self._index_dirty: set[int] = set()  # projects whose index has entries index.json doesn't have yet
         self._ilock = threading.Lock()
         self._linking: dict[str, dict] = {}  # slug -> background link run
         self._preflight_locks: dict[int, threading.Lock] = defaultdict(threading.Lock)
         self._preflighted: set[int] = set()  # projects checked since the app started (overview's check)
+        self._parts: dict[Path, tuple] = {}  # project root -> (its config files' stat, _file_parts' answer)
 
     # ------------------------------------------------------------------ pre-flight
 
@@ -480,36 +657,114 @@ class ForkEngine:
             yield
 
     def _build_unit(self, proj, fp: ForkProject, unit) -> tuple[bool, str]:
-        """Build one unit's object. Builds share the tree's build files (ninja's log), so they take turns."""
-        with self._build_locks[proj["id"]]:
-            return fp.build_unit(unit)
+        """Build one unit's object. Builds share the tree's build files (ninja's log), so they take turns: together
+        with the others asked for meanwhile, in one run of the build (_UnitBuilds)."""
+        with self._mlock:  # (one per project: two first builds at once made two, and batched apart)
+            builds = self._unit_builds[proj["id"]]
+        return builds.build(unit, lambda units: self._build_units(proj, fp, units))
+
+    def _build_units(self, proj, fp: ForkProject, units: list) -> list[tuple[bool, str]]:
+        with self._build_locks[proj["id"]]:  # (and nothing changes the build's files meanwhile)
+            return fp.build_units(units)
 
     def _build_all(self, proj, fp: ForkProject, failed: list[str] | None = None) -> tuple[bool, str]:
         with self._build_locks[proj["id"]]:
             return fp.build_all(failed=failed)
 
+    @contextmanager
+    def trial_run(self, proj, unit_name: str):
+        """A run of tries at one unit's functions that aren't kept (the permuter's turn): the unit is held for the run,
+        and a try that isn't kept puts its file back without building it again, as the next try builds anyway. The
+        unit is built once at the end. On an LTCG unit a build is a whole-unit link of about 5 s, and every try
+        built twice: half the permuter's time went to rebuilding the file it had just put back. (A unit linked
+        into the game takes the tree alone for each try: such tries rebuild as before.)"""
+        fp = ForkProject(Path(proj["root"]))
+        try:
+            unit = fp.unit(unit_name)
+        except ForkError:
+            yield
+            return
+        if unit.complete and fp.linkable():
+            yield
+            return
+        key = (proj["id"], unit_name)
+        with self._tree(proj).shared(), self._unit_lock(proj, unit_name):
+            self._trials[key] = False
+            try:
+                yield
+            finally:
+                if self._trials.pop(key, False):  # the object is the last try's: the file's own again
+                    hit = self._scores.get(key)
+                    if self._build_unit(proj, fp, unit)[0] and hit and unit.base is not None and unit.base.exists():
+                        self._keep_scores(proj, unit, (fp.root / unit.source).read_text(encoding="utf-8"), hit[2])
+
+
     def _keep_scores(self, proj, unit, text: str, scores: dict) -> None:
-        mtime = unit.base.stat().st_mtime_ns if unit.base is not None and unit.base.exists() else None
-        self._scores[(proj["id"], unit.name)] = (hashlib.sha1(text.encode()).hexdigest(), mtime, dict(scores))
+        """Remember historical observations for regression protection, never as a fresh baseline verdict."""
+        try:
+            digest = hashlib.sha256(unit.base.read_bytes()).hexdigest() if unit.base is not None else None
+        except OSError:
+            digest = None
+        self._scores[(proj["id"], unit.name)] = (hashlib.sha1(text.encode()).hexdigest(), digest, dict(scores))
 
     def _last_scores(self, proj, unit) -> dict | None:
+        """Historical scores only: callers may protect old matches but must not claim these are current."""
         hit = self._scores.get((proj["id"], unit.name))
-        return hit[2] if hit else None
+        return dict(hit[2]) if hit else None
 
     def _baseline(self, proj, fp: ForkProject, unit, text: str) -> tuple[dict | None, bool]:
-        """({function: match %} for the unit as its source file is now, whether that builds). Scores are None when
-        the file doesn't build or objdiff can't measure it."""
-        hit = self._scores.get((proj["id"], unit.name))
-        if (hit and unit.base is not None and unit.base.exists() and hit[0] == hashlib.sha1(text.encode()).hexdigest()
-                and hit[1] == unit.base.stat().st_mtime_ns):
-            return hit[2], True
-        ok, _ = self._build_unit(proj, fp, unit)  # the object may be older than the file
-        if not ok or unit.base is None or not unit.base.exists():
-            return None, False
+        """Fresh whole-unit scores, with no assumptions about a custom build's dependency tracking.
+
+        Header files, compiler binaries and scripts may change without touching the source or object timestamps.
+        Removing the declared output forces the project's own build to regenerate it. Unknown dependencies are
+        therefore never represented as a complete cache key. Historical scores remain available for protection.
+        """
         try:
+            evidence = fp.validate_targets([unit])
+            if evidence.status == 'invalid':
+                return None, False
+            with self._build_locks[proj["id"]]:
+                if unit.base is None:
+                    return None, False
+                candidate = unit.base
+                candidate.resolve().relative_to(fp.root.resolve())
+                if any(path.is_symlink() for path in (candidate, *candidate.parents)
+                       if path == fp.root or fp.root in path.parents):
+                    return None, False
+                protected = [unit.target]
+                manifest = getattr(fp, 'manifest', None) or {}
+                game = manifest.get('game') or {}
+                if game.get('path'):
+                    protected.append(fp.root / game['path'])
+                version = str(manifest.get('version', ''))
+                if version and '/' not in version and '\\' not in version and version not in ('.', '..'):
+                    config = fp.root / 'config' / version / 'functions.json'
+                    if config.is_file():
+                        declared = json.loads(config.read_text(encoding='utf-8'))
+                        protected.extend(fp.root / declared[key] for key in ('elf', 'exe') if declared.get(key))
+                for original in protected:
+                    if original is not None and (candidate.resolve() == original.resolve()
+                            or candidate.exists() and original.exists() and candidate.samefile(original)):
+                        return None, False
+                previous = candidate.read_bytes() if candidate.exists() else None
+                candidate.unlink(missing_ok=True)
+                try:
+                    ok, _ = fp.build_unit(unit)
+                except Exception:
+                    if previous is not None:
+                        candidate.unlink(missing_ok=True)
+                        candidate.write_bytes(previous)
+                    raise
+                if not ok or not candidate.is_file() or candidate.is_symlink():
+                    if previous is not None:
+                        candidate.unlink(missing_ok=True)
+                        candidate.write_bytes(previous)
+                    return None, False
+            if not ok or not unit.base.is_file():
+                return None, False
             d = fp.diff(unit, None)
-        except (ObjdiffError, ForkError):
-            return None, True
+        except (OSError, ValueError, TypeError, ObjdiffError, ForkError):
+            return None, False
         self._keep_scores(proj, unit, text, d.unit_scores)
         return d.unit_scores, True
 
@@ -529,7 +784,20 @@ class ForkEngine:
         proj = self.net._project(slug)
         if not self.is_fork(proj):
             raise NetworkError(f"{slug} isn't a fork")
-        return proj, ForkProject(Path(proj["root"])), json.loads(proj["config"])
+        fp = ForkProject(Path(proj["root"]))
+        evidence_key = f"original-target-evidence:{proj['id']}"
+        required = self.net.store.one("SELECT value FROM settings WHERE key=?", evidence_key) is not None
+        fp._target_evidence_seen = required
+
+        def retain_requirement(result):
+            nonlocal required
+            if (result.status == 'valid' or result.required) and not required:
+                with self.net.store.tx() as db:
+                    db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (evidence_key, 'required'))
+                required = True
+
+        fp.on_target_validation = retain_requirement
+        return proj, fp, json.loads(proj["config"])
 
     def _save_cfg(self, proj, cfg: dict) -> None:
         with self.net.store.tx() as db:
@@ -600,11 +868,12 @@ class ForkEngine:
             self.net._event(db, pid, None, "fork", event)
 
     def create_scratch(self, game: Path, console: consoles.Console, *, compiler: str | None = None, log=print,
-                       scope: str | None = None) -> str:
+                       scope: str | None = None, options: dict | None = None) -> str:
         """A game of a PROJECT-mode console (GameCube, Wii, PC, DS), from scratch: the console generates the
         community's kind of project for it (Console.create_project: dtk-template; for PC, decompdecomp's own from
         Ghidra's analysis; for DS, ds-decomp's), opened like a fork. `scope`: what the project covers (SCOPES), for
-        a console whose import sets library code aside (Console.sets_aside); kept in the project's manifest."""
+        a console whose import sets library code aside (Console.sets_aside); kept in the project's manifest.
+        `options`: the user's answers to Console.import_options, given to create_project as keywords."""
         if scope is not None and scope not in SCOPES:
             raise NetworkError(f"a project covers the game's own code ({GAME!r}) or the whole program, not {scope!r}")
         scoped = {"scope": scope or GAME} if console.sets_aside else {}
@@ -617,7 +886,7 @@ class ForkEngine:
         slug = self._free_slug(_slug(f"{info['title']} {info['id']}" if info.get("kind") != "dol" else info["title"]))
         dest = self.net.workspace / slug
         try:
-            facts = console.create_project(dest, game, compiler=compiler, log=log, **scoped)
+            facts = console.create_project(dest, game, compiler=compiler, log=log, **scoped, **(options or {}))
             if scoped:  # (before the first measuring, which reads it)
                 ForkProject(dest).update_manifest(**scoped)
         except BaseException:
@@ -637,7 +906,8 @@ class ForkEngine:
     def needs(self, slug: str) -> dict:
         _, fp, cfg = self.get(slug)
         return fp.needs(cfg.get("version")) | {"kind": fp.kind(), "versions": fp.versions(),
-                                                "version": cfg.get("version"), "readme": fp.readme()}
+                                                "version": cfg.get("version") or fp.default_game_version(),
+                                                "readme": fp.readme()}
 
     def setup(self, slug: str, game: bytes | Path | None, filename: str = "", log=print, move: bool = False) -> dict:
         """Add the user's game (bytes, or a file on disk) and run the project's setup, then measure it."""
@@ -664,8 +934,17 @@ class ForkEngine:
         return self.check(slug, log=log)
 
     def _match_version(self, proj, fp: ForkProject, cfg: dict, game: Path, log) -> None:
-        """A GameCube/Wii disc names its version (GP6E01, GP6P01...): use the project's matching version, or say
-        which ones the project has, instead of failing deep in the build."""
+        """Select a public project's supported version from the supplied game."""
+        from .. import consoles
+
+        version = consoles.get(fp.detect_platform()).match_fork_game_version(fp, game, log=log)
+        if version is not None:
+            if version != cfg.get("version"):
+                log(f"your ROM matches the project's {version} version")
+                cfg["version"] = version
+                self._save_cfg(proj, cfg)
+            return
+        # A GameCube/Wii disc names its version (GP6E01, GP6P01...).
         if fp.kind() != "dtk":
             return
         versions = fp.versions()
@@ -791,15 +1070,39 @@ class ForkEngine:
         log(said)
         return said if kept else None
 
-    def check(self, slug: str, log=print) -> dict:
-        """After a manual setup (or to refresh): pick the project up once it has an objdiff.json."""
+    def reimport(self, slug: str, game: Path, log=print) -> dict:
+        """Settings' Reimport for a project decompdecomp made (Console.reimport: PC analyses its program again), every
+        match, note and name kept. Returns what the GUI says: functions, matched, and what changed."""
+        proj, fp, cfg = self.get(slug)
+        if cfg.get("origin") != "scratch" or not consoles.get(cfg.get("platform")).reimports:
+            raise NetworkError("this project's own build sets its functions: it can't be reimported")
+        said = consoles.get(cfg.get("platform")).reimport(self.net, slug, game, log=log)
+        agg = self.net.store.one("SELECT COUNT(*) AS n, COALESCE(SUM(status='matched'), 0) AS m FROM functions WHERE "
+                                 "project_id=?", proj["id"])
+        return {"slug": slug, "functions": agg["n"], "matched": agg["m"],
+                "said": said or "the new analysis changed nothing (or was taken back: the project's feed says why)"}
+
+    def check(self, slug: str, log=print, build: bool = False) -> dict:
+        """After a manual setup (or to refresh): pick the project up once it has an objdiff.json. `build` (the
+        project page's Re-measure and Check again): its build runs first, so sources changed outside decompdecomp (a
+        rollback, an editor) are measured as they are; a measure reads build/ as it is, and a rolled-back Xbox game
+        measured its broken build again and again."""
         proj, fp, cfg = self.get(slug)
         if not (fp.root / "objdiff.json").exists():
             raise NetworkError("no objdiff.json yet. The project's build creates it (often `python configure.py` "
                                "or `make`); see its README")
         cfg["ready"] = True
         self._save_cfg(proj, cfg)
-        measures = self.sync(slug, log=log)
+        if build:
+            log("building what changed since the last build")
+            failed: list[str] = []
+            with self._tree(proj).exclusive(), self._build_locks[proj["id"]]:
+                fp.build_all(log=log, failed=failed)
+                rep = fp.report()
+            # a unit whose source doesn't build keeps its last object: what it matched then doesn't count now
+            measures = self.sync(slug, log=log, rep=rep, broken=fp.failed_units(failed))
+        else:
+            measures = self.sync(slug, log=log)
         if fp.linkable():
             self.link_soon(slug)  # files that are finished but not linked yet (in the project as it came, too)
         return measures
@@ -818,11 +1121,16 @@ class ForkEngine:
             except (ObjdiffError, ForkError) as e:
                 raise NetworkError(f"objdiff couldn't measure the project: {e}") from None
         units = {u.name: u for u in fp.units()}
+        addresses = consoles.get(cfg.get("platform")).function_addresses(fp)
         data = {n: _data_symbols(u.target) for n, u in units.items()}
         rows = [(u["name"], f) for u in rep.get("units", []) for f in u.get("functions", [])
                 if f["name"] not in data.get(u["name"], ())]
         listed = _set_aside(fp)
         aside = listed if fp.scope == GAME else {}  # the whole program: set-aside code is worked on and counted
+        console, version = consoles.get(cfg.get("platform")), (fp.manifest or {}).get("version") or cfg.get("version")
+        # real names a report doesn't give (a PC game's stay _func_0041B470@8): how the source spells them
+        reals = console.real_names(fp, version)
+        generated = console.generated_functions(fp, version)  # no C of their own makes them (a PC game's EH stubs)
         counts: dict[str, int] = defaultdict(int)
         for _, f in rows:
             counts[f["name"]] += 1
@@ -841,7 +1149,7 @@ class ForkEngine:
         moved: dict[tuple[str, str], list] = defaultdict(list)  # (module, symbol) -> rows no unit has any more
         for key, r in existing.items():
             if key not in here and key[0]:
-                moved[(key[0].split("/", 1)[0], key[1])].append(r)
+                moved[(key[0].split("/", 1)[0] if "/" in key[0] else "", key[1])].append(r)
         with self.net.store.tx() as db:
             for uname, f in rows:
                 sym = f["name"]
@@ -855,9 +1163,11 @@ class ForkEngine:
                 meta = {"symbol": sym, "demangled": md.get("demangled_name"), "source": u.source if u else None}
                 if k:
                     meta["nth"] = k
+                if real := reals.get(sym):
+                    meta["real"] = real
                 old = existing.get((uname, sym, k))
-                if old is None and moved.get((uname.split("/", 1)[0], sym)):
-                    old = moved[(uname.split("/", 1)[0], sym)].pop(0)
+                if old is None and moved.get((uname.split("/", 1)[0] if "/" in uname else "", sym)):
+                    old = moved[(uname.split("/", 1)[0] if "/" in uname else "", sym)].pop(0)
                     name = sym if counts[sym] == 1 else f"{sym}@{uname}" + (f"#{k + 1}" if k else "")
                     used.discard(old["name"])
                     while name in used:
@@ -873,6 +1183,8 @@ class ForkEngine:
                     kept = _KEPT_KEYS if old["size"] == size else ("reopened",)
                     meta.update({k: v for k, v in was.items() if k in kept
                                  and not (k == "asm_code" and was.get("set_aside"))})  # (set aside: decided below)
+                if sym in generated and not meta.get("reopened"):  # set aside as assembly is, whatever the scope
+                    meta["asm_code"] = generated[sym]
                 if sym in aside:  # code the project says isn't the game's own (library code, middleware)
                     meta["asm_code"] = aside[sym]
                     meta["set_aside"] = True  # and progress takes it off, as no C code is (network.SET_ASIDE)
@@ -881,6 +1193,9 @@ class ForkEngine:
                     status = "asm"  # hand-written assembly (here or in its twin elsewhere): not for agents
                 score = None if fuzzy is None else scaled(fuzzy, n)
                 vram = md.get("virtual_address")
+                if vram is None:
+                    vram = addresses.get((uname, sym))
+                vram = int(vram) if vram is not None else old["vram"] if old is not None else None
                 if old is None:
                     name = sym if counts[sym] == 1 else f"{sym}@{uname}" + (f"#{k + 1}" if k else "")
                     while name in used:
@@ -888,14 +1203,14 @@ class ForkEngine:
                     used.add(name)
                     db.execute("INSERT INTO functions(project_id,name,size,n_insns,status,best_score,unit,vram,meta,asm) "
                                "VALUES(?,?,?,?,?,?,?,?,?,?)", (proj["id"], name, size, n, status, score, uname,
-                                                              int(vram) if vram else None, json.dumps(meta), ""))
+                                                              vram, json.dumps(meta), ""))
                 else:
                     # a better attempt kept elsewhere stays the best; a 0 (identical) of a function that no longer
                     # matches doesn't: the queue and briefs would say it's done
                     if status != "matched" and old["best_source"] and old["best_score"] and old["status"] != "matched":
                         score = old["best_score"] if score is None else min(score, old["best_score"])
-                    db.execute("UPDATE functions SET size=?, n_insns=?, status=?, best_score=?, meta=? WHERE id=?",
-                               (size, n, status, score, json.dumps(meta), old["id"]))
+                    db.execute("UPDATE functions SET size=?, n_insns=?, status=?, best_score=?, vram=?, meta=? WHERE id=?",
+                               (size, n, status, score, vram, json.dumps(meta), old["id"]))
                     if old["status"] == "matched" and status != "matched":
                         self._reopened(db, proj, old, "full report" + (", the unit doesn't build" if uname in broken
                                                                          else ""), fuzzy,
@@ -1246,7 +1561,7 @@ class ForkEngine:
                 raise NetworkError(f"nothing was changed: {e}") from None
             fp.build_all()
             rep = fp.report()
-            paths = [str(p.relative_to(fp.root)) for p in [*saved, *made]]
+            paths = [p.relative_to(fp.root).as_posix() for p in [*saved, *made]]
             n = sum(item[4] for item in plan["split"])
             self._commit_paths(proj, fp, paths, f"Give code without a source file one ({len(made)} files, {n} functions)\n\n"
                                "Each stretch of code no file covered gets a file of its own, so it can be decompiled; "
@@ -1340,7 +1655,9 @@ class ForkEngine:
             text = old_path.read_text(errors="replace", encoding="utf-8") if old_path.exists() else ""
             going = {s for r in rows if (s := self._meta(r).get("symbol")) in syms and addr <= syms[s][1] < hi}
             new_text, rest, moved = self._divide(text, rows, going)
-            scores_before = self._baseline(proj, fp, unit, text)[0] or {}
+            scores_before = self._baseline(proj, fp, unit, text)[0]
+            if scores_before is None:
+                raise NetworkError("Cannot protect matched neighbors without a fresh whole-unit baseline.")
             saved = {conf: conf.read_text(encoding="utf-8"), mod.splits: mod.splits.read_text(encoding="utf-8"), old_path: text}
             protected = {n for n, pct in scores_before.items() if pct is not None and pct >= 100}
             try:
@@ -1446,8 +1763,9 @@ class ForkEngine:
         going = set(order[order.index(sym):])
         rows = [r for r in self.net.store.all("SELECT id, name, meta FROM functions WHERE project_id=? AND unit=? AND "
                                               "status != 'nosource'", proj["id"], unit.name)]
-        stem = re.sub(r"_[0-9A-Fa-f]{8}$", "", Path(rel).stem)
-        tail = re.search(r"([0-9A-Fa-f]{8})$", sym)
+        stem = re.sub(r"_[0-9A-Fa-f]{8,16}$", "", Path(rel).stem)
+        # (a PC function: @func_0041B470@8; a 64-bit one's address has 9 digits or more, func_140001000)
+        tail = re.search(r"(?<![0-9A-Fa-f])([0-9A-Fa-f]{8,16})(?:@\d+)?$", sym)
         new = new_name.strip().lstrip("./") or (Path(rel).parent / f"{stem}_{(tail.group(1) if tail else sym).upper()}"
                                                 f"{Path(rel).suffix}").as_posix()
         old_path, new_path = fp.root / rel, fp.root / new
@@ -1455,7 +1773,10 @@ class ForkEngine:
             raise NetworkError(f"{new} exists already: pick another new_name")
         text = old_path.read_text(errors="replace", encoding="utf-8") if old_path.exists() else ""
         new_text, rest, moved = self._divide(text, rows, going)
-        protected = {n for n, pct in (self._baseline(proj, fp, unit, text)[0] or {}).items() if pct is not None and pct >= 100}
+        baseline = self._baseline(proj, fp, unit, text)[0]
+        if baseline is None:
+            raise NetworkError("Cannot protect matched neighbors without a fresh whole-unit baseline.")
+        protected = {n for n, pct in baseline.items() if pct is not None and pct >= 100}
         checks = consoles.REBUILD_CHECK in console.features
         with self._tree(proj).exclusive(), self._build_locks[proj["id"]]:
             before = (fp.manifest or {}).get("rebuild") or {}
@@ -1507,24 +1828,29 @@ class ForkEngine:
         comes from (Console.rename_symbol), and as a whole word in every source and header file. Kept only when the
         project sets up again, the game still rebuilds as it did and every match still matches; else every file is
         put back. Polishing in project mode had local names only: functions and globals stayed func_0205d0f4 and
-        data_0222f194. The function's row keeps its history under the new name."""
-        if not re.fullmatch(r"[A-Za-z_]\w*", new) or not re.fullmatch(r"[A-Za-z_]\w*", old) or old == new:
+        data_0222f194. The function's row keeps its history under the new name. Where the report keeps the original's
+        symbol (Console.renames_in_report: a PC game's _func_0041B470@8), the row keeps that name too, and the new one
+        is the function's real name (Console.real_names), how its source spells it."""
+        # (`old` as the report gives a PC function: _func_0041B470@8, @func_0041B470@8)
+        if not re.fullmatch(r"[A-Za-z_]\w*", new) or not re.fullmatch(r"@?[A-Za-z_]\w*(?:@\d+)?", old) or old == new:
             raise NetworkError("rename_symbol takes two different C names: old and new")
         proj, fp, cfg = self.get(slug)
         if slug in self.net.links:
             raise NetworkError("in a room, the host's project is the one to rename in: say it in a note")
         console = consoles.get(cfg.get("platform"))
         version = (fp.manifest or {}).get("version") or cfg.get("version")
-        word, taken = re.compile(rf"\b{re.escape(old)}\b"), re.compile(rf"\b{re.escape(new)}\b")
-        files = sorted(p for d in ("src", "include") if (fp.root / d).is_dir() for p in (fp.root / d).rglob("*")
-                       if p.is_file() and p.suffix in self.SOURCE_SUFFIXES)
-        texts = {p: p.read_text(errors="replace", encoding="utf-8") for p in files}
-        if any(taken.search(t) for t in texts.values()):
-            raise NetworkError(f"{new} is used in the project already: pick another name")
-        matched = {self._meta(r).get("symbol") or r["name"] for r in self.net.store.all(
-            "SELECT name, meta FROM functions WHERE project_id=? AND status='matched'", proj["id"])}
+        word, taken = re.compile(console.rename_pattern(old)), re.compile(rf"\b{re.escape(new)}\b")
         checks = consoles.REBUILD_CHECK in console.features
         with self._tree(proj).exclusive(), self._build_locks[proj["id"]]:
+            # read under the lock: eight polishing helpers renamed at once, each wrote back files it had read before
+            # the others' renames, and half of an Xbox game's renames were undone in some files and not others
+            files = sorted(p for d in ("src", "include") if (fp.root / d).is_dir() for p in (fp.root / d).rglob("*")
+                           if p.is_file() and p.suffix in self.SOURCE_SUFFIXES)
+            texts = {p: p.read_text(errors="replace", encoding="utf-8") for p in files}
+            if any(taken.search(t) for t in texts.values()):
+                raise NetworkError(f"{new} is used in the project already: pick another name")
+            matched = {self._meta(r).get("symbol") or r["name"] for r in self.net.store.all(
+                "SELECT name, meta FROM functions WHERE project_id=? AND status='matched'", proj["id"])}
             before = (fp.manifest or {}).get("rebuild") or {}
             saved: dict[Path, str] = {}
             try:
@@ -1542,7 +1868,8 @@ class ForkEngine:
                 rep = fp.report()
                 now = {f["name"] for u in rep.get("units", []) for f in u.get("functions", [])
                        if (f.get("fuzzy_match_percent") or 0) >= 100}
-                if lost := sorted(n for n in matched if (new if n == old else n) not in now):
+                renamed = new if console.renames_in_report else old
+                if lost := sorted(n for n in matched if (renamed if n == old else n) not in now):
                     raise ForkError(f"these functions would stop matching: {', '.join(lost[:8])}")
             except (ForkError, RomError, ObjdiffError, OSError, ValueError) as e:
                 for p, t in saved.items():
@@ -1551,11 +1878,12 @@ class ForkEngine:
                     fp.run(cmd, log=lambda *_: None)
                 raise NetworkError(f"not renamed, nothing changed: {e}") from None
             with self.net.store.tx() as db:  # the function keeps its row, its matches and notes, under its new name
-                db.execute("UPDATE functions SET name=?, meta=json_set(COALESCE(meta, '{}'), '$.symbol', ?) WHERE "
-                           "project_id=? AND (name=? OR json_extract(meta, '$.symbol')=?)",
-                           (new, new, proj["id"], old, old))
+                if console.renames_in_report:  # (else sync gives it its real name, from the console's config)
+                    db.execute("UPDATE functions SET name=?, meta=json_set(COALESCE(meta, '{}'), '$.symbol', ?) WHERE "
+                               "project_id=? AND (name=? OR json_extract(meta, '$.symbol')=?)",
+                               (new, new, proj["id"], old, old))
                 self.net._event(db, proj["id"], agent.id if agent else None, "rename", f"{old} → {new}")
-            self._commit_paths(proj, fp, [str(p.relative_to(fp.root)) for p in saved],
+            self._commit_paths(proj, fp, [p.relative_to(fp.root).as_posix() for p in saved],
                                f"Rename {old} to {new}\n\n{message.strip() or 'Named'} by "
                                f"{agent.name if agent else 'decompdecomp'} with decompdecomp; the game still builds as it "
                                "did and every match still matches.")
@@ -1599,28 +1927,44 @@ class ForkEngine:
         return self._index[proj["id"]]
 
     def _save_index(self, proj, fp: ForkProject) -> None:
+        """Write index.json, only when something new was indexed: every sync (each pull from a room, each edit)
+        ends an indexing pass, and a GameCube game's 11 MB index rewritten five times a second wrote 50 MB/s."""
         with self._ilock:
+            if proj["id"] not in self._index_dirty:
+                return
+            self._index_dirty.discard(proj["id"])
             snapshot = dict(self._index.get(proj["id"], {}))
         try:
             (fp.root / STATE / "index.json").write_text(json.dumps(snapshot), encoding="utf-8")
         except OSError:
-            pass
+            with self._ilock:
+                self._index_dirty.add(proj["id"])
 
     def _remember(self, proj, fp: ForkProject, unit, d) -> None:
         if unit.target is None or not unit.target.exists():
             return
-        entry = {"mtime": unit.target.stat().st_mtime, "order": d.order, "ops": d.ops}
+        entry = {"sha256": hashlib.sha256(unit.target.read_bytes()).hexdigest(), "order": d.order, "ops": d.ops}
         idx = self._index_of(proj, fp)
         with self._ilock:
+            if idx.get(unit.name) == entry:  # every compile measures its unit again: mostly nothing new
+                return
             idx[unit.name] = entry
+            self._index_dirty.add(proj["id"])
 
     def _unit_index(self, proj, fp: ForkProject, unit, save: bool = True) -> dict | None:
         """Target order and mnemonics of a unit's functions, from its target object only (never races a build)."""
         idx = self._index_of(proj, fp)
         if unit.target is None or not unit.target.exists():
             return None
+        evidence = fp.validate_targets([unit])
+        if evidence.status == 'invalid':
+            return None
+        try:
+            digest = hashlib.sha256(unit.target.read_bytes()).hexdigest()
+        except OSError:
+            return None
         hit = idx.get(unit.name)
-        if hit and hit.get("mtime") == unit.target.stat().st_mtime:
+        if hit and hit.get("sha256") == digest:
             return hit
         row = self.net.store.one("SELECT meta FROM functions WHERE project_id=? AND unit=? LIMIT 1", proj["id"], unit.name)
         if row is None:
@@ -1699,8 +2043,9 @@ class ForkEngine:
                 lines += ["", f"Source of {best['name']} (matched):", "```c", src.strip()[:4000], "```"]
         return "\n".join(lines)
 
-    def _current_source(self, fp: ForkProject, fn) -> str | None:
-        """fn's definition as its file has it now, also when the file gets it by including another source file."""
+    def _current_source(self, fp: ForkProject, fn, comment: bool = False) -> str | None:
+        """fn's definition as its file has it now, also when the file gets it by including another source file.
+        `comment`: with the comment right above it (polishing's brief shows it)."""
         unit = fp.unit(fn["unit"])
         if not unit.source or not (fp.root / unit.source).exists():
             return None
@@ -1717,23 +2062,26 @@ class ForkEngine:
                 continue
             _, span = self._find(text, names)
             if span:
-                return text[span[0]:span[1]]
+                return text[csource.comment_above(text, span[0]) if comment else span[0]:span[1]]
             for inc in _SOURCE_INCLUDE.findall(text):
                 todo += [p for p in (fp.root / inc, fp.root / "src" / inc, path.parent / inc) if p.is_file()][:1]
         return None
 
-    def twin_source(self, proj, a, b, names: dict[str, str], includes: bool = False) -> str | None:
+    def twin_source(self, proj, a, b, names: dict[str, str], includes: bool = False, theirs=None) -> str | None:
         """a's matched definition, from its source file, written for its twin b: names swapped (see app/twins.py),
         with the includes and declarations it relies on from a's file that b's file doesn't have (compile_and_diff
-        places those in b's file). None for a definition in assembly (then b is assembly too)."""
+        places those in b's file). None for a definition in assembly (then b is assembly too). `theirs`: a is that
+        project's (twins across games): its declarations come along, never its includes (its headers aren't b's)."""
         from . import twins
 
         fp = ForkProject(Path(proj["root"]))
-        ua, ub = fp.unit(a["unit"]), fp.unit(b["unit"])
+        fa = ForkProject(Path(theirs["root"])) if theirs is not None else fp
+        ua, ub = fa.unit(a["unit"]), fp.unit(b["unit"])
         if not ua.source or not ub.source:
             return None
+        includes = includes and theirs is None
         try:
-            text_a = (fp.root / ua.source).read_text(errors="replace", encoding="utf-8")
+            text_a = (fa.root / ua.source).read_text(errors="replace", encoding="utf-8")
             text_b = (fp.root / ub.source).read_text(errors="replace", encoding="utf-8") if (fp.root / ub.source).exists() else ""
         except OSError:
             return None
@@ -1891,8 +2239,9 @@ class ForkEngine:
         scratch = next((u.scratch for u in units if u.scratch), None) or {}
         platform = consoles.name(cfg.get("platform")) or "unknown platform"
         console = consoles.get(cfg.get("platform"))
+        # the project's own compilers (review of #138: a 32-bit PC game's session was told of MSVC/14.16-x64 too)
         per_file = (f"each source file can have its own compiler (try_compiler switches it, \"all\" tries each); "
-                    f"this platform's: {', '.join(c.id for c in console.compilers)}\n"
+                    f"this project's: {', '.join(c.id for c in console.project_compilers(fp))}\n"
                     if console.file_compiler(fp, "") else "")
         what = ("started from scratch from your copy of the game" if cfg.get("origin") == "scratch"
                 else f"a fork of {cfg['repo_url']}")
@@ -1913,8 +2262,9 @@ class ForkEngine:
 
     @staticmethod
     def _names(meta: dict, fn) -> list[str]:
-        """Ways the function may be spelled in source: full C++ name, Class::method, then the plain symbol."""
-        out = []
+        """Ways the function may be spelled in source: its real name (a PC game's, Console.real_names), full C++
+        name, Class::method, then the plain symbol."""
+        out = [meta["real"]] if meta.get("real") else []
         dem = (meta.get("demangled") or "").split("(", 1)[0].strip()
         if dem:
             dem = dem.split(" ")[-1] if " " in dem and "operator" not in dem else dem
@@ -1927,6 +2277,10 @@ class ForkEngine:
         out.append(meta.get("symbol") or fn["name"].split("@")[0])
         if (c := _MSVC_C.fullmatch(meta.get("symbol") or "")):  # _f, _f@8 (__stdcall), @f@8 (__fastcall): f in C
             out.append(c.group(1))
+        if not dem and re.fullmatch(r"[A-Za-z_]\w*", out[-1]):
+            # a class named after the function, and its destructor (func_004D9DD0::~func_004D9DD0): a PC game's
+            # build pairs it by the address in its name; its constructor is func_004D9DD0::func_004D9DD0 already
+            out.append(f"{out[-1]}::~{out[-1]}")
         return list(dict.fromkeys(out))
 
     def _find(self, text: str, names: list[str]):
@@ -1935,6 +2289,43 @@ class ForkEngine:
             if span:
                 return n, span
         return None, None
+
+    @classmethod
+    def _seen_beside(cls, fp: ForkProject, text: str, span: tuple[int, int], hit: str,
+                     names: list[str]) -> tuple[int, int] | None:
+        """The definition the build sees after one an `#if` hides at `span`, or None: found by `hit`, then by the
+        function's other `names`. Only one at file scope counts: a call in another function's body followed by a
+        block reads as a definition (`y = f(x) * 2.0;` then `if (y) {`), and taken for it, that function was cut from
+        the call on and the try put inside it."""
+        for look in dict.fromkeys([hit, *names]):
+            at = span
+            while (later := csource.find(text[at[1]:], look)) is not None:
+                at = (at[1] + later[0], at[1] + later[1])
+                # (and only one that surely is a definition: at file scope too, find() takes a call for one, `static
+                # double bias = f(2.0) * 2.0;` up to the next definition's `{`, and the code between was replaced;
+                # and only one the build surely compiles: of `#ifdef _WIN32` and its `#else`, a macro the app can't
+                # tell, the try went into the first, maybe the branch the build leaves out, and never matched)
+                if csource.at_file_scope(text, at[0]) and csource.opens_body(text, at, look) and \
+                        cls._surely_compiled(fp, text, at[0]):
+                    return at
+        return None
+
+    @staticmethod
+    def _surely_compiled(fp: ForkProject, text: str, at: int) -> bool:
+        """Whether the code at `at` is compiled whatever the macros the project may define are (csource.
+        surely_compiled with the project's never-defined ones, _hidden's)."""
+        names = {n for n in csource.condition_names(text, at) if project_macro(n)}
+        return csource.surely_compiled(text, at, fp.never_defined(names) if names else set())
+
+    @staticmethod
+    def _hidden(fp: ForkProject, text: str, at: int) -> tuple[int, str] | None:
+        """(line, directive) of the `#if` branch that leaves the code at `at` of a source out of the build. The search
+        for definitions (a second or so in a big project) runs only when the code would be hidden with every macro
+        that may be the project's own undefined: knowing more macros undefined only ever hides more."""
+        names = {n for n in csource.condition_names(text, at) if project_macro(n)}
+        if csource.hidden_by(text, at, names) is None:
+            return None
+        return csource.hidden_by(text, at, fp.never_defined(names))
 
     def _held(self, proj, unit: str, text: str | None = None) -> set[str]:
         """Functions of a unit whose source is still the very text judged to load the wrong constants: objdiff's
@@ -1979,7 +2370,8 @@ class ForkEngine:
     @staticmethod
     def _missing_note(unit, fn) -> str:
         """What to tell an agent whose compile built, but whose unit's object has no such function."""
-        return (f"\n\nNOT IN YOUR BUILD: {unit.name} compiled, but its object doesn't define {fn['name']}, so there "
+        sym = ForkEngine._meta(fn).get("symbol") or fn["name"]
+        return (f"\n\nNOT IN YOUR BUILD: {unit.name} compiled, but its object doesn't define {sym}, so there "
                 "is nothing to compare yet.")
 
     def _apply_scores(self, proj, unit: str, scores: dict[str, float | None], skip: int | None = None,
@@ -2006,8 +2398,13 @@ class ForkEngine:
                     self._reopened(db, proj, r, via, pct, held=pct is not None and pct >= 100)
                 elif pct is not None and r["best_score"] == 0:  # reopened before this was fixed: still says identical
                     db.execute("UPDATE functions SET best_score=? WHERE id=?", (scaled(pct, r["n_insns"]), r["id"]))
-                elif pct is not None and not r["best_source"]:
-                    db.execute("UPDATE functions SET best_score=? WHERE id=?", (scaled(pct, r["n_insns"]), r["id"]))
+                elif pct is not None and not r["best_source"] and r["best_score"] != scaled(pct, r["n_insns"]):
+                    score = scaled(pct, r["n_insns"])
+                    improved = (score < r["n_insns"] * 100
+                                and (r["best_score"] is None or score < r["best_score"]))
+                    db.execute("UPDATE functions SET best_score=?, "
+                               "last_improved=CASE WHEN ? THEN ? ELSE last_improved END WHERE id=?",
+                               (score, improved, time.time(), r["id"]))
 
     def _matched(self, db, proj, r, agent: Agent | None, text: str | None) -> None:
         """Record a function that matches now (outside compile_and_diff, which records its own)."""
@@ -2023,6 +2420,22 @@ class ForkEngine:
         self.net.on_match(proj, r["id"], agent)
 
     DATA_LISTED = 12  # data symbols a brief describes
+
+    def permuter_name(self, slug: str, function: str, source: str) -> str:
+        """The name the function's definition has in `source`, which decomp-permuter looks it up by: a PC or Xbox
+        game's function is its mangled symbol (`?Update@@YAXH@Z`), which no C spells, so every turn on one ended
+        with "Function ... not found in base.c". The symbol itself when no spelling of it (_names) is defined. The
+        definition's own spelling, class and all: a method found by its bare name (`Func_E46D0`) may be defined on
+        a class the source calls something else than its symbol does (`C_vt_003AB500::Func_E46D0`), and the
+        bare name isn't the definition's (6 of 8 an Xbox game's turns lost that way)."""
+        fn = self._fn(slug, function)
+        names = [n for n in self._names(self._meta(fn), fn) if re.fullmatch(r"[\w:~]+", n)]
+        name, span = self._find(source, names)
+        if name is None:
+            return function
+        own = re.search(rf"(?<![\w:~])((?:[A-Za-z_]\w*\s*::\s*)*~?{re.escape(name.split('::')[-1])})\s*\(",
+                        source[span[0]:span[1]])
+        return re.sub(r"\s+", "", own.group(1)) if own else name
 
     def permuter_header(self, slug: str, function: str) -> str:
         """What decomp-permuter must read before a function of a fork: the headers its source file includes, then
@@ -2085,11 +2498,18 @@ class ForkEngine:
             lines.append(f"C++ name: {meta['demangled']}")
         if unit.scratch:
             lines.append(f"compiler: {unit.scratch.get('compiler', '?')} {unit.scratch.get('c_flags', '')}")
-        src_text = None
+        src_text, asm = None, []
         if unit.source:
             lines.append(f"source file: {unit.source}")
-            if own := consoles.get(cfg.get("platform")).file_compiler(fp, unit.source):
+            console = consoles.get(cfg.get("platform"))
+            if own := console.file_compiler(fp, unit.source):
                 lines.append(f"this file's compiler: {own} (try_compiler(\"{fn['name']}\", \"all\") tries the others)")
+            # its own settings and why (an agent wondering why a file builds differently has the answer here)
+            if mine := console.file_settings(fp).get(unit.source):
+                said = [f"its own flags: {' '.join(mine['flags'])}"] if mine.get("flags") else []
+                said += [f"why: {mine['why']}"] if mine.get("why") else []
+                if said:
+                    lines.append("this file's build: " + "; ".join(said) + " (docs/build-settings.md has every file's)")
             p = fp.root / unit.source
             src_text = p.read_text(errors="replace", encoding="utf-8") if p.exists() else None
         else:
@@ -2097,12 +2517,12 @@ class ForkEngine:
         try:
             d = fp.diff(unit, meta.get("symbol") or fn["name"])
             pct = ("not in your build yet" if d.match_percent is None else
-                   "every instruction matches, but loaded constants differ" if d.literals else
+                   d.why_not() if d.literals else
                    f"{percent_text(d.match_percent)} match")
             asm = d.target_asm().splitlines()
-            if len(asm) > 500:
-                asm = asm[:500] + [f"... ({len(asm) - 500} more instructions)"]
-            lines += [f"current state: {pct}", "", "### Target assembly", "```asm", *asm, "```"]
+            shown = asm[:500] + ([f"... ({len(asm) - 500} more instructions; list_parts shows them a part at a time)"]
+                                 if len(asm) > 500 else [])
+            lines += [f"current state: {pct}", "", "### Target assembly", "```asm", *shown, "```"]
             if cfg.get("origin") == "scratch":
                 lines += self._data_used(proj, d.refs)
             if d.literals:
@@ -2115,29 +2535,51 @@ class ForkEngine:
         _, span = self._find(src_text, self._names(meta, fn)) if src_text else (None, None)
         if span:
             lines += ["", "### Current source", "```c", src_text[span[0]:span[1]].strip(), "```"]
+            if hidden := self._hidden(fp, src_text, span[0]):
+                lines.append(f"⚠️ It's inside `{hidden[1]}` (line {hidden[0]} of {unit.source}), which the build leaves "
+                             "out: the state above is not this code's. compile_and_diff compiles yours where the build "
+                             "sees it, without that copy; kept, the function is visible from then on.")
         else:
             lines += ["", f"### Not in {unit.source or 'the source'} yet: compile_and_diff adds it at the end."]
-        if fn["best_source"] and fn["status"] != "matched":
+        if (fn["best_source"] and fn["status"] != "matched"
+                and (not span or fn["best_source"].strip() != src_text[span[0]:span[1]].strip())):
             lines += ["", f"### Best attempt so far (score {fn['best_score']})", "```c", fn["best_source"].strip(), "```"]
         elif fn["status"] != "matched" and (span is None or csource.is_stub(src_text[span[0]:span[1]])):
             seed = self._draft(proj, fp, cfg, fn, unit)
-            if seed:
+            made = self._compilable(proj, fp, cfg, fn, unit) if seed else None
+            if made is not None:  # (as the headers are now: it follows them, and redraft adds an agent's)
+                lines += ["", "### Machine draft (Ghidra's, made to compile here; often wrong in types and details; "
+                              "redraft(function, context) makes it again with your declarations)", "```cpp",
+                          (made[0] + "\n" if made[0] else "") + made[1].strip(), "```"]
+            elif seed:
                 lines += ["", "### Machine draft: a starting point, often wrong in types and details", "```c",
-                          seed.strip(), "```"]
+                          self._method_draft(fp, cfg, fn, seed).strip(), "```"]
+        lines += self._class_brief(fp, cfg, fn) + self._struct_brief(fp, cfg, fn)
+        lines += self._debug_brief(fp, cfg, fn)
+        lines += self._ltcg_brief(fp, meta, fn, unit)
+        lines += self._method_brief(fp, cfg, meta, fn)
+        if found := self._unresolved_lines(fp, meta, fn, unit, src_text[span[0]:span[1]] if span else None):
+            lines += ["", f"### Unresolved in {unit.name}'s harness link (nothing in it defines them yet)", *found]
         twin = self._twin_brief(proj, fn) if fn["status"] != "matched" else []
         lines += twin
         try:
             alike = [] if twin else [(r, sim) for r, sim in self.similar(proj, fp, fn, top=3) if r["status"] == "matched"]
         except (ObjdiffError, ForkError):
             alike = []
+        src = None
         if alike:
             r, sim = alike[0]
             src = self._current_source(fp, r)
             lines += ["", f"### Looks like {r['name']} ({sim * 100:.0f}% similar, already matched)"]
-            if src and len(src) < 3000:
+            if function_parts.donor_fits(src, fn["n_insns"] or 0, 3000):
                 lines += ["```c", src.strip(), "```"]
             if len(alike) > 1:
                 lines.append("also similar and matched: " + ", ".join(f"{x['name']} ({s * 100:.0f}%)" for x, s in alike[1:]))
+        if fn["status"] != "matched" and (fn["n_insns"] or 0) >= function_parts.LARGE:
+            # how big functions matched, this one's repeated calls, the macros its file (and the look-alike) define
+            lines += function_parts.big_lines(fn["n_insns"], asm, function_parts.file_macros(
+                (src_text or "") + "\n" + (src or "")), parts=bool(unit.source))
+            lines += self._parts_brief(proj, fn)
         done = self.net.store.all("SELECT name FROM functions WHERE project_id=? AND unit=? AND status='matched' "
                                   "AND id != ? ORDER BY n_insns DESC LIMIT 12", fn["project_id"], fn["unit"], fn["id"])
         if done:
@@ -2156,7 +2598,24 @@ class ForkEngine:
         lines += ["", "Send compile_and_diff the complete function definition (same name and signature as the original), "
                       "with any #include \"...\", prototypes or #pragma lines it needs. Structs, globals and helper "
                       "functions go in with edit_file."]
-        return "\n".join(lines)
+        from .code_blocks import hints
+        from .function_patterns import hints as pattern_hints
+        return "\n".join(lines) + hints(self.net, fn) + pattern_hints(self.net, fn)
+
+    def _parts_brief(self, proj, fn) -> list[str]:
+        """A big function's parts, for its brief: where the target is cut, which are marked in the C and held."""
+        try:
+            code, parts = function_parts.target_parts(self.net, proj["slug"], fn)
+            if len(parts) < 2:
+                return []
+            definition = function_parts._definition(self, proj["slug"], fn)
+            agent = SimpleNamespace(id=None)
+            table = function_parts._parts_table(self.net, agent, proj["slug"], fn, definition, code, parts)
+        except (NetworkError, ForkError, ObjdiffError, OSError, ValueError):
+            return []  # a way of working: never between an agent and the function
+        shown = table[:30] + ([f"- ... and {len(table) - 30} more (list_parts)"] if len(table) > 30 else [])
+        return ["", f"### Its parts ({len(parts)}, cut at the target's blocks; work on one at a time)", *shown,
+                function_parts.MARKERS]
 
     def _twin_brief(self, proj, fn) -> list[str]:
         """For a brief: the matched function with the same code (relocations aside), and its code made into this
@@ -2173,7 +2632,7 @@ class ForkEngine:
         except (NetworkError, ForkError, OSError, ValueError):
             source = None
         out = ["", f"### Identical code: {a['name']} ({a['unit']}) is the same machine code and already matches"]
-        if source and len(source) < 6000:
+        if function_parts.donor_fits(source, fn["n_insns"] or 0, 6000):
             why = self.net.twins.miss_why(fn["id"])
             out += ["Its code with this function's names: start from it. "
                     + (f"decompdecomp tried it as is: {why}. Fix that (this file lacks something the other one has: a "
@@ -2184,14 +2643,17 @@ class ForkEngine:
             out.append("It's hand-written assembly there, so this one is too: release it with a note saying so.")
         else:
             src = self._current_source(ForkProject(Path(proj["root"])), a)
-            if src and len(src) < 4000:
+            if function_parts.donor_fits(src, fn["n_insns"] or 0, 4000):
                 out += ["Its source (its names differ from this one's: use the ones in this function's assembly):",
                         "```c", src.strip(), "```"]
         return out
 
     def _draft(self, proj, fp: ForkProject, cfg: dict, fn, unit) -> str | None:
-        """m2c draft from the project's assembly for this function, cached in the database."""
-        if fn["seed"] is not None:
+        """m2c draft from the project's assembly for this function (Ghidra's from its target object where m2c can't
+        read the code), cached in the database. A console with drafts of its own (Ghidra's: PC) keys it by the unit's
+        target object: a join, a split or a repair of the analysis changes that, and the draft is made again."""
+        key = self._draft_key(cfg, unit)
+        if fn["seed"] is not None and fn["seed_key"] == key:
             return fn["seed"] or None
         hint = (unit.scratch or {}).get("compiler", "") or json.dumps(fp.needs(cfg.get("version")))
         meta = self._meta(fn)
@@ -2199,20 +2661,226 @@ class ForkEngine:
             text = drafts.draft(fp.root, cfg.get("platform") or "", unit.name, meta.get("symbol") or fn["name"],
                                 unit.source, compiler_hint=hint)
             text = text and "/* m2c */\n" + text
-            if not text and unit.target is not None and unit.target.exists() and ghidra.available():
+            if not text and self._ghidra_drafts(fp):
                 # not STATE (".decomp"): analyzeHeadless refuses a project path with an element starting with "."
-                found = ghidra.decompile_object(unit.target, fp.root / "build" / "ghidra")
-                names = [meta.get("symbol") or fn["name"], *self._names(meta, fn)]
-                body = next((found[n] for n in names if n in found), None)
-                from .. import consoles
-
-                adapt = getattr(consoles.get(cfg.get("platform") or ""), "adapt_draft", None)
-                text = body and "/* Ghidra */\n" + (adapt(body.strip()) if adapt else body.strip())
+                body = self._ghidra_draft(fp, cfg, unit, [meta.get("symbol") or fn["name"], *self._names(meta, fn)])
+                text = body and "/* Ghidra */\n" + body
         except OSError:
             text = None
         with self.net.store.tx() as db:
-            db.execute("UPDATE functions SET seed=? WHERE id=?", (text or "", fn["id"]))
+            db.execute("UPDATE functions SET seed=?, seed_key=? WHERE id=?", (text or "", key, fn["id"]))
         return text
+
+    @staticmethod
+    def _draft_key(cfg: dict, unit) -> str | None:
+        """What a function's machine draft is made from, where that changes (Console.own_drafts: its unit's target
+        object, which Ghidra drafts): None elsewhere, a draft made once."""
+        if not consoles.get(cfg.get("platform")).own_drafts or unit.target is None:
+            return None
+        try:
+            return hashlib.sha1(unit.target.read_bytes()).hexdigest()[:16]
+        except OSError:
+            return None
+
+    # ------------------------------------------------------------------ drafts in the background (app/drafts.py)
+
+    def can_draft(self, proj) -> bool:
+        """Whether the background drafter makes this project's drafts: a game started from scratch on a console with
+        drafts of its own (PC), with Ghidra installed (its exact drafts need nothing, and are made as autopilot
+        tries them)."""
+        cfg = json.loads(proj["config"])
+        return (cfg.get("origin") == "scratch" and bool(cfg.get("ready"))
+                and consoles.get(cfg.get("platform")).own_drafts and ghidra.available())
+
+    def stale_drafts(self, proj) -> list[int]:
+        """Open functions whose machine draft is missing or was made from another target object, a unit after
+        another (Ghidra drafts a whole unit at once); then the open ones autopilot tried, whose drafts the headers
+        may have changed (each is tried again only if its draft did: autopilot_one skips what it judged)."""
+        _, fp, cfg = self.get(proj["slug"])
+        rows = self.net.store.all("SELECT id, unit, seed, seed_key FROM functions WHERE project_id=? AND "
+                                  "status='open' ORDER BY unit, n_insns", proj["id"])
+        keys = {}
+        for r in rows:
+            if r["unit"] not in keys:
+                try:
+                    keys[r["unit"]] = self._draft_key(cfg, fp.unit(r["unit"]))
+                except (ForkError, KeyError):
+                    keys[r["unit"]] = None
+        stale = [r["id"] for r in rows if r["seed"] is None or r["seed_key"] != keys[r["unit"]]]
+        agent, _ = self.net.local_agent("autopilot")
+        tried = {r["function_id"] for r in self.net.store.all(
+            "SELECT DISTINCT a.function_id FROM attempts a JOIN functions f ON f.id=a.function_id WHERE "
+            "f.project_id=? AND f.status='open' AND a.agent_id=?", proj["id"], agent.id)}
+        return stale + [r["id"] for r in rows if r["id"] in tried and r["id"] not in set(stale)]
+
+    def draft_mark(self, proj) -> tuple:
+        """What drafts are made from, summed up: the headers (declarations, classes) and functions.json (names, the
+        analysis) as they are on disk."""
+        root = Path(proj["root"])
+        files = [*sorted((root / "include").rglob("*.h")), *sorted((root / "config").rglob("functions.json"))]
+        return tuple((p.name, p.stat().st_mtime_ns) for p in files if p.is_file())
+
+    def background_draft(self, proj, fn) -> str | None:
+        """One function's machine draft, made for the background drafter (and cached, as when a brief asks)."""
+        _, fp, cfg = self.get(proj["slug"])
+        unit = fp.unit(fn["unit"])
+        return self._draft(proj, fp, cfg, fn, unit) if unit.source else None
+
+    def redraft(self, slug: str, function: str, context: str) -> str:
+        """redraft in a game whose console has drafts of its own (PC): Ghidra's draft made compilable again with an
+        agent's declarations (a class that declares the function, a callee's prototype, a global's type) on top of the
+        project's headers. Recorded nowhere."""
+        proj, fp, cfg = self.get(slug)
+        if not consoles.get(cfg.get("platform")).own_drafts:
+            raise NetworkError("redraft makes the machine drafts of ROM projects (m2c) and PC games (Ghidra's): in "
+                               "this project, write from the brief's draft")
+        if not context.strip():
+            raise NetworkError("pass the declarations to draft with in `context` (a class, a prototype, an extern)")
+        if not ghidra.available():
+            raise NetworkError("redraft needs Ghidra, which makes PC games' drafts: the user can install it in Setup")
+        fn = self._fn(slug, function)
+        unit = fp.unit(fn["unit"])
+        made = self._compilable(proj, fp, cfg, fn, unit, context)
+        if made is None:
+            raise NetworkError(f"Ghidra's draft of {fn['name']} can't be made into C that compiles (it reads registers "
+                               "or stack no C names): write from the brief's draft")
+        prelude, code = made
+        return (f"Ghidra's draft of {fn['name']} with your declarations, as C that compiles in {unit.source}. Recorded "
+                "nowhere: try it with compile_and_diff (with your declarations in a header: edit_file), and keep what "
+                "helped in the project's headers, so every draft and agent gets it.\n```cpp\n"
+                + (prelude + "\n" if prelude else "") + code.strip() + "\n```")
+
+    def _classes(self, fp: ForkProject, cfg: dict) -> classes.Classes | None:
+        """The C++ classes the console reads from the project's program (Console.classes), or None."""
+        try:
+            return consoles.get(cfg.get("platform")).classes(fp)
+        except Exception:  # a reading of the program: it never stands between an agent and the function
+            logging.getLogger("decompdecomp").exception("reading the C++ classes failed")
+            return None
+
+    def _class_of(self, fp: ForkProject, cfg: dict, fn) -> tuple[classes.Classes | None, int | None]:
+        """The project's classes and the function's address in them (None: no classes, or not one of theirs)."""
+        found = self._classes(fp, cfg)
+        return found, found.symbols.get(self._meta(fn).get("symbol") or fn["name"]) if found else None
+
+    def _class_brief(self, fp: ForkProject, cfg: dict, fn) -> list[str]:
+        """get_function's lines on the class of a virtual function, constructor or destructor (classes.brief_lines)."""
+        found, addr = self._class_of(fp, cfg, fn)
+        return classes.brief_lines(found, addr, self._class_label(found)) if addr is not None else []
+
+    def _debug_brief(self, fp: ForkProject, cfg: dict, fn) -> list[str]:
+        """What the game's own debug information says about the function (Console.debug_of), when it has any."""
+        console = consoles.get(cfg.get("platform"))
+        version = (fp.manifest or {}).get("version") or cfg.get("version")
+        known = console.debug_of(fp, version, self._meta(fn).get("symbol") or fn["name"]) if version else None
+        return console.debug_brief(known) if known else []
+
+    @staticmethod
+    def _struct_label(found: structs.Structs):
+        """A function's or global's name as agents know it: a global without a real name is D_<address>, as the
+        project's sources name it."""
+        return lambda addr: found.labels.get(addr, f"D_{addr:08X}")
+
+    @staticmethod
+    def _class_label(found: classes.Classes):
+        return lambda addr: found.labels.get(addr, f"0x{addr:08X}")
+
+    def _method_draft(self, fp: ForkProject, cfg: dict, fn, draft: str) -> str:
+        """The machine draft as the brief shows it: where the function is surely a method of one class
+        (classes.owner), as `Class::name(...)` with `this` (the processor's Arch.method_draft); else as made."""
+        rewrite = arch.get(consoles.get(cfg.get("platform")).arch).method_draft
+        if rewrite is None:
+            return draft
+        try:
+            found, addr = self._class_of(fp, cfg, fn)
+            cls, role = classes.owner(found, addr) if addr is not None else (None, "")
+            if cls is None:
+                return draft
+            label = self._class_label(found)
+            symbol = self._meta(fn).get("symbol") or fn["name"]
+            word = re.sub(r"@.*$", "", symbol.lstrip("_@?"))  # the name inside a decorated symbol: the draft's holds it
+            return rewrite(draft, word, label(cls.vtable), label(addr), role, found.found_from) or draft
+        except Exception:  # a way of showing the draft: it never stands between an agent and it
+            logging.getLogger("decompdecomp").exception("showing a draft as a C++ method failed")
+            return draft
+
+    def get_class(self, slug: str, what: str = "") -> str:
+        """get_class in a project: the classes the console reads from its program (PC: RTTI and code), by name, vtable
+        address or one of their functions (as the report, func_<address> or a real name spells it)."""
+        _, fp, cfg = self.get(slug)
+        found = self._classes(fp, cfg)
+        if found is None:
+            raise NetworkError(classes.WHERE)
+        label = self._class_label(found)
+        what = what.strip()
+        if not what or not found.by_vtable:
+            return classes.listing(found, label)
+        addr = found.symbols.get(what, next((vt for vt, name in found.names.items() if name == what), None))
+        if addr is None and (m := re.fullmatch(r"(?:0x)?([0-9A-Fa-f]{6,8})", what)):
+            addr = int(m.group(1), 16)
+        if addr is None:
+            try:
+                fn = self._fn(slug, what)
+                addr = found.symbols.get(self._meta(fn).get("symbol") or fn["name"])
+            except NetworkError:
+                pass
+        hits = found.find(addr) if addr is not None else []
+        if not hits:
+            raise NetworkError(f"`{what}` isn't a class, a vtable, or a virtual function, constructor or destructor of "
+                               f"one of the {len(found.by_vtable)} classes found in this game: get_class() lists them")
+        return "\n\n".join(classes.describe(c, found, label, focus=addr) for c in hits[:3])
+
+    def _structs(self, fp: ForkProject, cfg: dict) -> structs.Structs | None:
+        """The struct layouts the console guesses from the project's code (Console.structs), or None."""
+        try:
+            return consoles.get(cfg.get("platform")).structs(fp)
+        except Exception:  # a reading of the program: it never stands between an agent and the function
+            logging.getLogger("decompdecomp").exception("guessing struct layouts failed")
+            return None
+
+    def guess_struct(self, slug: str, function: str, argument: str = "arg0") -> str:
+        """guess_struct in a project: the layout behind one of a function's pointers (`this`, arg0-arg3 on the
+        stack, what it returns, or a global by its D_<address>), as layouts.guess_text says it."""
+        from .engine import layouts
+
+        _, fp, cfg = self.get(slug)
+        found = self._structs(fp, cfg)
+        if found is None:
+            raise NetworkError(f"{layouts.where_read()}, not this project's")
+        name = function.strip()
+        addr = found.symbols.get(name)  # (the report's symbol, func_<address> or a real name)
+        if addr is None:
+            fn = self._fn(slug, function)
+            name, addr = fn["name"], found.symbols.get(self._meta(fn).get("symbol") or fn["name"])
+        if addr is None:
+            raise NetworkError(f"{name} isn't one of the functions read from the program")
+        base, path, n = layouts.parse_argument(argument)
+        if n == structs.RETURN:
+            key, what = (structs.RETURN, addr), "what it returns"
+        elif n is not None:
+            key, what = (structs.ARGUMENT, addr, n), structs.argument_name(n)
+        else:
+            m = re.fullmatch(r"_?(?:D_|0x)?([0-9A-Fa-f]{8,16})", base)
+            at = int(m.group(1), 16) if m else next((a for a, name in found.labels.items() if name == base), None)
+            if at is None:
+                raise NetworkError(f"`{argument}`: say this, arg0 to arg3, return, or a global's name or D_<address> "
+                                   "(and +0x14 to follow the pointer at 0x14)")
+            key, what = (structs.GLOBAL, at), f"the global {self._struct_label(found)(at)}"
+        label = self._struct_label(found)
+        return "\n".join(layouts.guess_text(found, key, path, what, name, argument, label,
+                                             "declare what holds in a header the project's sources include"))
+
+    def _struct_brief(self, fp: ForkProject, cfg: dict, fn) -> list[str]:
+        """get_function's lines on the function's pointer arguments' likely layouts (layouts.brief_lines)."""
+        from .engine import layouts
+
+        found = self._structs(fp, cfg)
+        addr = found.symbols.get(self._meta(fn).get("symbol") or fn["name"]) if found else None
+        try:
+            return layouts.brief_lines(found, addr, fn["name"], self._struct_label(found)) if addr is not None else []
+        except Exception:  # a heuristic: it never stands between an agent and the function
+            logging.getLogger("decompdecomp").exception("guessing struct layouts failed")
+            return []
 
     def claim(self, agent: Agent, slug: str, function: str | None = None, strategy: str = "easiest") -> str:
         if (link := self.net.links.get(slug)) is not None:
@@ -2224,6 +2892,7 @@ class ForkEngine:
         if fn is None:
             left = (self.get(slug)[2].get("uncovered") or {}).get("functions")
             return (self.net.nothing_to_claim(agent, self.net._project(slug), " with a source file")
+                    + function_parts.waiting(self.net, slug)
                     + (f"\n{left} more functions are in code no source file covers yet. The user can give them files "
                        "(the project's overview in decompdecomp: Give them source files); then there's more to claim."
                        if left else ""))
@@ -2231,9 +2900,9 @@ class ForkEngine:
 
     def _claim_in_room(self, link, agent: Agent, slug: str, function: str | None, strategy: str) -> str:
         """A member of a room: the host hands out functions (nobody does one twice); the brief comes from this copy."""
-        name = link.claim(agent, self._fn(slug, function)["name"] if function else None, strategy)
-        if name is None:
-            return "Nothing left to claim in this room: every function with a source file matches or someone is on it. 🎉"
+        name, why = link.claim(agent, self._fn(slug, function)["name"] if function else None, strategy)
+        if name is None:  # (the host's word: what's left and why, as its own agents hear it)
+            return why or "Nothing left to claim in this room: every function with a source file matches or someone is on it. 🎉"
         try:
             fn = self.net.claim_row(agent, slug, name, strategy)
         except NetworkError:  # the host has a newer tree (new files, a split): follow it, then claim here
@@ -2257,15 +2926,17 @@ class ForkEngine:
         return "\n".join(out) or "none"
 
     def attempt(self, agent: Agent, slug: str, function: str, source: str, keep: bool = True, prelude: str = "",
-                quiet: int | None = None) -> dict:
+                quiet: int | None = None, part: int | None = None, comment: bool = False) -> dict:
         """`keep`: whether a version that doesn't match stays in the source file (an agent's work in progress) or
         is undone and kept only as the function's best attempt (autopilot's drafts). `prelude`: (decompdecomp's own
         tries) type definitions the code needs, placed after the file's includes. `quiet`: (the permuter's
         variants) recorded only when better than this score. A try that isn't kept holds the function only while
-        it builds (twins' tries come unclaimed: a 30-minute claim each kept agents off them, then counted as given up)."""
+        it builds (twins' tries come unclaimed: a 30-minute claim each kept agents off them, then counted as given up).
+        `part`: compile_part's change to one part of a big function (function_parts.py), which checked the agent may
+        change it: allowed while another agent holds the function, recorded as a part's compile."""
         held = None if keep else self._hold_for_try(slug, function, agent)
         try:
-            res = self._attempt(agent, slug, function, source, keep, prelude, quiet)
+            res = self._attempt(agent, slug, function, source, keep, prelude, quiet, part=part, comment=comment)
         finally:
             if held is not None:
                 with self.net.store.tx() as db:
@@ -2292,6 +2963,8 @@ class ForkEngine:
                 threading.Thread(target=self._report_best, args=(link, agent, name, source, res["score"]), daemon=True).start()
         return res
 
+
+
     def _hold_for_try(self, slug: str, function: str, agent: Agent) -> int | None:
         """Claim an open function nobody holds for one quick try; its id, or None (held already, or matched)."""
         fn = self._fn(slug, function)
@@ -2317,9 +2990,52 @@ class ForkEngine:
         except NetworkError:
             pass
 
-    def _attempt(self, agent: Agent, slug: str, function: str, source: str, keep: bool = True, prelude: str = "",
-                 quiet: int | None = None) -> dict:
+    def _probe_state(self) -> tuple[OrderedDict, threading.Lock]:
+        """The preview cache: compile key -> what a preview of that source said, and its lock (made on first use,
+        so an engine built without __init__ still gets one)."""
+        state = getattr(self, "_probe_state_memo", None)
+        if state is None:
+            state = self._probe_state_memo = (OrderedDict(), threading.Lock())
+        return state
+
+    def _probe_of(self, key: str) -> dict | None:
+        """A preview of this exact source, judged before: its result again without building anything."""
+        probes, lock = self._probe_state()
+        with lock:
+            hit = probes.get(key)
+            if hit is None:
+                return None
+            probes.move_to_end(key)
+            return dict(hit)
+
+    def _probe_keep(self, key: str, result: dict) -> dict:
+        """Record what a preview of this source said, so the next preview of it costs nothing."""
+        if result.get("score") is not None:
+            probes, lock = self._probe_state()
+            with lock:
+                probes[key] = dict(result)
+                probes.move_to_end(key)
+                while len(probes) > 512:
+                    probes.popitem(last=False)
+        return result
+
+    def _preview_attempt(self, agent: Agent, slug: str, function: str, source: str, keep: bool = True, prelude: str = "",
+                 quiet: int | None = None, probe: bool = False, part: int | None = None) -> dict:
         proj, fp, cfg = self.get(slug)
+        result_fingerprint = None
+        advisory_revision = None
+
+        def record(*args, **kwargs):
+            kwargs.setdefault('output_fingerprint', result_fingerprint)
+            kwargs.setdefault('build_revision', advisory_revision)
+            if part is not None:
+                kwargs.setdefault('via', 'part')
+            return self.net._record(*args, **kwargs)
+
+        def output_fingerprint():
+            base = getattr(unit, 'base', None)
+            return target_validation.fingerprint_function(base.read_bytes(), symbol) if base and base.exists() else None
+
         fn = self._fn(slug, function)
         meta = self._meta(fn)
         if len(source) > 64 * 1024:
@@ -2330,7 +3046,9 @@ class ForkEngine:
         _, span = self._find(source, names)
         if span is None:
             raise NetworkError(f"send the complete definition of {names[0]} (with its body)")
-        code = source[span[0]:span[1]]
+        comment_start = csource.comment_above(source, span[0])
+        commented = comment_start < span[0]
+        code = source[comment_start:span[1]]
         unit = fp.unit(fn["unit"])
         if not unit.source:
             raise NetworkError(f"unit {unit.name} has no source file, so there's nowhere to write it")
@@ -2340,26 +3058,32 @@ class ForkEngine:
             have = ""
         includes, before_lines, after_lines = _around(source, span, have, unit.source)
         with self.net.store.tx() as db:  # claim bookkeeping, as for ROM projects
-            self.net._expire_claims(db)
-            claim = db.execute("SELECT agent_id FROM claims WHERE function_id=?", (fn["id"],)).fetchone()
-            if claim is not None and claim["agent_id"] != agent.id:
+            if not probe:
+                self.net._expire_claims(db)
+            claim = db.execute("SELECT agent_id FROM claims WHERE function_id=? AND expires_at>?",
+                               (fn["id"], time.time() if probe else 0)).fetchone()
+            if claim is not None and claim["agent_id"] != agent.id and part is None:
                 raise NetworkError(f"{fn['name']} is claimed by {self.net._agent_name(claim['agent_id'])}")
             now = time.time()
-            if claim is None and fn["status"] != "matched":
+            if not probe and claim is None and fn["status"] != "matched":
                 db.execute("INSERT INTO claims VALUES(?,?,?,?)", (fn["id"], agent.id, now, now + self.net.claim_ttl))
-            elif claim is not None:
+            elif not probe and claim is not None and claim["agent_id"] == agent.id:
                 db.execute("UPDATE claims SET expires_at=? WHERE function_id=?", (now + self.net.claim_ttl, fn["id"]))
         path = fp.safe_path(unit.source, write=True)
         symbol = meta.get("symbol") or fn["name"]
         linked = unit.complete and fp.linkable()  # the game is built from this file: changes must keep it identical
         with self._tree(proj).exclusive() if linked else self._tree(proj).shared(), self._unit_lock(proj, unit.name):
-            before = path.read_text(errors="replace", encoding="utf-8") if path.exists() else ""
+            raw_before = path.read_bytes() if path.exists() else b""
+            before = raw_before.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
             # What matches in the file as it is now is what this change must keep (not the database's idea of it,
             # which a change outside decompdecomp or a different measurement can leave behind)
             scores, builds = self._baseline(proj, fp, unit, before)
             held = self._held(proj, unit.name, before)
+            if scores is None:
+                raise NetworkError("Cannot establish the unit's existing matches; fix the baseline build/diff first.")
             if scores is not None:
-                self._apply_scores(proj, unit.name, scores, text=before, via="unit diff before a compile")
+                if not probe:
+                    self._apply_scores(proj, unit.name, scores, text=before, via="unit diff before a compile")
                 protected = {n for n, pct in scores.items()
                              if n != symbol and n not in held and pct is not None and pct >= 100}
                 was_matched = (scores.get(symbol) or 0) >= 100 and symbol not in held
@@ -2368,6 +3092,27 @@ class ForkEngine:
                              if n != symbol and n not in held and pct is not None and pct >= 100}
                 was_matched = fn["status"] == "matched"
             hit, old_span = self._find(before, names)
+            base, carried = before, ""  # what the new definition goes into; what of the parked copy goes with it
+            parked = self._hidden(fp, before, old_span[0]) if old_span else None
+            if parked and (seen := self._seen_beside(fp, before, old_span, hit, names)):
+                # a draft parked in `#ifdef` before the build's own definition in its `#else`: the one the build sees
+                # is the one tried (the parked one taken out, a new one put in, the visible one stayed: defined twice)
+                old_span, parked = seen, None
+            if parked:
+                # parked in an #if branch the build leaves out: written there, the compile was judged on other code,
+                # and moved out with edit_file it was refused when it broke a matched neighbour (where whole-program
+                # optimisation couples them), so an agent could do nothing with it. It goes where the build sees it,
+                # without the parked copy: kept, the function is visible from then on; else the file is undone. Its
+                # annotation (`// FUNCTION: 0x...`, often with the notes of earlier tries) comes along, and its
+                # comment too unless the agent sent one
+                lo = csource.comment_above(before, old_span[0])
+                mark = csource.marker_above(before, lo)
+                carried = before[mark:lo] + ("" if commented else before[lo:old_span[0]])
+                base, old_span = before[:mark] + before[old_span[1]:], None
+            if not probe:  # parts of a big function other agents hold keep their C (function_parts.py)
+                from . import function_parts
+
+                function_parts.guard(self.net, agent, fn, before[old_span[0]:old_span[1]] if old_span else "", code)
             pre, post = "".join(ln + "\n" for ln in before_lines), "".join(ln + "\n" for ln in after_lines)
             if old_span:
                 lo, hi = old_span
@@ -2375,14 +3120,19 @@ class ForkEngine:
                     lo, hi = _pragmas_around(before, lo, hi)
                 after = before[:lo] + pre + code.rstrip("\n") + "\n" + post + before[hi:]
             else:
-                after = self._insert_in_order(proj, fp, unit, fn, before, pre + code.rstrip("\n") + "\n" + post)
+                placed = pre + carried + code.rstrip("\n") + "\n" + post
+                after = self._insert_in_order(proj, fp, unit, fn, base, placed)
+                if base is not before and (span := self._find(after, names)[1]) and self._hidden(fp, after, span[0]):
+                    after = base.rstrip("\n") + "\n\n" + placed  # (its neighbours are parked too: after them all)
             after = _with_includes(after, includes, prelude)
             # the same file as an earlier compile of this function made, nothing it depends on changed since: that
             # compile's result, not another build
-            agents_try = keep and quiet is None and not was_matched
-            key = self.net.compile_key(fn, unit.name, after)
-            if agents_try and (again := self.net.repeat_of(key, agent, fn)) is not None:
+            agents_try = keep and quiet is None and not was_matched and not probe
+            # a rig may stand in for the network without the compile cache
+            key = self.net.compile_key(fn, unit.name, after) if hasattr(self.net, "compile_key") else None
+            if agents_try and key is not None and (again := self.net.repeat_of(key, agent, fn)) is not None:
                 return again
+            advisory_revision = 'advisory:' + key if key else None
             path.write_text(after, encoding="utf-8")
 
             def remembered(text: str, score: int | None, kept: bool = True) -> str:
@@ -2396,8 +3146,40 @@ class ForkEngine:
 
             def undo() -> None:
                 path.write_text(before, encoding="utf-8")
+                if (proj["id"], unit.name) in self._trials and scores is not None:
+                    self._trials[(proj["id"], unit.name)] = True
+                    return
                 if self._build_unit(proj, fp, unit)[0] and scores is not None:
                     self._keep_scores(proj, unit, before, scores)
+
+            if probe:
+                # Preview is deliberately separate from keep=False: even exact matches must roll back.
+                try:
+                    ok, log = self._build_unit(proj, fp, unit)
+                    if not ok:
+                        return {"text": f"BUILD ERROR: {log[-1500:]}", "score": None, "matched": False}
+                    d = fp.diff(unit, symbol)
+                    result_fingerprint = output_fingerprint()
+                    broken = sorted(n for n in protected if (d.unit_scores.get(n) or 0) < 100)
+                    if broken or (was_matched and not d.matched):
+                        return {"text": "Rejected: breaks existing matches", "score": None,
+                                "matched": False, "broken": broken, "compiled": True, "output_fingerprint": result_fingerprint}
+                    if linked and d.matched and not self._verify(proj, fp)[0]:
+                        return {"text": "Rejected: linked game differs", "score": None, "matched": False}
+                    pct = d.match_percent or 0.0
+                    score = max(1, len(d.literals)) if d.literals else scaled(pct, fn["n_insns"])
+                    return {"text": f"{percent_text(pct)} (score {score})"
+                            + ("; loaded constants differ" if d.literals else ""), "score": score,
+                            "matched": d.matched, "percent": pct, "compiled": True,
+                            "output_fingerprint": result_fingerprint, "rows": list(getattr(d, 'rows', [])),
+                            "unit_scores": dict(getattr(d, 'unit_scores', {}) or {})}
+                finally:
+                    path.write_bytes(raw_before)
+                    restored, log = self._build_all(proj, fp) if linked else self._build_unit(proj, fp, unit)
+                    if not restored:
+                        raise NetworkError(f"Preview restored the source but rebuilding it failed: {log[-1500:]}")
+                    if scores is not None:
+                        self._keep_scores(proj, unit, before, scores)
 
             ok, log = self._build_unit(proj, fp, unit)
             if not ok and (broken := fp.build_problem()) is not None:
@@ -2413,13 +3195,14 @@ class ForkEngine:
             if not ok:
                 undo()
                 if quiet is None:
-                    self.net._record(fn, agent, None, code, 0)
+                    record(fn, agent, None, code, 0)
                 why = "" if builds else ("\n(The file didn't build before your change either, so the error may be in "
                                          "other code of the file: fix that with edit_file.)")
                 return {"text": f"❌ BUILD ERROR (your change was undone){why}\n{log[-3000:]}", "score": None,
                         "matched": False}
             try:
                 d = fp.diff(unit, symbol)
+                result_fingerprint = output_fingerprint()
             except (ObjdiffError, ForkError) as e:
                 undo()
                 return {"text": f"❌ objdiff couldn't compare (your change was undone): {e}", "score": None, "matched": False}
@@ -2429,16 +3212,37 @@ class ForkEngine:
             broken = sorted(n for n in protected if n and (d.unit_scores.get(n) or 0) < 100)
             if broken:
                 undo()
-                if quiet is None:
-                    self.net._record(fn, agent, None, code, 0, compiled=True)
-                return {"text": remembered(f"❌ REJECTED and undone: your change breaks matched function(s) "
-                                           f"{', '.join(broken[:8])}. Check you replaced the right definition "
-                                           "(overloads?) and didn't change shared code.", None),
-                        "score": None, "matched": False, "broken": broken}
+                # the function's own result still counts: where whole-program optimisation (or inlining) makes a
+                # function's code change how its neighbours compile, a draft short of exact breaks them, and without
+                # its score an x86 game's agents parked drafts behind #if flags and rebuilt by hand to measure them
+                own = None
+                if d.match_percent is not None:
+                    own = max(1, len(d.literals)) if d.literals else scaled(d.match_percent, fn["n_insns"])
+                if quiet is None:  # an attempt, never the best: release puts the best back in the file
+                    record(fn, agent, own, code, 0, compiled=True, best=False)
+                listed = ", ".join(broken[:8])
+                if own is None:
+                    text = (f"❌ REJECTED and undone: your change breaks matched function(s) {listed}. Check you "
+                            "replaced the right definition (overloads?) and didn't change shared code.")
+                elif d.matched:
+                    text = (f"❌ REJECTED and undone: your change breaks matched function(s) {listed}, though "
+                            f"{fn['name']} itself matches. What changed them is how it's declared or what else you "
+                            "sent (its calling convention, static or inline, a shared declaration): check you "
+                            "replaced the right definition (overloads?).")
+                else:
+                    text = (f"❌ REJECTED and undone: your change breaks matched function(s) {listed}. {fn['name']} "
+                            f"itself came out at {percent_text(d.match_percent)} (score {own}): recorded as an "
+                            f"attempt, not kept in {unit.source}. If they changed only because of how {fn['name']} "
+                            "compiles into them (inlined, or whole-program optimisation choosing registers across "
+                            f"functions), they match again once {fn['name']} matches exactly: work from the diff "
+                            "below. Otherwise check you replaced the right definition (overloads?) and didn't change "
+                            f"shared code.\n{d.render()}")
+                return {"text": remembered(text, own, kept=False), "score": None, "held_score": own, "matched": False,
+                        "broken": broken}
             if linked and d.matched and not (ok := self._verify(proj, fp))[0]:
                 undo()
                 if quiet is None:
-                    self.net._record(fn, agent, None, code, 0, compiled=True)
+                    record(fn, agent, None, code, 0, compiled=True)
                 return {"text": f"❌ REJECTED and undone: {unit.source} is linked into the game, and with your change "
                                 f"the game no longer builds byte for byte:\n{_tail(ok[1])}", "score": None,
                         "matched": False}
@@ -2448,7 +3252,7 @@ class ForkEngine:
             if not matched and not keep and not was_matched:  # tried, not kept: the file stays as it was
                 undo()
                 if quiet is None or score < quiet:
-                    self.net._record(fn, agent, score, code, 0, compiled=True)
+                    record(fn, agent, score, code, 0, compiled=True)
                 return {"text": f"{percent_text(pct)} match (score {score}); not kept in {unit.source}", "score": score,
                         "matched": False, "percent": pct}
             best = fn["best_score"]
@@ -2458,7 +3262,7 @@ class ForkEngine:
                 # the one the notes and the brief call the best (an agent found its 91.8% try there, not its 92.3%)
                 undo()
                 if quiet is None:
-                    self.net._record(fn, agent, score, code, 0, compiled=True)
+                    record(fn, agent, score, code, 0, compiled=True)
                 stall = self.net.stall_note(fn["id"], agent.id)
                 text = remembered(f"{percent_text(pct)} match (score {score}), worse than the best so far (score "
                                   f"{best}), so {unit.source} keeps what it had; your attempt is recorded.\n"
@@ -2468,7 +3272,7 @@ class ForkEngine:
             self._hold(fn, code if d.literals else None)
             if was_matched:  # a rewrite of a matched function must keep matching
                 if quiet is None:  # a polishing helper's compiles count too (not as a match)
-                    self.net._record(fn, agent, score, code, 0)
+                    record(fn, agent, score, code, 0)
                 if not matched:
                     undo()
                     why = "loads other constants" if d.literals else f"is {percent_text(pct)}"
@@ -2479,7 +3283,7 @@ class ForkEngine:
                                                     f"Edited by {agent.name} with decompdecomp.")
                 return {"text": f"✅ {fn['name']} still matches; your tidier version is committed.{_renamed_note(d)}",
                         "score": 0, "matched": True}
-            self.net._record(fn, agent, score, code, 0, matched=matched)
+            record(fn, agent, score, code, 0, matched=matched)
             self._apply_scores(proj, fn["unit"], d.unit_scores, skip=fn["id"], agent=agent, text=after,
                                via=f"unit diff after a compile of {fn['name']}")
             self._remember(proj, fp, unit, d)
@@ -2498,6 +3302,8 @@ class ForkEngine:
         else:
             text = f"{percent_text(pct)} match (score {score}; 0 = identical).\n{d.render()}{missing}"
         return {"text": remembered(text, score) + stall, "score": score, "matched": False}
+
+
 
     def try_compiler(self, agent: Agent, slug: str, function: str, compiler: str, flags: str = "",
                      source: str = "") -> str:
@@ -2521,13 +3327,13 @@ class ForkEngine:
             raise NetworkError("this project's flags are its build's own: try_compiler changes only the file's compiler")
         if fn["status"] == "matched":
             raise NetworkError(f"{fn['name']} already matches with {own}")
-        known = [c.id for c in console.compilers]
+        known = [c.id for c in console.project_compilers(fp)]  # (a 32-bit game's 32-bit ones, a 64-bit game's 64-bit)
         if compiler.strip().lower() == "all":
             wanted = sorted(known, key=lambda c: abs(known.index(c) - known.index(own))) if own in known else known
         else:
             wanted = [compiler.strip()]
         if wanted[0] not in known:
-            raise NetworkError(f"{wanted[0]!r} isn't one of this platform's compilers: {', '.join(known)}")
+            raise NetworkError(f"{wanted[0]!r} isn't one of this project's compilers: {', '.join(known)}")
         if wanted == [own]:
             raise NetworkError(f"{unit.source} is built with {own} already")
         source = source.strip() or self.net._source_of(fn) or ""
@@ -2541,7 +3347,8 @@ class ForkEngine:
             with self._tree(proj).exclusive() if linked else self._tree(proj).shared(), self._unit_lock(proj, unit.name):
                 try:
                     # what matches with the file's own compiler, measured before it changes: what every try must keep
-                    self._baseline(proj, fp, unit, (fp.root / unit.source).read_text(errors="replace", encoding="utf-8"))
+                    base_scores, _ = self._baseline(proj, fp, unit, (fp.root / unit.source).read_text(
+                        errors="replace", encoding="utf-8"))
                     for c in wanted:
                         if tried and time.monotonic() > until:
                             break
@@ -2549,7 +3356,23 @@ class ForkEngine:
                             with self._build_locks[proj["id"]]:  # (a build reads the map)
                                 rel = console.set_file_compiler(fp, unit.source, c)
                             changed = True
-                        res = self._attempt(agent, slug, function, source, keep=False, quiet=0)
+                        if c != own and console.compiler_evidence > 1:
+                            # one match could be luck (app/unit_compilers.py): a preview first, and the file switches
+                            # only once enough of its functions match only with `c` (this build's and the evidence
+                            # earlier tries kept); else this match is kept as evidence and the file stays as it was
+                            trial = self._attempt(agent, slug, function, source, probe=True)
+                            if trial["matched"]:
+                                verdict = self._evidence_switch(agent, slug, proj, fp, console, unit, fn, own, c, source,
+                                                                base_scores or {}, trial.get("unit_scores") or {})
+                                if verdict is None:  # enough: the file switched, documented and committed
+                                    kept = c
+                                    return (f"{c}: {trial['text']}\n{unit.source} is built with {c} from now on "
+                                            f"(its reason and evidence: {console.settings_doc(fp) or 'the settings'}).")
+                                tried.append(f"{c}: {trial['text']}. {verdict}")
+                                continue
+                            res = trial
+                        else:
+                            res = self._attempt(agent, slug, function, source, keep=False, quiet=0)
                         if res["matched"] and c == own:
                             return f"{c}: {res['text']}\nThat's {unit.source}'s own compiler: nothing to switch."
                         if res["matched"]:
@@ -2557,10 +3380,14 @@ class ForkEngine:
                             self.net.bump_generation(proj["id"])  # (earlier compiles of the file aren't repeats)
                             self._commit(proj, fp, rel, f"Build {unit.source} with {c}\n\n{fn['name']} matches with "
                                                         f"it (found by {agent.name} with decompdecomp).")
+                            self.net.filecompilers.tried(slug, unit.source, c)  # (the range checks around it)
                             return f"{c}: {res['text']}\n{unit.source} is built with {c} from now on."
                         if res.get("broken"):  # the file's other functions need its own compiler
                             res["text"] = (f"the file's matched {', '.join(res['broken'][:8])} no longer match with it. "
                                            f"If {fn['name']} needs it, give it a file of its own first (split_file)")
+                        if len(wanted) == 1 and c != own and res.get("rows") and not res["matched"]:
+                            # a preview's text is its score alone: the rows are what to act on (agents asked for them)
+                            res["text"] += f"\nIts diff with {c}:\n" + render_rows(res["rows"], legend=objdiff.LEGEND)
                         tried.append(f"{c}: {res['text']}" if len(wanted) == 1 else f"{c}: {res['text'].split(chr(10))[0]}")
                 finally:
                     if changed and kept is None:
@@ -2577,27 +3404,162 @@ class ForkEngine:
         return (f"No compiler matches {fn['name']}; {unit.source} stays with {own}.\n" + "\n".join(tried)
                 + (f"\nNot tried yet (time ran out): {', '.join(left)}. Try them by name." if left else ""))
 
+    def _evidence_switch(self, agent: Agent, slug: str, proj, fp: ForkProject, console, unit, fn, own: str, c: str,
+                         source: str, base: dict, now: dict) -> str | None:
+        """try_compiler's match with `c` on a console that wants more than one function of evidence: None when the
+        file has switched (its functions' matches recorded, the evidence written with its reason, the project's page
+        of build settings committed); else what it still needs (this match kept as evidence)."""
+        from . import unit_compilers
+
+        needed = unit_compilers.needed(console, base)
+        _, gained, lost = unit_compilers.decide(base, now, needed)
+        symbol = self._meta(fn).get("symbol") or fn["name"]
+        earlier = [e for e in unit_compilers.stored(self.net, proj, unit.source, c) if e["function_id"] != fn["id"]]
+        shown = set(gained) | {symbol} | {self._meta(self._fn(slug, e["name"])).get("symbol") or e["name"] for e in earlier}
+        if lost or len(shown) < needed:
+            count = unit_compilers.keep(self.net, proj, unit.source, c, fn, source, base.get(symbol), agent)
+            if lost:
+                return (f"the file's {', '.join(lost[:6])} no longer match with {c}, so {unit.source} stays with {own} "
+                        f"(this match is kept as evidence)")
+            return (f"Kept as evidence: {count} of the {needed} functions of {unit.source} that must match only with {c} "
+                    f"before it's built with it (one match could be luck). {unit.source} stays with {own} for now: "
+                    f"try_compiler(\"<another of its functions>\", \"{c}\") on another of its functions, with C that "
+                    f"matches, completes it.")
+        # enough: the file switches, the earlier evidence's C goes in with it, every match is recorded
+        res = self._attempt(agent, slug, fn["name"], source, keep=False, quiet=0)
+        if not res.get("matched"):
+            return f"{fn['name']} didn't match again in the project's build, so {unit.source} stays with {own}"
+        for e in earlier:
+            try:
+                self._attempt(agent, slug, e["name"], e["code"], keep=False, quiet=0)
+            except NetworkError:
+                pass  # (someone's working on it: it matches when they compile its C)
+        evidence = [{"function": n, "before": round(base.get(n) or 0.0, 2), "by": agent.name} for n in sorted(shown)]
+        with self._build_locks[proj["id"]]:
+            rel = console.set_file_compiler(fp, unit.source, c, unit_compilers.reason(c, own, evidence), evidence)
+        doc = console.settings_doc(fp)
+        self.net.bump_generation(proj["id"])  # (earlier compiles of the file aren't repeats)
+        self._commit_paths(proj, fp, [p for p in (rel, doc) if p],
+                           f"Build {unit.source} with {c}\n\n{len(shown)} of its functions match only with it "
+                           f"({', '.join(sorted(shown)[:6])}); found by {agent.name} with decompdecomp. Why and on what "
+                           f"evidence: {doc or rel}.")
+        unit_compilers.forget(self.net, proj, unit.source)
+        return None
+
     # ------------------------------------------------------------------ autopilot
 
     def autopilot_prepare(self, slug: str) -> list[int]:
         """The open functions autopilot tries in a game started from scratch, smallest first. Raises NetworkError
-        when it can't run here."""
+        when it can't run here. A console with drafts of its own (Console.own_drafts: PC) needs no m2c: its exact
+        drafts come from the code, its others from Ghidra when it's installed."""
         proj, fp, cfg = self.get(slug)
         if cfg.get("origin") != "scratch":
             raise NetworkError("autopilot works on games started from scratch: a public decomp's headers don't have "
                                "what machine drafts need, and its easy functions are done already")
         if not cfg.get("ready"):
             raise NetworkError("finish setting the project up first")
-        if not drafts.supported(cfg.get("platform") or "") or toolchains.installed("m2c") is None:
-            raise NetworkError("autopilot needs m2c, the draft decompiler: install it in Setup")
-        if drafts.add_m2c_macros(fp.root / "include" / "common.h"):  # projects made before autopilot ran on them
-            self._commit(proj, fp, "include/common.h", "Add the macros machine drafts use\n\nWritten by decompdecomp's autopilot.")
-        rows = self.net.store.all("SELECT id FROM functions WHERE project_id=? AND status='open' ORDER BY n_insns, id",
-                                  proj["id"])
+        console = consoles.get(cfg.get("platform"))
+        rows = self.net.store.all("SELECT id, name, unit, meta FROM functions WHERE project_id=? AND status='open' "
+                                  "ORDER BY n_insns, id", proj["id"])
+        if console.own_drafts:
+            if (rel := console.prepare_drafts(fp)):
+                self._commit(proj, fp, rel, "Add the types machine drafts use\n\nWritten by decompdecomp's autopilot.")
+        else:
+            if not drafts.supported(cfg.get("platform") or ""):
+                if not self._ghidra_drafts(fp):
+                    raise NetworkError("autopilot needs a draft decompiler: m2c, or for this game's code Ghidra (Setup)")
+                rows = self.net.store.all("SELECT id FROM functions WHERE project_id=? AND status='open' "
+                                          "AND n_insns < ? ORDER BY n_insns, id", proj["id"], GHIDRA_DRAFT_INSNS)
+                return [r["id"] for r in rows]
+            # m2c reads the assembly a project keeps for its undecompiled functions. A ds-decomp project has none: its
+            # sources are the delinked code as comments, so every draft would fail and autopilot would still commit
+            # the macros (#232). Say so before writing anything, and let the helpers have the project.
+            if rows and self._draft_asm(fp, rows) is None:
+                raise NetworkError("Autopilot needs machine drafts, and this project keeps no assembly for m2c to read "
+                                   "(a ds-decomp project): helpers still work on it.")
+            if toolchains.installed("m2c") is None:
+                raise NetworkError("autopilot needs m2c, the draft decompiler: install it in Setup")
+            if drafts.add_m2c_macros(fp.root / "include" / "common.h"):  # projects made before autopilot ran on them
+                self._commit(proj, fp, "include/common.h", "Add the macros machine drafts use\n\nWritten by decompdecomp's autopilot.")
         return [r["id"] for r in rows]
 
+
+    def _draft_asm(self, fp: ForkProject, rows) -> Path | None:
+        """The assembly file of the first of these open functions that has one (forks/drafts.py's lookup), or None
+        when the project keeps no assembly for m2c to read."""
+        sources: dict[str | None, str | None] = {}
+        unit_of = getattr(fp, "unit", None)  # (a project whose objdiff.json isn't there to read yet)
+        for fn in rows:
+            unit_name, source = fn["unit"], None
+            if unit_of is not None:
+                try:
+                    unit = unit_of(unit_name)
+                except ForkError:  # (not in objdiff.json any more: its assembly may still be in asm/)
+                    unit = None
+                if unit is not None:
+                    unit_name, source = unit.name, unit.source
+            if source not in sources:
+                try:
+                    sources[source] = ((fp.root / source).read_text(errors="replace", encoding="utf-8")
+                                       if source else None)
+                except OSError:
+                    sources[source] = None
+            if (asm := drafts.find_asm(fp.root, unit_name, self._meta(fn).get("symbol") or fn["name"],
+                                       sources[source])) is not None:
+                return asm
+        return None
+
+    def _known(self, fp: ForkProject, unit) -> str:
+        """The project's headers and a unit's source file, as one text: what drafts take declarations from."""
+        parts = []
+        for path in [*sorted((fp.root / "include").rglob("*.h")), *([fp.root / unit.source] if unit.source else [])]:
+            try:
+                parts.append(path.read_text(errors="replace", encoding="utf-8"))
+            except OSError:
+                continue
+        return "\n".join(parts)
+
+    def _compilable(self, proj, fp: ForkProject, cfg: dict, fn, unit, context: str = "") -> tuple[str, str] | None:
+        """The function's machine draft (Ghidra's) as C that compiles in its file, made with the headers as they are
+        now (and `context`, an agent's declarations: redraft), or None (the console has no such drafts, or this one
+        can't be)."""
+        console = consoles.get(cfg.get("platform"))
+        if not console.own_drafts:
+            return None
+        raw = self._draft(proj, fp, cfg, fn, unit)
+        if not raw or not raw.startswith("/* Ghidra */"):
+            return None
+        meta = self._meta(fn)
+        return console.compilable_draft(fp, meta.get("symbol") or fn["name"], raw.removeprefix("/* Ghidra */\n"),
+                                        self._known(fp, unit) + "\n" + context)
+
+    def _autopilot_drafts(self, proj, fp: ForkProject, cfg: dict, fn, unit):
+        """What autopilot tries for a function, in order, as (prelude, definition with what it includes): a console
+        with drafts of its own, its exact drafts, then its machine draft made compilable (made only when no exact
+        one matched: Ghidra takes seconds a source file); else m2c's draft."""
+        console = consoles.get(cfg.get("platform"))
+        meta = self._meta(fn)
+        if console.own_drafts:
+            yield from console.exact_drafts(fp, meta.get("symbol") or fn["name"], self._known(fp, unit))
+            if (made := self._compilable(proj, fp, cfg, fn, unit)) is not None:
+                yield made
+            return
+        hint = (unit.scratch or {}).get("compiler", "") or json.dumps(fp.needs(cfg.get("version")))
+        text = drafts.draft(fp.root, cfg.get("platform") or "", unit.name, meta.get("symbol") or fn["name"],
+                            unit.source, compiler_hint=hint, valid=True)
+        _, span = self._find(text, self._names(meta, fn)) if text else (None, None)
+        if span is None:
+            return
+        try:
+            current = (fp.root / unit.source).read_text(errors="replace", encoding="utf-8")
+        except OSError:
+            current = ""
+        yield "", "/* machine draft (m2c), tried by autopilot */\n" + drafts.self_contained(text, span, current)
+
     def autopilot_one(self, agent: Agent, proj, fid: int) -> str:
-        """match | near | far | fail | skip, for one function's machine draft, built and diffed like an agent's."""
+        """match | near | far | fail | skip, for one function's drafts, each built and diffed like an agent's, until
+        one matches. A draft autopilot already judged as it is now is skipped: autopilot tries a function again when
+        its drafts changed (the background drafter asks it to after the headers changed, app/drafts.py)."""
         now = time.time()
         with self.net.store.tx() as db:
             self.net._expire_claims(db)
@@ -2611,17 +3573,31 @@ class ForkEngine:
             if not unit.source:
                 return "skip"
             meta = self._meta(fn)
-            hint = (unit.scratch or {}).get("compiler", "") or json.dumps(fp.needs(cfg.get("version")))
-            text = drafts.draft(fp.root, cfg.get("platform") or "", unit.name, meta.get("symbol") or fn["name"],
-                                unit.source, compiler_hint=hint, valid=True)
-            _, span = self._find(text, self._names(meta, fn)) if text else (None, None)
-            if span is None:
-                return "fail"
-            try:
-                current = (fp.root / unit.source).read_text(errors="replace", encoding="utf-8")
-            except OSError:
-                current = ""
-            code = "/* machine draft (m2c), tried by autopilot */\n" + drafts.self_contained(text, span, current)
+            names = self._names(meta, fn)
+            if self._uses_m2c(cfg):
+                hint = (unit.scratch or {}).get("compiler", "") or json.dumps(fp.needs(cfg.get("version")))
+                text = drafts.draft(fp.root, cfg.get("platform") or "", unit.name, meta.get("symbol") or fn["name"],
+                                    unit.source, compiler_hint=hint, valid=True)
+                _, span = self._find(text, names) if text else (None, None)
+                if span is None:
+                    return "fail"
+                try:
+                    current = (fp.root / unit.source).read_text(errors="replace", encoding="utf-8")
+                except OSError:
+                    current = ""
+                code = "/* machine draft (m2c), tried by autopilot */\n" + drafts.self_contained(text, span, current)
+            else:
+                # Ghidra's draft, in the console's type names, relying on the declarations its file has (as the
+                # project's own tools/drafts.py did: 249 of a PS4 game's functions matched that way)
+                text = self._ghidra_draft(fp, cfg, unit, [meta.get("symbol") or fn["name"], *names])
+                _, span = self._find(text, names) if text else (None, None)
+                if span is None:
+                    return "fail"
+                definition = text[span[0]:span[1]]
+                if self.net.store.one("SELECT 1 FROM attempts WHERE function_id=? AND agent_id=? AND source=?",
+                                      fid, agent.id, definition):
+                    return "skip"  # judged before, and the draft is the same: another run spends no build on it
+                code = "/* machine draft (Ghidra), tried by autopilot */\n" + definition
             res = self.attempt(agent, proj["slug"], fn["name"], code, keep=False)
             if res["matched"]:
                 return "match"
@@ -2636,6 +3612,31 @@ class ForkEngine:
         finally:
             with self.net.store.tx() as db:
                 db.execute("DELETE FROM claims WHERE function_id=? AND agent_id=?", (fid, agent.id))
+
+    @staticmethod
+    def _uses_m2c(cfg: dict) -> bool:
+        """Whether autopilot drafts this project's code with m2c (it reads the console's code, and it's installed);
+        Ghidra drafts the rest (_ghidra_drafts)."""
+        return drafts.supported(cfg.get("platform") or "") and toolchains.installed("m2c") is not None
+
+    @staticmethod
+    def _ghidra_drafts(fp: ForkProject) -> bool:
+        """Whether this project has Ghidra drafts: Ghidra installed, or drafts it made before, cached in the project
+        (build/ghidra, by each target object's content). On a PS4 game the cache held a draft for 21,612 of its
+        21,624 open functions, and autopilot tried none of them: it drafted with m2c only, which can't read x86."""
+        cache = fp.root / "build" / "ghidra"
+        return ghidra.available() or (cache.is_dir() and any(cache.glob("*.json")))
+
+    def _ghidra_draft(self, fp: ForkProject, cfg: dict, unit, names: list[str]) -> str | None:
+        """A function's Ghidra draft, in its console's type names (Console.adapt_draft)."""
+        if unit.target is None or not unit.target.exists():
+            return None
+        found = ghidra.decompile_object(unit.target, fp.root / "build" / "ghidra")
+        body = next((found[n] for n in names if found.get(n)), None)
+        if not body:
+            return None
+        adapt = getattr(consoles.get(cfg.get("platform") or ""), "adapt_draft", None)
+        return adapt(body.strip()) if adapt else body.strip()
 
     def _insert_in_order(self, proj, fp: ForkProject, unit, fn, text: str, code: str) -> str:
         """Place a new function where it was in the original: after the closest earlier function present in the
@@ -2677,23 +3678,21 @@ class ForkEngine:
         if any(f["status"] == "matched" for f in (a, b)):
             raise NetworkError(f"{next(f['name'] for f in (a, b) if f['status'] == 'matched')} is matched: a join "
                                "would change it, so it can't be one")
+        console = consoles.get(cfg.get("platform"))
+        if not console.joins_functions:
+            raise NetworkError(f"{console.name or 'This console'} projects can't join functions yet: work on them as "
+                               "they are, and say so in a note for the next agent")
         first, last = sorted((a, b), key=lambda f: (f["vram"] or 0, f["id"]))
         key = f"{first['name']}+{last['name']}"
         refused = (cfg.get("joins_refused") or {}).get(key)
         if refused:
             return f"Joining {first['name']} and {last['name']} was tried, and refused: {refused}. Work on them as they are."
-        with self.net.store.tx() as db:
-            meta = json.loads(db.execute("SELECT meta FROM functions WHERE id=?", (first["id"],)).fetchone()["meta"] or "{}")
-            said = meta.setdefault("joins", {}).setdefault(last["name"], {})
-            said[agent.name] = {"model": model_of(agent.name), "why": reason.strip()[:2000], "t": time.time()}
-            db.execute("UPDATE functions SET meta=? WHERE id=?", (json.dumps(meta), first["id"]))
-            self.net._event(db, proj["id"], agent.id, "join", f"{first['name']} + {last['name']}: {reason.strip()[:200]}")
-        models = {v["model"] for v in said.values()}
+        said, models = self._vote(agent, proj, first, "joins", last["name"], reason, "join",
+                                  f"{first['name']} + {last['name']}")
         if len(said) < NOT_C_AGENTS or len(models) < NOT_C_MODELS:
             return (f"Your proposal is counted ({len(said)} of {NOT_C_AGENTS} agents, {len(models)} of {NOT_C_MODELS} "
                     f"models): {first['name']} and {last['name']} are joined once enough agree and the game still "
                     "builds byte for byte. Meanwhile, claim another function.")
-        console = consoles.get(cfg.get("platform"))
         matched = {r["name"] for r in self.net.store.all("SELECT name FROM functions WHERE project_id=? AND "
                                                          "status='matched'", proj["id"])}
         why = None
@@ -2717,6 +3716,85 @@ class ForkEngine:
                               f"Agents ({', '.join(sorted(said))}) found this was cut by the analysis, and decompdecomp "
                               f"joined it: {done}. It's the whole function now, whatever older notes say.",
                               first["name"])
+        except NetworkError:
+            pass
+        return f"With yours, {len(said)} agents of {len(models)} models agree: {done}. The game still builds byte for byte."
+
+    def _vote(self, agent: Agent, proj, fn, kind: str, key: str, reason: str, event: str, what: str):
+        """An agent's say on a change to the project's functions (`kind`: joins, boundaries; `key`: which change),
+        kept in the function's meta; returns everyone's say on it and their models."""
+        with self.net.store.tx() as db:
+            meta = json.loads(db.execute("SELECT meta FROM functions WHERE id=?", (fn["id"],)).fetchone()["meta"] or "{}")
+            said = meta.setdefault(kind, {}).setdefault(key, {})
+            said[agent.name] = {"model": model_of(agent.name), "why": reason.strip()[:2000], "t": time.time()}
+            db.execute("UPDATE functions SET meta=? WHERE id=?", (json.dumps(meta), fn["id"]))
+            self.net._event(db, proj["id"], agent.id, event, f"{what}: {reason.strip()[:200]}")
+        return said, {v["model"] for v in said.values()}
+
+    def report_boundary(self, agent: Agent, slug: str, function: str, end: str, reason: str) -> str:
+        """An agent says a function runs on past its end: into data or leftovers, or into another function the
+        analysis merged with it. Once NOT_C_AGENTS agents of NOT_C_MODELS models say it of the same address, the
+        console cuts it there (Console.cut_function: the rest a function of its own, set aside when it isn't code),
+        checked as a join is (reanalyse: the game rebuilt byte for byte, else taken back), never a matched function;
+        a cut that doesn't hold is remembered. ROM projects ask the user instead (engine.request_boundary): there the
+        rest is always set aside, and the user sees the words it leaves out; here the rebuild check stands behind it."""
+        if not reason.strip():
+            raise NetworkError("say what follows the end (data, leftovers, another function) and how you can tell")
+        proj, fp, cfg = self.get(slug)
+        if slug in self.net.links:
+            raise NetworkError("in a room, the host's project is the one to cut functions in: say it in a note")
+        console = consoles.get(cfg.get("platform"))
+        if not console.reports_boundaries:
+            raise NetworkError(f"{console.name or 'This console'} projects can't report function ends yet: work on it "
+                               "as it is (ROADMAP.md says what's planned)")
+        fn = self._fn(slug, function)
+        symbol = self._meta(fn).get("symbol") or fn["name"]
+        extent = console.function_extent(fp, symbol)
+        if extent is None:
+            raise NetworkError("this project's functions are its own build's: report_boundary works where decompdecomp "
+                               "made the project (a PC game started from scratch)")
+        if fn["status"] == "matched":
+            raise NetworkError(f"{fn['name']} is matched: its end is proven")
+        start, size = extent
+        text = str(end).strip().lower()
+        try:
+            at = start + int(text[1:], 16) if text.startswith("+") else int(text, 16)
+        except ValueError:
+            at = None
+        if at is None or not start < at < start + size:
+            raise NetworkError(f"`end` is where {fn['name']} really ends: an address inside it (0x{start:08X} to "
+                               f"0x{start + size:08X}) or an offset into it (+0x20)")
+        key = f"0x{at:08X}"
+        refused = (cfg.get("boundaries_refused") or {}).get(f"{symbol}@{key}")
+        if refused:
+            return f"Ending {fn['name']} at {key} was tried, and refused: {refused}. Work on it as it is."
+        said, models = self._vote(agent, proj, fn, "boundaries", key, reason, "boundary", f"{fn['name']} ends at {key}")
+        if len(said) < NOT_C_AGENTS or len(models) < NOT_C_MODELS:
+            return (f"Your report is counted ({len(said)} of {NOT_C_AGENTS} agents, {len(models)} of {NOT_C_MODELS} "
+                    f"models): {fn['name']} ends at {key} once enough agree and the game still builds byte for byte. "
+                    "Meanwhile, release it or work on with its current size.")
+        matched = {r["name"] for r in self.net.store.all("SELECT name FROM functions WHERE project_id=? AND "
+                                                         "status='matched'", proj["id"])}
+        why = None
+        what = "; ".join(dict.fromkeys(v["why"][:200] for v in said.values()))
+
+        def step(fp):
+            nonlocal why
+            try:
+                return console.cut_function(fp, symbol, at, matched, what)
+            except (RomError, ForkError) as e:
+                why = str(e)
+                raise ForkError(why) from None
+        done = self.reanalyse(slug, step, log=lambda *_: None)
+        if not done:
+            why = why or "the game no longer rebuilt byte for byte with it"
+            self.net._update_cfg(slug, lambda c: c.setdefault("boundaries_refused", {}).update({f"{symbol}@{key}": why}))
+            return f"{len(said)} agents agreed, but ending {fn['name']} at {key} was refused: {why}."
+        self.net.joined(fn["name"], slug)  # (its code changed: what set it aside was about the whole)
+        try:
+            self.net.add_note(self.net.local_agent("decompdecomp")[0], slug,
+                              f"Agents ({', '.join(sorted(said))}) found it ran on past its end, and decompdecomp cut "
+                              f"it: {done}. It's the whole function now, whatever older notes say.", fn["name"])
         except NetworkError:
             pass
         return f"With yours, {len(said)} agents of {len(models)} models agree: {done}. The game still builds byte for byte."
@@ -2750,9 +3828,18 @@ class ForkEngine:
         return None
 
     def release_hints(self, slug: str, fn) -> list[str]:
-        """For a release pushed back: what this project knows about what to do next with the function (nothing yet
-        in general)."""
-        return []
+        """For a release pushed back: what this project knows about what to do next with the function (in an LTCG
+        project: the unresolved names that change its code, and that the rest are no reason to stop)."""
+        _, fp, _ = self.get(slug)
+        if not (fp.manifest or {}).get("ltcg"):
+            return []
+        unit = fp.unit(fn["unit"])
+        if unit.base is None or not ltcg_unresolved(unit.base):
+            return []
+        found = self._unresolved_lines(fp, self._meta(fn), fn, unit, self._current_source(fp, fn), only_mattering=True)
+        return ["Unresolved names in the harness link are no reason to stop: data and callees the original calls with "
+                "a standard convention change nothing (the judge writes the original's references in their place).",
+                *found]
 
     def read_file(self, slug: str, path: str, start: int = 1, count: int = 200) -> str:
         _, fp, _ = self.get(slug)
@@ -2922,13 +4009,17 @@ class ForkEngine:
             return text
         proj, fp, cfg = self.get(slug)
         p = fp.safe_path(path, write=True)
-        self.net.bump_generation(proj["id"])  # (a header or shared file: compiles may come out differently now)
         if _CHEAT.search(_strip_comments(new)):
             raise NetworkError("inline assembly, asm functions and asm includes aren't allowed")
         rel = Path(os.path.relpath(p, fp.root)).as_posix()
         units = [u for u in fp.units_for(rel) if u.base is not None]
         if units:  # a unit's own source file: only that unit can change
+            # and no earlier compile needs forgetting: a compile's key holds its unit's whole text (_attempt), so
+            # this edit changes the keys of this unit's compiles only. Bumping the project's generation here, every
+            # agent's repeat check was cleared once every 39 s on a PS4 game (5,034 such edits in 2.3 days), and
+            # 4,657 compiles were an agent's own repeats built again (12% of all of them)
             return self._edit_source(agent, proj, fp, p, rel, units, old, new, message)
+        self.net.bump_generation(proj["id"])  # (a header or shared file: compiles may come out differently now)
         return self._edit_shared(agent, proj, fp, slug, p, rel, old, new, message)
 
     @staticmethod
@@ -2946,13 +4037,26 @@ class ForkEngine:
         with self._tree(proj).exclusive() if linked else self._tree(proj).shared(), \
                 self._units_locked(proj, [u.name for u in units]):
             existed, text, updated = self._edited(p, rel, old, new)
+            # Shared declarations may need work, but another helper's claimed definition has one owner.
+            other_claims = self.net.store.all(
+                "SELECT f.* FROM functions f JOIN claims c ON c.function_id=f.id WHERE f.project_id=? "
+                "AND c.agent_id!=? AND c.expires_at>? AND f.unit IN (" + ','.join('?' for _ in units) + ")",
+                proj['id'], agent.id, time.time(), *(unit.name for unit in units))
+            for claimed in other_claims:
+                names = self._names(self._meta(claimed), claimed)
+                _, before_span = self._find(text, names)
+                _, after_span = self._find(updated, names)
+                before_body = text[slice(*before_span)] if before_span else None
+                after_body = updated[slice(*after_span)] if after_span else None
+                if before_body != after_body:
+                    raise NetworkError(f"{claimed['name']} has another source owner; report a proposal instead of editing its definition.")
             bases = {u.name: self._baseline(proj, fp, u, text) for u in units}
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(updated, encoding="utf-8")
+            _rewrite(p, updated)
 
             def undo() -> None:
                 if existed:
-                    p.write_text(text, encoding="utf-8")
+                    _rewrite(p, text)
                 else:
                     p.unlink(missing_ok=True)
                 for u in units:
@@ -3013,11 +4117,11 @@ class ForkEngine:
             protected = {(r["unit"], self._meta(r).get("symbol")) for r in self.net.store.all(
                 "SELECT unit, meta FROM functions WHERE project_id=? AND status='matched'", proj["id"])}
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(updated, encoding="utf-8")
+            _rewrite(p, updated)
 
             def undo() -> None:
                 if existed:
-                    p.write_text(text, encoding="utf-8")
+                    _rewrite(p, text)
                 else:
                     p.unlink(missing_ok=True)
                 self._build_all(proj, fp)
@@ -3051,7 +4155,7 @@ class ForkEngine:
                 if truly:
                     return f"❌ REJECTED and undone: the edit breaks {len(truly)} matched function(s): {', '.join(truly[:10])}"
                 p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_text(updated, encoding="utf-8")
+                _rewrite(p, updated)
                 self._build_all(proj, fp)
             self._scores = {k: v for k, v in self._scores.items() if k[0] != proj["id"]}
             self._commit(proj, fp, rel, f"{message.strip()}\n\nEdited by {agent.name} with decompdecomp.")
@@ -3066,10 +4170,31 @@ class ForkEngine:
 
     def overview(self, slug: str) -> dict:
         proj, fp, cfg = self.get(slug)
-        if cfg.get("ready"):
-            self._preflight_once(slug)
         agg = self.net.store.one(f"SELECT {PROGRESS_COLUMNS}, SUM(attempts) AS attempts "
                                  f"FROM functions WHERE project_id=? AND {IN_BUILD}", proj["id"])
+        if missing := self.net.project_missing(proj):
+            # Nothing here reads the tree (it isn't there): what the database knows, and why it can't be opened.
+            return {
+                "slug": slug, "title": proj["name"], "description": proj["description"], "kind": "fork",
+                **consoles.get(cfg.get("platform")).project_facts(),
+                "repo_url": cfg.get("repo_url"), "fork_kind": cfg.get("fork_kind"), "version": cfg.get("version"),
+                "origin": cfg.get("origin"), "compiler_name": cfg.get("compiler"), "versions": [],
+                "ready": bool(cfg.get("ready")), "needs": None,
+                "rom": {"game_code": cfg.get("version") or "", "region": consoles.name(cfg.get("platform")),
+                        "title": proj["name"]},
+                "compiler": {"toolchain": "project", "name": "Project's own build", "flags": [], "installed": True,
+                             "proprietary": False, "supported": True},
+                "compilers": [],
+                "functions": agg["total"] or 0, "matched": agg["matched"] or 0, "bytes": agg["bytes"] or 0,
+                "matched_bytes": agg["matched_bytes"] or 0, "set_aside": agg["set_aside"] or 0,
+                "set_aside_bytes": agg["set_aside_bytes"] or 0, "attempts": agg["attempts"] or 0,
+                "context_version": 0, "folder": proj["root"], "room": self.net._room_info(slug),
+                "measures": cfg.get("measures") or {}, "uncovered": None, "rebuild": None,
+                "reimports": cfg.get("origin") == "scratch" and consoles.get(cfg.get("platform")).reimports,
+                "build_problem": None, "missing": missing,
+            }
+        if cfg.get("ready"):
+            self._preflight_once(slug)
         m = cfg.get("measures") or {}
         need = fp.needs(cfg.get("version")) if not cfg.get("ready") else None
         return {
@@ -3090,6 +4215,7 @@ class ForkEngine:
             "context_version": 0, "folder": proj["root"], "room": self.net._room_info(slug),
             "measures": m, "uncovered": self.uncovered(slug) if cfg.get("ready") and fp.linkable() else None,
             "rebuild": (fp.manifest or {}).get("rebuild") if cfg.get("origin") == "scratch" else None,
+            "reimports": cfg.get("origin") == "scratch" and consoles.get(cfg.get("platform")).reimports,
             **self._scope_facts(proj, fp, cfg),
             # why it doesn't build on this computer (preflight; checked once a run when its page first opens)
             "build_problem": cfg.get("build_problem") if cfg.get("ready") else None,
@@ -3113,9 +4239,15 @@ class ForkEngine:
     def _file_parts(self, fp: ForkProject, cfg: dict) -> tuple[str, list[dict]] | None:
         """(the project's own compiler, the parts built with another: one per source file, with its address range),
         for a project whose files each have a compiler (Console.file_compiler: DS); None: its build decides."""
+        # the overview goes with every live poll (each second): reading a PC game's 1,300 files' compilers again each
+        # time took 300-400 ms. Read again when a file they come from changed (a new source file changes one too)
         console = consoles.get(cfg.get("platform"))
+        stamp = _config_stamp(fp.root, console.compiler_config) if console.compiler_config else None
+        if stamp is not None and (known := self._parts.get(fp.root)) is not None and known[0] == stamp:
+            return known[1]
         own = console.file_compiler(fp, "")
         if own is None:
+            self._parts[fp.root] = (stamp, None)
             return None
         ranges = console.file_ranges(fp)
         parts = []
@@ -3124,17 +4256,22 @@ class ForkEngine:
                 for start, end in ranges.get(source) or [(0, 0)]:
                     parts.append({"file": source, "start": start, "end": end, "toolchain": c,
                                   "name": consoles.compiler_name(c), "flags": []})
+        self._parts[fp.root] = (stamp, (own, parts))
         return own, parts
 
     def _compiler_facts(self, fp: ForkProject, cfg: dict) -> dict:
-        """The overview's compiler fields, as a ROM project's: the Settings panel and its dropdown work the same."""
+        """The overview's compiler fields, as a ROM project's: the Settings panel and its dropdown work the same.
+        Nothing where the project's build decides its compilers (a public decomp): no panel, and a page reading a
+        missing `compiler_map` as false says there's no map (steering.js). The map fact the GUI's wording follows is
+        the Settings answer's (compiler_answer), which each file having a compiler decides."""
         found = self._file_parts(fp, cfg)
         if found is None:
             return {}
         own, parts = found
         return {"compiler": {"toolchain": own, "name": consoles.compiler_name(own), "flags": [], "installed": True,
                              "proprietary": False, "supported": True},
-                "compilers": [c.id for c in consoles.get(cfg.get("platform")).compilers], "compiler_ranges": parts}
+                "compilers": [c.id for c in consoles.get(cfg.get("platform")).project_compilers(fp)],
+                "compiler_ranges": parts}
 
     def compiler_answer(self, slug: str) -> dict:
         """The Settings panel's answer (engine.compiler_answer's form): the project's compiler and the files built
@@ -3144,8 +4281,22 @@ class ForkEngine:
         if found is None:
             raise NetworkError("this project's own build sets its compilers")
         own, parts = found
-        return {"compiler": consoles.compiler_name(own), "flags": "", "mips": False, "elsewhere": [],
-                "elsewhere_count": 0, "checking": False, "survey": {}, "checks": [],
+        files = self.net.filecompilers
+        elsewhere = [r for r in files.build(slug).runs if r.differs()]
+        survey, state = cfg.get("file_survey") or {}, files.surveys.get(slug) or {}
+        checks = cfg.get("file_checks") or []
+        has_map = files.applies(slug)  # (`mips` is what older pages called this fact)
+        return {"compiler": consoles.compiler_name(own), "flags": "", "compiler_map": has_map,
+                "mips": has_map, "unit": "source file",
+                "elsewhere": [{"start": r.start, "end": r.end, "compiler": consoles.compiler_name(r.label[0]),
+                               "functions": r.functions, "confirmed": r.confirmed} for r in elsewhere[:12]],
+                "elsewhere_count": len(elsewhere),
+                "checking": state.get("state") == "running" or any(c["status"] == "checking" for c in checks),
+                "survey": {"state": state.get("state"), "tried": len(survey.get("tried", {})),
+                           "confirmed": len(survey.get("confirmed", {})), "running_tried": state.get("tried", 0),
+                           "t": survey.get("t")},
+                "checks": [{"id": c["id"], "audit": False, "status": c["status"], "said": c.get("said") or "",
+                            "ranges": c["spans"], "compiler": consoles.compiler_name(c["toolchain"])} for c in checks],
                 "parts": [{"start": p["start"], "end": p["end"], "compiler": p["name"], "flags": "", "file": p["file"],
                            "check": "confirmed", "said": f"{p['file']}: its matched functions match with it"}
                           for p in parts]}
@@ -3182,8 +4333,8 @@ class ForkEngine:
         console = consoles.get(cfg.get("platform"))
         if console.file_compiler(fp, "") is None:
             raise NetworkError("this project's own build sets its compilers")
-        if compiler not in {c.id for c in console.compilers}:
-            raise NetworkError(f"{compiler!r} isn't one of this platform's compilers")
+        if compiler not in {c.id for c in console.project_compilers(fp)}:
+            raise NetworkError(f"{compiler!r} isn't one of this project's compilers")
         sources = sorted({u.source for u in fp.units() if u.source})
         stayed = []
         for n, source in enumerate(sources, 1):
@@ -3201,6 +4352,40 @@ class ForkEngine:
         self.net._update_cfg(slug, lambda c: c.update(compiler=compiler))
         return {"switched": len(sources) - len(stayed), "stayed": stayed[:20]}
 
+    def file_scores(self, slug: str, source: str, compiler: str) -> tuple[dict[str, float], dict[str, float]]:
+        """Every function of a source file, its match % built with the file's own compiler and with `compiler`, the
+        file keeping its own: the evidence of the compiler map's survey and range checks (app/filecompilers.py). The
+        second is empty when the file doesn't build with it."""
+        proj, fp, cfg = self.get(slug)
+        console = consoles.get(cfg.get("platform"))
+        own = console.file_compiler(fp, source)
+        units = fp.units_for(source)
+        if own is None or not units:
+            raise NetworkError(f"{source} isn't a source file whose compiler this project lets you choose")
+        text = (fp.root / source).read_text(errors="replace", encoding="utf-8")
+        with self._tree(proj).exclusive(), self._units_locked(proj, [u.name for u in units]):
+            before: dict[str, float] = {}
+            for u in units:
+                before.update(self._baseline(proj, fp, u, text)[0] or {})
+            if compiler == own:
+                return before, before
+            after: dict[str, float] = {}
+            try:
+                with self._build_locks[proj["id"]]:  # (a build reads the map)
+                    console.set_file_compiler(fp, source, compiler)
+                for u in units:
+                    if self._build_unit(proj, fp, u)[0]:
+                        try:
+                            after.update(fp.diff(u, None).unit_scores)
+                        except (ObjdiffError, ForkError):
+                            pass
+            finally:
+                with self._build_locks[proj["id"]]:
+                    console.set_file_compiler(fp, source, own)
+                for u in units:
+                    self._build_unit(proj, fp, u)  # the file's objects are its own compiler's again
+        return before, after
+
     def set_file_compiler_by_hand(self, slug: str, source: str, compiler: str) -> None:
         """The user's choice of a source file's compiler (the project's Settings), kept only when every function of
         the file that matched still matches with it: the rule try_compiler's switches follow. What matches with it
@@ -3211,8 +4396,8 @@ class ForkEngine:
         units = fp.units_for(source)
         if own is None or not units:
             raise NetworkError(f"{source} isn't a source file whose compiler this project lets you choose")
-        if compiler not in {c.id for c in console.compilers}:
-            raise NetworkError(f"{compiler!r} isn't one of this platform's compilers")
+        if compiler not in {c.id for c in console.project_compilers(fp)}:
+            raise NetworkError(f"{compiler!r} isn't one of this project's compilers")
         if compiler == own:
             return
         text = (fp.root / source).read_text(errors="replace", encoding="utf-8")
@@ -3243,18 +4428,77 @@ class ForkEngine:
                 self._keep_scores(proj, u, text, after[u.name])
                 self._apply_scores(proj, u.name, after[u.name], text=text)
 
-    def function_diff(self, slug: str, name: str) -> dict:
-        """objdiff's diff of the function as it is in the source tree now."""
+    def _best_diff(self, proj, fp: ForkProject, fn) -> dict:
+        """objdiff's diff of a function's best attempt: written into its file like a try, built, and undone, so
+        neither the source nor the object it built stays changed. Cached by what it was built from."""
+        meta = self._meta(fn)
+        unit = fp.unit(fn["unit"])
+        source = fn["best_source"]
+        names = self._names(meta, fn)
+        _, span = self._find(source, names)
+        if span:  # the definition alone: a polishing comment above it isn't placed again
+            source = source[span[0]:span[1]]
+        symbol = meta.get("symbol") or fn["name"]
+        linked = unit.complete and fp.linkable()
+        try:
+            with self._tree(proj).exclusive() if linked else self._tree(proj).shared(), \
+                    self._unit_lock(proj, unit.name):
+                _, after, path, before = self._place(proj, fp, unit, fn, source, names)
+                existed = path.exists()
+                target = unit.target.stat().st_mtime_ns if unit.target is not None and unit.target.exists() else None
+                key = self.net.compile_key(fn, unit.name, source, after, before, str(target))
+                if key in self._best_diffs:
+                    return dict(self._best_diffs[key])
+                _rewrite(path, after)
+                try:
+                    ok, log = self._build_unit(proj, fp, unit)
+                    if not ok:
+                        out = {"kind": "best", "rows": None,
+                               "error": f"The best attempt didn't compile:\n{_tail(log)}"}
+                    else:
+                        d = fp.diff(unit, symbol)
+                        if d.match_percent is None:
+                            out = {"kind": "best", "rows": None}
+                        else:
+                            problems = [f"{'a reference differs' if isinstance(m, MappingConflict) else 'a loaded constant differs'}: "
+                                        f"{m.describe()}" for m in d.literals]
+                            problems += [f"refers to `{mine}` where the original refers to `{orig}`"
+                                         for orig, mine in d.renamed]
+                            out = {"kind": "best", "rows": [list(r) for r in d.rows], "score": None,
+                                   "percent": _floor_pct(d.match_percent, d.matched), "problems": problems}
+                finally:
+                    if existed:
+                        _rewrite(path, before)
+                    else:  # a unit with no source file yet: leave none behind
+                        path.unlink(missing_ok=True)
+                    self._build_unit(proj, fp, unit)  # the file's object is its own source's again
+        except NetworkError as e:
+            return {"kind": "best", "rows": None, "error": str(e)}
+        except (ObjdiffError, ForkError) as e:
+            return {"kind": "best", "rows": None, "error": f"objdiff: {e}"}
+        if len(self._best_diffs) > 32:
+            self._best_diffs.pop(next(iter(self._best_diffs)))
+        self._best_diffs[key] = out
+        return dict(out)
+
+    def function_diff(self, slug: str, name: str, which: str = "latest") -> dict:
+        """objdiff's diff of the function as it is in the source tree now, or of its best attempt (`which`)."""
         proj, fp, cfg = self.get(slug)
         fn = self._fn(slug, name)
         meta = self._meta(fn)
+        if which == "best" and fn["status"] != "matched":
+            if not fn["best_source"]:
+                return {"kind": "best", "rows": None,
+                        "message": "There's no best attempt for this function yet."}
+            return self._best_diff(proj, fp, fn)
         try:
             d = fp.diff(fp.unit(fn["unit"]), meta.get("symbol") or fn["name"])
         except (ObjdiffError, ForkError) as e:
             return {"kind": None, "rows": None, "error": f"objdiff: {e}"}
         if d.match_percent is None:
             return {"kind": None, "rows": None}
-        problems = [f"a loaded constant differs: {m.describe()}" for m in d.literals]
+        problems = [f"{'a reference differs' if isinstance(m, MappingConflict) else 'a loaded constant differs'}: "
+                    f"{m.describe()}" for m in d.literals]
         problems += [f"refers to `{mine}` where the original refers to `{orig}`" for orig, mine in d.renamed]
         return {"kind": "matched" if fn["status"] == "matched" else "latest", "rows": [list(r) for r in d.rows],
                 "score": None, "percent": _floor_pct(d.match_percent, d.matched), "problems": problems}
@@ -3295,3 +4539,536 @@ class ForkEngine:
                 ("latest" if current and worked else "best" if fn["best_source"] else "draft" if draft else None),
                 "match_percent": pct, "scores": [{"score": a["score"], "t": a["created_at"], "agent": a["agent"]} for a in attempts],
                 "notes": [dict(n) for n in notes], "calls": [], "called_by": []}
+
+    def _program(self, fp: ForkProject):
+        """The original program and its functions, for a project built with link-time code generation (None: not
+        one, or it can't be read: a heuristic never stands between an agent and the function)."""
+        manifest = fp.manifest or {}
+        if not manifest.get("ltcg"):
+            return None
+        try:
+            return convention.load(fp.root, manifest)
+        except (OSError, KeyError, ValueError, ForkError):
+            return None
+
+
+
+    def _ltcg_brief(self, fp: ForkProject, meta: dict, fn, unit) -> list[str]:
+        """For a brief, in an LTCG project (forks/ltcg.py): how the original passes the function its arguments
+        (forks/convention.py), which the driver and stand-ins in harness/ must reproduce, and whether this unit's
+        compile already goes through a harness."""
+        if (prog := self._program(fp)) is None:
+            return []
+        try:
+            addr = prog.find(meta.get("symbol") or fn["name"])
+            found = convention.evidence(prog, addr) if addr is not None else []
+        except Exception:  # a heuristic: it never stands between an agent and the function
+            logging.getLogger("decompdecomp").exception("reading the function's convention failed")
+            return []
+        if not found:
+            return []
+        name = unit.name
+        if ltcg.has_entry(fp.root, name):
+            mode = [f"- Your compile already goes through the harness: {name} is built with /GL and linked with /LTCG "
+                    f"with harness/{name}.drv.cpp, whose calls make the linker pick these registers. Write the "
+                    "function as ordinary C/C++ and compile it: the convention is not a reason to release it. If "
+                    "what differs is the convention itself, make the driver's call (or a stand-in) look like the "
+                    "original's call site below. Functions are found in the link by func_<address> in their names, or "
+                    "by `// FUNCTION: 0x<address>` right above the definition (for a method or an operator: add the "
+                    "map symbol's substring after the address)."]
+        else:
+            mode = [f"- {name} builds plain, without /GL: harness/{name}.drv.cpp doesn't define HarnessEntry yet. "
+                    "That is right for code the game built without link-time code generation (a library piece, a "
+                    "file built /O2): write it as plain C. If this function's callers pass it registers (below), the "
+                    f"unit needs a driver first: standins_for(\"{name}\") writes a starting point (stand-ins "
+                    "for what the unit uses elsewhere, a HarnessEntry); put it in with edit_file."]
+        return ["", "### Calling convention in the original (link-time code generation: the linker picked it for its "
+                "callers; harness/ must call it the same way)", *mode,
+                *[f"- {line}" if not line.startswith("  ") else line for line in found]]
+
+
+
+    def _convention_warning(self, fp: ForkProject, meta: dict, fn, unit) -> list[str]:
+        """For an attempt's result in an LTCG project: when the function the harness link made differs in convention
+        from the original's, say so. A helper or driver call adds a call site, which can change what the linker picks
+        for the callee, and then the bytes differ for a reason the C doesn't show."""
+        if unit.base is None or (prog := self._program(fp)) is None:
+            return []
+        try:
+            symbol = meta.get("symbol") or fn["name"]
+            addr = prog.find(symbol)
+            if addr is None or not unit.base.exists():
+                return []
+            code = next((c for owner, c, _ in coffobj.sections(unit.base.read_bytes())
+                         if owner == symbol or coffobj.c_name(owner) == fn["name"]), None)
+            if not code:
+                return []
+            found = convention.differences(convention.analyse(prog.code(addr), addr), convention.analyse(code, addr))
+        except Exception:  # a heuristic: it never stands between an agent and the result
+            logging.getLogger("decompdecomp").exception("comparing the compiled convention failed")
+            return []
+        if not found:
+            return []
+        return ["", "The linker gave your function another convention than the original's (" + "; ".join(found) + "). "
+                "Under LTCG the callers decide it: keep the original's number of call sites (a helper, a stand-in or "
+                "a second driver call adds one), and check that the driver's calls load what the brief's call sites "
+                "load. The brief's convention evidence is the target."]
+
+
+
+    def _method_brief(self, fp: ForkProject, cfg: dict, meta: dict, fn) -> list[str]:
+        """For a brief, in an LTCG project: whether the function looks like a member function, of which struct, its
+        fields and the declaration to write (forks/methods.py: `this` can arrive in any register under LTCG, which the
+        ECX-only readers of structs.py and the RTTI classes miss). When RTTI already named the function's class
+        (`_class_brief`), only the register is added: the class's name is the game's own."""
+        if (prog := self._program(fp)) is None:
+            return []
+        try:
+            addr = prog.find(meta.get("symbol") or fn["name"])
+            if addr is None:
+                return []
+            objs = methods.recover(prog, True)
+            lines = methods.brief(prog, objs, addr, True, meta.get("demangled"))
+            if self._class_of(fp, cfg, fn)[1] is not None and addr in objs.of:
+                return ["", f"- `this` arrives in {objs.of[addr].methods[addr]} (the linker's choice under link-time "
+                            "code generation): a member function of the class above still matches"]
+            if lines and lines[1].startswith("### Looks like a member function"):
+                lines += ["```cpp", methods.declaration(prog, objs.of[addr]), "```"]
+            return lines
+        except Exception:  # a heuristic: it never stands between an agent and the function
+            logging.getLogger("decompdecomp").exception("finding member functions failed")
+            return []
+
+
+
+    def _unresolved_lines(self, fp: ForkProject, meta: dict, fn, unit, code: str | None,
+                          only_mattering: bool = False) -> list[str]:
+        """For a brief, a compile result or a release: the names the unit's last harness link left unresolved that
+        this function's code uses, which of them can change its code (forks/unresolved.py) and which are harmless.
+        A bare list read as a to-do, and agents released functions for references that change nothing."""
+        if unit.base is None or not (missing := ltcg_unresolved(unit.base)):
+            return []
+        prog = self._program(fp)
+        caller, library = None, set()
+        if prog is not None:
+            caller = prog.find(meta.get("symbol") or fn["name"])
+            library = {prog.by_name[x] for x in _set_aside(fp) if x in prog.by_name}
+        used = unresolved.used_by(code, missing) if code else []
+        found = [unresolved.classify(prog, caller, x, library) for x in used]
+        if only_mattering:
+            found = [u for u in found if u.matters is not False]
+            return unresolved.summary(found, unit.name) if found else []
+        return unresolved.summary(found, unit.name, len(missing) - len(used))
+
+
+
+    def standins_for(self, agent: Agent | None, slug: str, what: str) -> str:
+        """Stand-in and driver skeletons for a unit of an LTCG project (forks/standins.py): a unit, its source file
+        or one of its functions. What agents write into harness/."""
+        _, fp, _ = self.get(slug)
+        if (prog := self._program(fp)) is None:
+            raise NetworkError("standins_for is for projects of games built with link-time code generation (harness/ "
+                               "files): this project isn't one")
+        name = what.strip()
+        units = {f["unit"] for f in prog.functions.values()}
+        unit = next((u for u in (name, name.rsplit("/", 1)[-1], Path(name).stem) if u in units), None)
+        if unit is None and (addr := prog.find(name)) is not None:
+            unit = prog.functions[addr]["unit"]
+        if unit is None:
+            try:
+                row = self._fn(slug, name)
+            except NetworkError:
+                raise NetworkError(f"{what!r} isn't a unit, source file or function of this project") from None
+            if (addr := prog.find(self._meta(row).get("symbol") or row["name"])) is None:
+                raise NetworkError(f"{what!r} isn't in this project's functions.json")
+            unit = prog.functions[addr]["unit"]
+        return standins.render(prog, unit)
+
+
+
+    def _place(self, proj, fp: ForkProject, unit, fn, source: str, names: list[str], comment: bool = False,
+               prelude: str = "") -> tuple[str, str, Path, str]:
+        """`source`'s definition written into its unit's source file as it is now: (the code, the file after,
+        the file, the file before)."""
+        _, span = self._find(source, names)
+        if span is None:
+            raise NetworkError(f"send the complete definition of {names[0]} (with its body)")
+        # with the comment right above it (what it does, from polishing): the file kept the definition only
+        # Polishing's only: a twin's note or a decompiling agent's scratch comment replaced a forked decomp's own
+        # doc comments, and piled up in its files
+        if comment:
+            span = (csource.comment_above(source, span[0]), span[1])
+        code = source[span[0]:span[1]]
+        commented = code.lstrip().startswith(("//", "/*"))
+        if not unit.source:
+            raise NetworkError(f"unit {unit.name} has no source file, so there's nowhere to write it")
+        path = fp.safe_path(unit.source, write=True)
+        try:
+            before = path.read_text(errors="replace", encoding="utf-8")
+        except OSError:
+            before = ""
+        includes, before_lines, after_lines = _around(source, span, before, unit.source)
+        hit, old_span = self._find(before, names)
+        base, carried = before, ""  # what the new definition goes into; what of the parked copy goes with it
+        parked = self._hidden(fp, before, old_span[0]) if old_span else None
+        if parked and (seen := self._seen_beside(fp, before, old_span, hit, names)):
+            # a draft parked in `#ifdef` before the build's own definition in its `#else`: the one the build sees
+            # is the one tried (the parked one taken out, a new one put in, the visible one stayed: defined twice)
+            old_span, parked = seen, None
+        if parked:
+            # parked in an #if branch the build leaves out: written there, the compile was judged on other code,
+            # and moved out with edit_file it was refused when it broke a matched neighbour (where whole-program
+            # optimisation couples them), so an agent could do nothing with it. It goes where the build sees it,
+            # without the parked copy: kept, the function is visible from then on; else the file is undone. Its
+            # annotation (`// FUNCTION: 0x...`, often with the notes of earlier tries) comes along, and its
+            # comment too unless the agent sent one
+            lo = csource.comment_above(before, old_span[0])
+            mark = csource.marker_above(before, lo)
+            carried = before[mark:lo] + ("" if commented else before[lo:old_span[0]])
+            base, old_span = before[:mark] + before[old_span[1]:], None
+        pre, post = "".join(ln + "\n" for ln in before_lines), "".join(ln + "\n" for ln in after_lines)
+        if old_span:
+            lo, hi = old_span
+            kept = ""  # the file's comment, when none was sent
+            if commented:  # a new comment replaces the old one; without one, the file's stays
+                lo = csource.comment_above(before, lo)
+            if any(_PRAGMA.match(ln) for ln in before_lines + after_lines):  # a new wrapper replaces the old one
+                above = csource.comment_above(before, lo)
+                wrapped, hi = _pragmas_around(before, lo, hi)
+                if not commented and wrapped < above:
+                    kept = before[above:lo]
+                lo = wrapped
+            after = before[:lo] + pre + kept + code.rstrip("\n") + "\n" + post + before[hi:]
+        else:
+            placed = pre + carried + code.rstrip("\n") + "\n" + post
+            after = self._insert_in_order(proj, fp, unit, fn, base, placed)
+            if base is not before and (span := self._find(after, names)[1]) and self._hidden(fp, after, span[0]):
+                after = base.rstrip("\n") + "\n\n" + placed  # (its neighbours are parked too: after them all)
+        after = _with_includes(after, includes, prelude)
+        return code, after, path, before
+
+
+
+    def search_flags(self, agent: Agent, slug: str, function: str, compiler: str = "", source: str = "") -> str:
+        """search_flags where each source file has flags of its own (Console.file_flags: PC's /Oy-): the function's C
+        built with each variant of its file's flags (Console.flag_variants), judged as an attempt that isn't kept. A
+        variant it matches with stays the file's, committed, when the file's other matched functions still match (the
+        attempt's own rule); otherwise the file keeps its flags and nothing is recorded."""
+        proj, fp, cfg = self.get(slug)
+        console = consoles.get(cfg.get("platform"))
+        fn = self._fn(slug, function)
+        unit = fp.unit(fn["unit"])
+        own = console.file_flags(fp, unit.source) if unit.source else None
+        if own is None:
+            raise NetworkError("a fork builds with its project's own compilers and flags")
+        if compiler.strip():
+            raise NetworkError("search_flags tries the file's flags with its own compiler: try_compiler tries others")
+        if self.net.links.get(slug) is not None:
+            raise NetworkError("in a room, the host's project decides each file's flags: search_flags works there")
+        if fn["status"] == "matched":
+            raise NetworkError(f"{fn['name']} already matches with {unit.source}'s flags")
+        source = source.strip() or self.net._source_of(fn) or ""
+        if not source:
+            raise NetworkError(f"{fn['name']} has no attempt yet: pass the C as source")
+        shown = lambda flags: " ".join(flags) or "(the project's flags only)"  # noqa: E731
+        linked = unit.complete and fp.linkable()
+        results, kept, changed = [], None, False
+        held = self._hold_for_try(slug, function, agent)
+        try:
+            with self._tree(proj).exclusive() if linked else self._tree(proj).shared(), self._unit_lock(proj, unit.name):
+                try:
+                    self._baseline(proj, fp, unit, (fp.root / unit.source).read_text(errors="replace", encoding="utf-8"))
+                    for flags in console.flag_variants(own):
+                        if flags != own:
+                            with self._build_locks[proj["id"]]:  # (a build reads the flags)
+                                rel = console.set_file_flags(fp, unit.source, flags)
+                            changed = True
+                        res = self._attempt(agent, slug, function, source, keep=False, quiet=0)
+                        if res["matched"] and flags == own:
+                            return f"{res['text']}\nThat's with {unit.source}'s own flags: nothing to change."
+                        if res["matched"]:
+                            kept = flags
+                            self.net.bump_generation(proj["id"])  # (earlier compiles of the file aren't repeats)
+                            self._commit(proj, fp, rel, f"Build {unit.source} with {shown(flags)}\n\n{fn['name']} "
+                                                        f"matches with them (found by {agent.name} with decompdecomp).")
+                            return f"{shown(flags)}: {res['text']}\n{unit.source} is built with them from now on."
+                        why = "breaks the file's matched functions" if res.get("broken") else \
+                            "doesn't build" if res["score"] is None else f"score {res['score']}"
+                        results.append((res["score"] if res["score"] is not None and not res.get("broken") else None,
+                                        flags, why))
+                finally:
+                    if changed and kept is None:
+                        with self._build_locks[proj["id"]]:
+                            console.set_file_flags(fp, unit.source, own)
+                        self._build_unit(proj, fp, unit)  # the file's object is its own flags' again
+        finally:
+            if held is not None:
+                with self.net.store.tx() as db:
+                    db.execute("DELETE FROM claims WHERE function_id=? AND agent_id=?", (held, agent.id))
+        results.sort(key=lambda r: (r[0] is None, r[0] or 0))
+        lines = [f"- {why:>8}  {shown(flags)}" + ("   <- the file's flags" if flags == own else "")
+                 for _, flags, why in results]
+        best = results[0] if results else None
+        verdict = ("The flags aren't the problem: the file's are as good as any." if best and best[1] == own else
+                   "Other flags come closer, but none matches: look at the C again first.")
+        return (f"{len(results)} flag variants for {fn['name']} in {unit.source} (lower is better), none matches:\n"
+                + "\n".join(lines) + "\n" + verdict)
+
+
+    def _ordinary_attempt(self, agent: Agent, slug: str, function: str, source: str, keep: bool = True, prelude: str = "",
+                 quiet: int | None = None, comment: bool = False) -> dict:
+        proj, fp, cfg = self.get(slug)
+        result_fingerprint = None
+
+        def record(*args, **kwargs):
+            kwargs.setdefault('output_fingerprint', result_fingerprint)
+            kwargs.setdefault('build_revision', 'advisory:' + key)
+            return self.net._record(*args, **kwargs)
+
+        fn = self._fn(slug, function)
+        meta = self._meta(fn)
+        if len(source) > 64 * 1024:
+            raise NetworkError("source too large")
+        if _CHEAT.search(_strip_comments(source)):
+            raise NetworkError("inline assembly, asm functions and asm includes aren't allowed: a match has to come from C/C++")
+        names = self._names(meta, fn)
+        _, span = self._find(source, names)
+        console = consoles.get(cfg.get("platform"))
+        version = (fp.manifest or {}).get("version") or cfg.get("version")
+        structor = None
+        if span is None and console.names_structors and not meta.get("demangled") and "::" in (meta.get("real") or "::"):
+            # a constructor or destructor of a class the agent named (CFoo::~CFoo for func_004A86D0) becomes the
+            # function's real name below, which the build pairs with the original: a class's constructor and
+            # destructor are at two addresses, and can't both be named after the class. One named so before (a
+            # real name with "::") may be renamed: the agent's class has another name now
+            if (structor := csource.structor(source)) is not None:
+                given = console.real_names(fp, version).get(meta.get("symbol") or fn["name"])
+                names = [structor, *names, *([given] if given else [])]
+                _, span = self._find(source, names)
+        if span is None:
+            raise NetworkError(f"send the complete definition of {names[0]} (with its body)")
+        unit = fp.unit(fn["unit"])
+        if not unit.source:
+            raise NetworkError(f"unit {unit.name} has no source file, so there's nowhere to write it")
+        symbol = meta.get("symbol") or fn["name"]
+        linked = unit.complete and fp.linkable()  # the game is built from this file: changes must keep it identical
+        with self._tree(proj).exclusive() if linked else self._tree(proj).shared(), self._unit_lock(proj, unit.name):
+            code, after, path, before = self._place(proj, fp, unit, fn, source, names, comment, prelude)
+            from . import function_parts
+
+            _, old_span = self._find(before, names)
+            function_parts.guard(self.net, agent, fn, before[old_span[0]:old_span[1]] if old_span else "", code)
+            with self.net.store.tx() as db:  # claim bookkeeping, as for ROM projects
+                self.net._expire_claims(db)
+                claim = db.execute("SELECT agent_id FROM claims WHERE function_id=?", (fn["id"],)).fetchone()
+                if claim is not None and claim["agent_id"] != agent.id:
+                    raise NetworkError(f"{fn['name']} is claimed by {self.net._agent_name(claim['agent_id'])}")
+                now = time.time()
+                if claim is None and fn["status"] != "matched":
+                    db.execute("INSERT INTO claims VALUES(?,?,?,?)",
+                               (fn["id"], agent.id, now, now + self.net.claim_ttl))
+                elif claim is not None:
+                    db.execute("UPDATE claims SET expires_at=? WHERE function_id=?",
+                               (now + self.net.claim_ttl, fn["id"]))
+            # What matches in the file as it is now is what this change must keep (not the database's idea of it,
+            # which a change outside decompdecomp or a different measurement can leave behind)
+            scores, builds = self._baseline(proj, fp, unit, before)
+            held = self._held(proj, unit.name, before)
+            if scores is not None:
+                self._apply_scores(proj, unit.name, scores, text=before, via="unit diff before a compile")
+                protected = {n for n, pct in scores.items()
+                             if n != symbol and n not in held and pct is not None and pct >= 100}
+                was_matched = (scores.get(symbol) or 0) >= 100 and symbol not in held
+            else:
+                protected = {n for n, pct in (self._last_scores(proj, unit) or {}).items()
+                             if n != symbol and n not in held and pct is not None and pct >= 100}
+                was_matched = fn["status"] == "matched"
+            # the same file as an earlier compile of this function made, nothing it depends on changed since: that
+            # compile's result, not another build
+            agents_try = keep and quiet is None and not was_matched
+            # (an LTCG project's driver and stand-ins are part of what the unit builds with: harness/<unit>.*.cpp)
+            harness = "".join(p.read_text(errors="replace", encoding="utf-8")
+                              for p in sorted((fp.root / "harness").glob(f"{unit.name}.*.cpp")))
+            key = self.net.compile_key(fn, unit.name, after, harness)
+            if agents_try and (again := self.net.repeat_of(key, agent, fn)) is not None:
+                return again
+            renamed: dict[Path, str] = {}
+            if structor:
+                try:
+                    with self._build_locks[proj["id"]]:  # builds read the config
+                        renamed = console.rename_symbol(fp, version, fn["name"], structor)
+                except ForkError as e:
+                    raise NetworkError(f"{structor} can't be {fn['name']}'s name: {e}") from None
+
+            def unname() -> None:
+                """The config as it was: a name left behind would keep another function from being that class's
+                constructor (an agent's wrong address). Nothing renamed (nearly every try): no wait for the build
+                lock, which a run of the project's builds holds; each of the permuter's tries waited for the next
+                run here, writing nothing."""
+                if not renamed:
+                    return
+                with self._build_locks[proj["id"]]:
+                    for p, t in renamed.items():
+                        p.write_text(t, encoding="utf-8")
+
+            committed = [unit.source, *(p.relative_to(fp.root).as_posix() for p in renamed)]
+            _rewrite(path, after)
+
+            def remembered(text: str, score: int | None, kept: bool = True) -> str:
+                """A result as repeat_of gives it back later (agents' tries only), plus the note when this variant
+                only reproduces an earlier score of the claim."""
+                if not agents_try:
+                    return text
+                if kept:
+                    self.net.remember_compile(key, agent, fn, text, score)
+                return text + self.net.same_score_note(fn["id"], agent.id, score, code)
+
+            def undo() -> None:
+                _rewrite(path, before)
+                unname()
+                if (proj["id"], unit.name) in self._trials and scores is not None and not renamed:
+                    self._trials[(proj["id"], unit.name)] = True  # (a run of tries: built once, at its end)
+                    return
+                if self._build_unit(proj, fp, unit)[0] and scores is not None:
+                    self._keep_scores(proj, unit, before, scores)
+
+            ok, log = self._build_unit(proj, fp, unit)
+            if not ok and (broken := fp.build_problem()) is not None:
+                # the build itself is broken, not the agent's code: nothing recorded or counted, and the project
+                # is set up again in the background (one project spent five compiles on a build.ninja whose python
+                # was in another home, then the sessions quit)
+                _rewrite(path, before)
+                unname()
+                threading.Thread(target=self.preflight, args=(slug,), daemon=True, name=f"preflight-{slug}").start()
+                return {"text": f"❌ The project's build is broken, not your code: {broken}. Your change was undone, "
+                                "and nothing was recorded or counted. decompdecomp is setting the project up again; "
+                                "don't compile until it's fixed: end your session here.", "score": None,
+                        "matched": False}
+            if not ok:
+                undo()
+                if quiet is None:
+                    record(fn, agent, None, code, 0)
+                why = "" if builds else ("\n(The file didn't build before your change either, so the error may be in "
+                                         "other code of the file: fix that with edit_file.)")
+                return {"text": f"❌ BUILD ERROR (your change was undone){why}\n{log[-3000:]}", "score": None,
+                        "matched": False}
+            try:
+                d = fp.diff(unit, symbol)
+                output = getattr(unit, 'base', None)
+                result_fingerprint = target_validation.fingerprint_function(
+                    output.read_bytes(), symbol) if output and output.is_file() else None
+            except (ObjdiffError, ForkError) as e:
+                undo()
+                return {"text": f"❌ objdiff couldn't compare (your change was undone): {e}", "score": None, "matched": False}
+            if quiet is None:
+                d.rows = with_constant_values(d.rows, consoles.get(cfg.get("platform")), fp)
+                self.net.keep_diff(agent.id, fn["id"], d.rows, objdiff.LEGEND)
+            broken = sorted(n for n in protected if n and (d.unit_scores.get(n) or 0) < 100)
+            if broken:
+                undo()
+                # the function's own result still counts: where whole-program optimisation (or inlining) makes a
+                # function's code change how its neighbours compile, a draft short of exact breaks them, and without
+                # its score an x86 game's agents parked drafts behind #if flags and rebuilt by hand to measure them
+                own = None
+                if d.match_percent is not None:
+                    own = max(1, len(d.literals)) if d.literals else scaled(d.match_percent, fn["n_insns"])
+                if quiet is None:  # an attempt, never the best: release puts the best back in the file
+                    record(fn, agent, own, code, 0, compiled=True, best=False)
+                listed = ", ".join(broken[:8])
+                if own is None:
+                    text = (f"❌ REJECTED and undone: your change breaks matched function(s) {listed}. Check you "
+                            "replaced the right definition (overloads?) and didn't change shared code.")
+                elif d.matched:
+                    text = (f"❌ REJECTED and undone: your change breaks matched function(s) {listed}, though "
+                            f"{fn['name']} itself matches. What changed them is how it's declared or what else you "
+                            "sent (its calling convention, static or inline, a shared declaration): check you "
+                            "replaced the right definition (overloads?).")
+                else:
+                    text = (f"❌ REJECTED and undone: your change breaks matched function(s) {listed}. {fn['name']} "
+                            f"itself came out at {percent_text(d.match_percent)} (score {own}): recorded as an "
+                            f"attempt, not kept in {unit.source}. If they changed only because of how {fn['name']} "
+                            "compiles into them (inlined, or whole-program optimisation choosing registers across "
+                            f"functions), they match again once {fn['name']} matches exactly: work from the diff "
+                            "below. Otherwise check you replaced the right definition (overloads?) and didn't change "
+                            f"shared code.\n{d.render()}")
+                return {"text": remembered(text, own), "score": None, "held_score": own, "matched": False,
+                        "broken": broken}
+            if linked and d.matched and not (ok := self._verify(proj, fp))[0]:
+                undo()
+                if quiet is None:
+                    record(fn, agent, None, code, 0, compiled=True)
+                return {"text": f"❌ REJECTED and undone: {unit.source} is linked into the game, and with your change "
+                                f"the game no longer builds byte for byte:\n{_tail(ok[1])}", "score": None,
+                        "matched": False}
+            pct = d.match_percent if d.match_percent is not None else 0.0
+            score = max(1, len(d.literals)) if d.literals else scaled(pct, fn["n_insns"])
+            matched = d.matched
+            if not matched and not keep and not was_matched:  # tried, not kept: the file stays as it was
+                undo()
+                if quiet is None or score < quiet:
+                    record(fn, agent, score, code, 0, compiled=True)
+                return {"text": f"{percent_text(pct)} match (score {score}); not kept in {unit.source}", "score": score,
+                        "matched": False, "percent": pct}
+            best = fn["best_score"]
+            if (not matched and not was_matched and d.match_percent is not None and best is not None
+                    and fn["best_source"] and score > best):
+                # worse than the best so far: the file keeps what it had, so it never ends on a worse variant than
+                # the one the notes and the brief call the best (an agent found its 91.8% try there, not its 92.3%)
+                undo()
+                if quiet is None:
+                    record(fn, agent, score, code, 0, compiled=True)
+                stall = self.net.stall_note(fn["id"], agent.id)
+                text = remembered(f"{percent_text(pct)} match (score {score}), worse than the best so far (score "
+                                  f"{best}), so {unit.source} keeps what it had; your attempt is recorded.\n"
+                                  f"{d.render()}", score)
+                return {"text": text + stall, "score": score, "matched": False, "percent": pct}
+            self._keep_scores(proj, unit, after, d.unit_scores)
+            self._hold(fn, code if d.literals else None)
+            if was_matched:  # a rewrite of a matched function must keep matching
+                if quiet is None:  # a polishing helper's compiles count too (not as a match)
+                    record(fn, agent, score, code, 0)
+                if not matched:
+                    undo()
+                    why = "loads other constants" if d.literals else f"is {percent_text(pct)}"
+                    return {"text": f"❌ {fn['name']} already matches; your version {why}, so the matching one was "
+                                    "kept. Call claim_function for a function that still needs work.",
+                            "score": score, "matched": False}
+                self._commit_paths(proj, fp, committed, f"Tidy {meta.get('demangled') or symbol} (still matches)\n\n"
+                                                        f"Edited by {agent.name} with decompdecomp.")
+                return {"text": f"✅ {fn['name']} still matches; your tidier version is committed.{_renamed_note(d)}",
+                        "score": 0, "matched": True}
+            record(fn, agent, score, code, 0, matched=matched)
+            self._apply_scores(proj, fn["unit"], d.unit_scores, skip=fn["id"], agent=agent, text=after,
+                               via=f"unit diff after a compile of {fn['name']}")
+            self._remember(proj, fp, unit, d)
+            if matched:
+                self._commit_paths(proj, fp, committed, f"Match {meta.get('demangled') or symbol}\n\n"
+                                                        f"Decompiled by {agent.name} with decompdecomp.")
+                return {"text": f"✅ MATCH! {fn['name']} is 100% identical to the original. Committed to git in the "
+                                f"project. Call claim_function for the next one.{_renamed_note(d)}"
+                                f"{self.net.dependents_note(fn['id'])}"
+                                f"{self._file_done(slug, proj, fp, unit, d.unit_scores, agent)}", "score": 0,
+                        "matched": True}
+        stall = self.net.stall_note(fn["id"], agent.id)
+        found = self._unresolved_lines(fp, meta, fn, unit, code) + self._convention_warning(fp, meta, fn, unit)
+        missing = ((self._missing_note(unit, fn) if d.match_percent is None else "")
+                   + ("\n\n" + "\n".join(found) if found else ""))
+        if d.literals:
+            text = f"score {score} (0 = identical). {d.literals_note()}{missing}"
+        else:
+            text = f"{percent_text(pct)} match (score {score}; 0 = identical).\n{d.render()}{missing}"
+        return {"text": remembered(text, score) + stall, "score": score, "matched": False}
+
+
+    def _attempt(self, agent, slug, function, source, keep=True, prelude="", quiet=None,
+                 probe=False, part=None, comment=False):
+        if probe or part is not None:
+            return self._preview_attempt(agent, slug, function, source, keep, prelude, quiet, probe, part)
+        result = self._ordinary_attempt(agent, slug, function, source, keep, prelude, quiet, comment)
+        if result.get('score') is not None or result.get('held_score') is not None:
+            fn = self._fn(slug, function)
+            cached = getattr(self.net, '_last_diffs', {}).get((agent.id, fn['id']))
+            if cached is not None:
+                result['rows'] = list(cached[0])
+            result['compiled'] = True
+        return result

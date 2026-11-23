@@ -5,7 +5,9 @@ wrote reached all the others, its guesses too ("it's this compiler", then "no, i
 (share_knowledge), and a proposal counts only when helpers running two different models back it on their own: two
 Claude Opus sessions agreeing are one opinion; Claude Opus and GPT agreeing are two. That's also why running
 helpers of several models pays: they check each other. An agreed proposal reaches every agent's prompt once the
-user accepts it, or at once when the project adds agreed knowledge by itself (its setting).
+user accepts it, or at once when the project adds agreed knowledge by itself (its setting). The user can also be
+the second opinion and accept a proposal one model backs: on an x86 game worked by one model only, 55 proposals
+waited for a second model that never came, and every session found the same things out again.
 
 Compiler questions don't belong here: which compiler built what is settled by the compiler map and range checks,
 with evidence, not by agents agreeing.
@@ -24,7 +26,7 @@ SAME_IDEA_RATIO = 0.6  # word overlap above which a new proposal is probably one
 MAX_TEXT = 600
 SHOWN_IN_PROMPT = 2500  # characters of accepted knowledge in a session's prompt
 OPEN_SHOWN = 8  # open proposals an agent is shown, newest first
-COMPILER_TALK = re.compile(r"\b(compil(er|ed)|toolchain|flags?|gcc|ido|mwcc|codewarrior|mwcps2|msvc)\b|(^|\s)-[OG]\d",
+COMPILER_TALK = re.compile(r"\b(compil(er|ed)|toolchain|flags?|gcc|ido|mwcc|codewarrior|mwcps2|mwccpsp|snc|msvc)\b|(^|\s)-[OG]\d",
                            re.I)
 
 SCHEMA = (
@@ -34,6 +36,26 @@ SCHEMA = (
     """CREATE TABLE IF NOT EXISTS knowledge_support(
       knowledge_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, model TEXT NOT NULL, created_at REAL NOT NULL,
       UNIQUE(knowledge_id, agent_id))""",
+    # a project's accepted knowledge is in its progress folder's manifest (progress.py)
+    """CREATE TRIGGER IF NOT EXISTS progress_dirty_knowledge_insert AFTER INSERT ON knowledge
+    WHEN EXISTS (SELECT 1 FROM projects WHERE id=NEW.project_id AND CASE WHEN json_valid(config) THEN json_extract(config,'$.kind') END='rom')
+    BEGIN
+      INSERT OR IGNORE INTO progress_dirty(project_id) VALUES(NEW.project_id);
+      UPDATE progress_dirty SET token=lower(hex(randomblob(16))), metadata=1 WHERE project_id=NEW.project_id;
+    END""",
+    """CREATE TRIGGER IF NOT EXISTS progress_dirty_knowledge_update
+    AFTER UPDATE OF project_id,text,status ON knowledge
+    WHEN EXISTS (SELECT 1 FROM projects WHERE id=NEW.project_id AND CASE WHEN json_valid(config) THEN json_extract(config,'$.kind') END='rom')
+    BEGIN
+      INSERT OR IGNORE INTO progress_dirty(project_id) VALUES(NEW.project_id);
+      UPDATE progress_dirty SET token=lower(hex(randomblob(16))), metadata=1 WHERE project_id=NEW.project_id;
+    END""",
+    """CREATE TRIGGER IF NOT EXISTS progress_dirty_knowledge_delete AFTER DELETE ON knowledge
+    WHEN EXISTS (SELECT 1 FROM projects WHERE id=OLD.project_id AND CASE WHEN json_valid(config) THEN json_extract(config,'$.kind') END='rom')
+    BEGIN
+      INSERT OR IGNORE INTO progress_dirty(project_id) VALUES(OLD.project_id);
+      UPDATE progress_dirty SET token=lower(hex(randomblob(16))), metadata=1 WHERE project_id=OLD.project_id;
+    END""",
 )
 PROPOSED, AGREED, ACCEPTED, REJECTED = "proposed", "agreed", "accepted", "rejected"
 
@@ -97,7 +119,8 @@ class Knowledge:
                              (proj["id"], text, PROPOSED, time.time())).lastrowid
         self._support(agent, proj, kid)
         return (f"Proposed as #{kid}. It reaches every agent once a helper running another model backs it "
-                f"(and the user accepts it, unless the project adds agreed knowledge by itself).")
+                f"(and the user accepts it, unless the project adds agreed knowledge by itself), or once the user "
+                f"gives it to agents.")
 
     def _support(self, agent: Agent, proj, kid: int) -> str:
         row = self.net.store.one("SELECT * FROM knowledge WHERE id=? AND project_id=?", kid, proj["id"])
@@ -123,7 +146,8 @@ class Knowledge:
                                   proj["id"], PROPOSED)
 
     def decide(self, slug: str, kid: int, accept: bool) -> None:
-        """The user accepts an agreed proposal, or rejects (or takes back) one."""
+        """The user accepts a proposal (agreed by two models, or one model's that the user vouches for), or rejects
+        (or takes back) one."""
         proj = self.net._project(slug)
         with self.net.store.tx() as db:
             db.execute("UPDATE knowledge SET status=?, decided_at=? WHERE id=? AND project_id=?",
@@ -160,7 +184,8 @@ class Knowledge:
                 break
             out.append(f"- {r['text']}")
             used += len(r["text"])
-        text = ("What agents learned about this game (agreed by different models):\n" + "\n".join(out)) if out else ""
+        text = ("What agents learned about this game (agreed by different models, or checked by the user):\n"
+                + "\n".join(out)) if out else ""
         open_ = self._open(proj)[:OPEN_SHOWN]
         if open_:
             text += ("\n\nProposals waiting for a second model (back one with share_knowledge(supports=N) only when "

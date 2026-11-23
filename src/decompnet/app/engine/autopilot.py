@@ -9,9 +9,11 @@ import logging
 import threading
 import time
 
-from ... import scoring, seeds
+from ... import scoring, seeds, toolchains
 from ...network import Agent, NetworkError
-from ...project import compiler_for
+from ...project import compiler_for, unknown_compiler_message
+
+TINY_PASSES = 50  # tiny-function passes in one run of autopilot, at most (each up to MAX_FUNCTIONS functions)
 
 
 class AutopilotMixin:
@@ -23,10 +25,19 @@ class AutopilotMixin:
         state = self.autopilots.get(slug)
         if state and state["state"] == "running":
             return state
+        if missing := self.project_missing(self._project(slug)):
+            raise NetworkError(missing)
+        fork = self.fork_slug(slug)
+        # #118: a project from another tool may name a compiler decompdecomp doesn't have. Say which and where to pick
+        # one, rather than failing later as "m2c can't read this project's code" or the registry's list of ids.
+        if not fork:
+            tc = self.cfg(self._project(slug))["compiler"]["toolchain"]
+            if not toolchains.known(tc):
+                raise NetworkError(unknown_compiler_message(tc))
         # first the twins (identical code to something matched: every project), then machine drafts where m2c reads
         # the code and the project's headers are fit for them (ROM projects; games started from scratch)
         try:
-            if (fork := self.fork_slug(slug)):  # a GameCube, Wii or DS game started from scratch: its own build judges
+            if fork:  # a GameCube, Wii or DS game started from scratch: its own build judges
                 ids = self.forks.autopilot_prepare(fork)
                 try_one, workers = self.forks.autopilot_one, min(workers, 2)  # each try builds a file: fewer at once
             else:
@@ -73,6 +84,36 @@ class AutopilotMixin:
                 state["matched"] += job.matched
         except Exception as e:
             logging.getLogger("decompdecomp").info("autopilot twins: %s", e)
+        state["phase"] = "tiny functions"
+        try:
+            from ..tiny_functions import MAX_FUNCTIONS, run
+
+            # passes of MAX_FUNCTIONS in a row while they still match: one pass a run left a PS4 game's 420 jumps
+            # through GOT slots, one template each, to five runs of autopilot (each started by the user)
+            tiny = scanned = 0
+            for _ in range(TINY_PASSES):
+                run(self, agent, proj, apply=True, state=state)
+                tiny += state.get("tiny_matched", 0)
+                scanned += state.get("tiny_scanned", 0)
+                if state["stop"].is_set() or not state.get("tiny_matched") or state.get("tiny_total", 0) < MAX_FUNCTIONS:
+                    break
+            state["tiny_matched"], state["tiny_scanned"] = tiny, scanned
+            state["matched"] += tiny
+        except Exception as e:
+            logging.getLogger("decompdecomp").info("autopilot tiny functions: %s", e)
+        state["phase"] = "finishing near matches"
+        try:
+            from ..finishing import run as finish
+            finish(self, agent, proj, apply=True, state=state)
+            state["matched"] += state.get("finish_matched", 0)
+        except Exception as e:
+            logging.getLogger("decompdecomp").info("autopilot finishing: %s", e)
+        state["phase"] = "code blocks"
+        try:
+            from ..code_blocks import warm
+            warm(self, proj, state)
+        except Exception as e:
+            logging.getLogger("decompdecomp").info("autopilot code blocks: %s", e)
         state["phase"] = "drafts"
         ids = [fid for fid in ids if (r := self.store.one("SELECT status FROM functions WHERE id=?", fid)) and r["status"] == "open"]
         state["total"] = len(ids)
@@ -97,9 +138,11 @@ class AutopilotMixin:
             with self.store.tx() as db:
                 cfg = json.loads(db.execute("SELECT config FROM projects WHERE id=?", (proj["id"],)).fetchone()["config"])
                 cfg["autopilot"] = {k: state.get(k) for k in ("total", "tried", "matched", "near", "twins", "started_at",
-                                                              "finished_at")}
+                                                              "finished_at", "block_scanned", "block_hints", "pattern_hints",
+                                                              "tiny_scanned", "tiny_matched", "tiny_cursor",
+                                                              "finish_scanned", "finish_matched", "finish_cursor")}
                 db.execute("UPDATE projects SET config=? WHERE id=?", (json.dumps(cfg), proj["id"]))
-            drafts = state["matched"] - state.get("twins", 0)
+            drafts = state["matched"] - state.get("twins", 0) - state.get("tiny_matched", 0) - state.get("finish_matched", 0)
             if drafts:  # (twins announce their own)
                 with self.store.tx() as db:
                     self._event(db, proj["id"], agent.id, "autopilot",
@@ -110,6 +153,8 @@ class AutopilotMixin:
         those twins itself.)"""
         if proj is None:
             return
+        if self.progress.applying:
+            return  # importing authoritative progress must not start new work before all its headers are loaded
         if agent is not None and agent.name == "autopilot" and self.twins._full_running(proj["slug"]):
             return
         self.twins.after_match(proj, function_id)
@@ -119,6 +164,13 @@ class AutopilotMixin:
     def try_quietly(self, agent, proj, fn, source: str) -> dict:
         """Judge one candidate for a function nobody holds (autopilot's tries): held only while it compiles,
         recorded as an attempt like any other. {"matched", "score"}."""
+        with self.progress.judging(proj["slug"]):
+            return self._try_quietly(agent, proj, fn, source)
+
+    def _try_quietly(self, agent, proj, fn, source: str) -> dict:
+        fn = self.store.one("SELECT * FROM functions WHERE id=?", fn["id"])
+        if fn is None or fn["status"] != "open":
+            raise NetworkError("This function is no longer open. Read the updated project before trying another draft.")
         now = time.time()
         with self.store.tx() as db:
             self._expire_claims(db)
@@ -155,30 +207,32 @@ class AutopilotMixin:
             db.execute("INSERT INTO claims VALUES(?,?,?,?)", (fid, agent.id, now, now + 300))
         try:
             self._seed_for(fn, proj)  # the readable draft, for the agents that come after
-            ctx = self._context(proj["id"], fn["unit"])
-            _, toolchain, context = self._draft_plan(fn, proj, ctx=ctx)
-            own = compiler_for(self.cfg(proj), fn["vram"])
-            data_asm = "\n".join(self._jtbl_asm(proj, fn)) if "jtbl_" in (fn["asm"] or "") else None
-            draft = seeds.generate_from_asm(self._asm_text(fn, proj), fn["name"], toolchain, context, data_asm, valid=True)
-            if not draft:
-                return "fail"
-            # (its compiler named in it: the same draft is worth judging again with another compiler)
-            source = (f"/* machine draft (m2c) for {toolchain} {' '.join(own.get('flags', []))}, tried by autopilot */\n"
-                      f"{seeds.M2C_MACROS}\n{draft}\n")
-            if self.store.one("SELECT 1 FROM attempts WHERE function_id=? AND agent_id=? AND context_version=? "
-                              "AND source=?", fid, agent.id, ctx["version"], source):
-                return "skip"
-            result = self._compile(proj, ctx["header"], source, fn)
-            if not result.ok:
-                return "fail"
-            cand, verdict, _ = self._evaluate(fn, proj, result.obj)
-            if cand is None:
-                return "fail"
-            d = scoring.diff(self._target_obj(fn, proj), cand)
-            if verdict is not None:
-                d = scoring.DiffResult(0 if verdict else max(1, d.score), d.max_score, d.rows, verdict)
-            self._record(fn, agent, d.score, source, ctx["version"], matched=d.bytes_match)
-            return "match" if d.bytes_match else "near" if d.percent >= 90 else "far"
+            with self.progress.judging(proj["slug"]):
+                ctx = self._context(proj["id"], fn["unit"])
+                _, toolchain, context = self._draft_plan(fn, proj, ctx=ctx)
+                own = compiler_for(self.cfg(proj), fn["vram"])
+                data_asm = "\n".join(self._jtbl_asm(proj, fn)) if "jtbl_" in (fn["asm"] or "") else None
+                draft = seeds.generate_from_asm(self._asm_text(fn, proj), fn["name"], toolchain, context,
+                                                data_asm, valid=True)
+                if not draft:
+                    return "fail"
+                # (its compiler named in it: the same draft is worth judging again with another compiler)
+                source = (f"/* machine draft (m2c) for {toolchain} {' '.join(own.get('flags', []))}, tried by autopilot */\n"
+                          f"{seeds.M2C_MACROS}\n{draft}\n")
+                if self.store.one("SELECT 1 FROM attempts WHERE function_id=? AND agent_id=? AND context_version=? "
+                                  "AND source=?", fid, agent.id, ctx["version"], source):
+                    return "skip"
+                result = self._compile(proj, ctx["header"], source, fn)
+                if not result.ok:
+                    return "fail"
+                cand, verdict, _ = self._evaluate(fn, proj, result.obj)
+                if cand is None:
+                    return "fail"
+                d = scoring.diff(self._target_obj(fn, proj), cand)
+                if verdict is not None:
+                    d = scoring.DiffResult(0 if verdict else max(1, d.score), d.max_score, d.rows, verdict)
+                self._record(fn, agent, d.score, source, ctx["version"], matched=d.bytes_match)
+                return "match" if d.bytes_match else "near" if d.percent >= 90 else "far"
         finally:
             with self.store.tx() as db:
                 db.execute("DELETE FROM claims WHERE function_id=? AND agent_id=?", (fid, agent.id))

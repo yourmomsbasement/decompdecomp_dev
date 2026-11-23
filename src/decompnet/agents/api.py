@@ -49,9 +49,37 @@ PAYMENT_REQUIRED = 402
 TOO_MANY_REQUESTS = 429
 TOO_LONG_STATUSES = (400, 413, 422, 500)  # what servers answer a request too long for the model's context
 TOO_LONG_READ = 2000  # characters of that answer read for why
+API_RETRIES, API_RETRY_WAIT = 3, 10  # a dropped request or a gateway's 5xx, asked again after 10, 20, 40 seconds
 # a function is done with when the helper compiled it to a match or released it: its work then folds into a line
-FINISHING = ("compile_and_diff", "release_function")
+FINISHING = ("compile_and_diff", "compile_patch", "compile_part", "release_function")
 FOLDED = 2  # messages a fold leaves: one call and its result
+# the line try_recipes starts its applied winner's verdict with (compile_tools.try_recipes; recipe names are one line)
+APPLIED = re.compile(r"^Applying .+ through the normal judge:$", re.M)
+
+
+def _finishes(net, name: str, args, result: str) -> tuple[bool, str]:
+    """(whether a call finished with its function, which function). A recipe preview keeps nothing, and neither
+    does apply=true without a better recipe: only an applied winner finishes. compile_status finishes only once its
+    operation completed a keeping compile (a patch, a definition, an applied recipe): polling a queued one, or
+    reading a preview's or diagnostics' result, leaves the helper still working on the function."""
+    args = args if isinstance(args, dict) else {}
+    function = str(args.get("function") or "")
+    if name == "try_recipes":
+        return args.get("apply") is True and APPLIED.search(result or "") is not None, function
+    if name == "compile_status":
+        row = net.store.one("SELECT state,payload,result FROM compile_operations WHERE id=?",
+                            str(args.get("operation_id") or ""))
+        if row is None or row["state"] != "completed":
+            return False, function
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except ValueError:
+            return False, function
+        action = payload.get("action")
+        kept = action in ("patch", "definition") or (
+            action == "recipes" and payload.get("apply") is True and APPLIED.search(row["result"] or "") is not None)
+        return kept, str(payload.get("function") or function)
+    return name in FINISHING, function
 
 
 class Api(Agent):
@@ -93,24 +121,35 @@ class Api(Agent):
         headers = {"Content-Type": "application/json"}
         if s.options.get("api_key"):
             headers["Authorization"] = f"Bearer {s.options['api_key']}"
-        schema = api_tool_schemas(fork=bool(net.fork_slug(s.slug)))
+        schema = api_tool_schemas(fork=bool(net.fork_slug(s.slug)), names=tools.project_tools(net, s.slug))
         messages = [{"role": "system", "content": tools.INSTRUCTIONS},
                     {"role": "user", "content": manager.prompt(s)}]
         count = int(s.options.get("per_session", PER_SESSION))
         used_tool, start, done = False, len(messages), 0
+        from ..app import schedule
+        if not schedule.open_at(s.options.get("hours")):
+            s.push("info", f"outside its hours ({schedule.describe(s.options.get('hours'))}): not starting a session")
+            return True
         with httpx.Client(timeout=httpx.Timeout(API_TIMEOUT, connect=API_CONNECT_TIMEOUT)) as client:
             window = context_window(client, base, s.options)
             s.push("info", f"session {s.runs}: {model} via {base} ({window // 1000}K tokens of context)")
             budget = int(window * API_CONTEXT_SHARE) - _tokens(schema)  # room for the reply and the tools' definitions
-            for _step in range(int(s.options.get("max_steps", API_STEPS))):
+            specialist = bool(s.options.get("_specialist_request"))
+            steps = min(20, int(s.options.get("max_steps", API_STEPS))) if specialist else int(s.options.get("max_steps", API_STEPS))
+            for _step in range(steps):
                 if s.stop.is_set():
+                    return True
+                if _step and not schedule.open_at(s.options.get("hours")):
+                    # the window closed mid-session: end here, the loop waits for the next one
+                    s.push("info", f"its hours ended ({schedule.describe(s.options.get('hours'))}): stopping this "
+                                   f"session rather than paying the peak rate")
                     return True
                 for _attempt in range(API_TRIM_RETRIES):
                     fit(messages, budget, keep=start)
                     request = {"model": model, "messages": messages, "tools": schema, "tool_choice": "auto"}
                     if s.options.get("effort"):
                         request["reasoning_effort"] = s.options["effort"]
-                    r = client.post(f"{base}/chat/completions", headers=headers, json=request)
+                    r = _post(client, f"{base}/chat/completions", headers, request, s.stop)
                     if r.status_code == 200 or not _too_long(r):
                         break
                     budget = int(budget * API_TRIM_FACTOR)  # the server counts differently, or knows better: trim more
@@ -167,7 +206,9 @@ class Api(Agent):
                     s.push("tool", f"{name}({args_brief(args)})")
                     result = tools.call(net, agent, s.slug, name, args)
                     messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
-                    finishing |= name in FINISHING
+                    if specialist and name == "report_specialist" and not result.startswith("error:"):
+                        return True
+                    finishing |= _finishes(net, name, args, result)[0]
                 # Done with what it held (in a room the host holds the claim: nothing here says when): what led up
                 # to this turn folds into a line, and this turn stays whole (a fork's match shows the file's data to
                 # fix next) until the next fold
@@ -199,6 +240,10 @@ def endpoint_entry(e: dict) -> dict:
     for k in ("api_key", "context_tokens", "max_sessions"):
         if e.get(k):
             out[k] = e[k]
+    if e.get("hours"):
+        from ..app import schedule
+        schedule.parse(str(e["hours"]))  # refuse a window nobody can read, at the point it is typed
+        out["hours"] = str(e["hours"]).strip()
     return out
 
 
@@ -245,16 +290,18 @@ def _done_line(net, slug: str, span: list[dict], done: int, count: int) -> str:
     from ..network import NetworkError  # (here: network imports this package)
 
     names, compiles = [], 0
+    results = {m.get("tool_call_id"): m.get("content") or "" for m in span if m.get("role") == "tool"}
     for m in span:
         for c in m.get("tool_calls") or []:
             fn = c["function"]
-            if fn["name"] not in FINISHING:
-                continue
-            compiles += fn["name"] == "compile_and_diff"
             try:
-                said = json.loads(fn.get("arguments") or "{}").get("function") or ""
+                args = json.loads(fn.get("arguments") or "{}")
             except ValueError:
-                said = ""
+                args = {}
+            done_with, said = _finishes(net, fn["name"], args, results.get(c.get("id"), ""))
+            if not done_with:
+                continue
+            compiles += fn["name"] != "release_function"
             names += [n.strip() for n in str(said).split(",") if n.strip() and n.strip() not in names]
     matched = []
     for name in names:
@@ -285,6 +332,22 @@ def api_usage(usage: dict) -> dict:
     if not (prompt or output):
         return {"tokens": number(usage, "total_tokens"), "turns": 1}
     return {"input": max(0, prompt - cached), "cache_read": cached, "output": output, "turns": 1}
+
+
+def _post(client, url: str, headers: dict, request: dict, stop) -> httpx.Response:
+    """#154: a laggy gateway's dropped request, timeout or 5xx is asked again in place a few times. Ending the session
+    on it threw the conversation away, so the helper started its function over and over."""
+    for attempt in range(API_RETRIES + 1):
+        last = attempt == API_RETRIES
+        try:
+            r = client.post(url, headers=headers, json=request)
+        except httpx.TransportError:
+            if last or stop.is_set():
+                raise
+        else:
+            if last or stop.is_set() or not (r.status_code == 408 or r.status_code >= 500) or _too_long(r):
+                return r
+        stop.wait(API_RETRY_WAIT * 2 ** attempt)
 
 
 def _retry_after(r) -> float | None:
@@ -352,15 +415,52 @@ def context_window(client, base: str, options: dict) -> int:
     return REMOTE_CONTEXT
 
 
-def api_tool_schemas(fork: bool = False) -> list[dict]:
-    """OpenAI-style tool definitions for the built-in agent, from the same tools CLI agents get."""
+def api_tool_schemas(fork: bool = False, names: list[str] | None = None) -> list[dict]:
+    """OpenAI-style tool definitions for the built-in agent, from the same tools CLI agents get (`names`: the
+    project's, tools.project_tools; else every tool of its kind)."""
     from ..app import tools  # (here: app/tools.py imports this package)
 
     s = lambda **props: {"type": "object", "properties": props, "required": [k for k, v in props.items() if v.pop("req", False)]}
     st = lambda desc, req=False: {"type": "string", "description": desc, "req": req}
     it = lambda desc: {"type": "integer", "description": desc}
     bo = lambda desc: {"type": "boolean", "description": desc}
+    edits = {"type": "array", "minItems": 1, "maxItems": 16, "items": {
+        "type": "object", "properties": {"old": {"type": "string"}, "new": {"type": "string"}},
+        "required": ["old", "new"], "additionalProperties": False}, "req": True}
+    recipes = {"type": "array", "minItems": 1, "maxItems": 8, "items": {
+        "type": "object", "properties": {"name": {"type": "string"},
+        "edits": {k: v for k, v in edits.items() if k != "req"}},
+        "required": ["name"], "additionalProperties": False}, "req": True}
     defs = {
+        "compile_start": ("Start a durable patch/definition/recipes/diagnostics operation; reuse request_id after a timeout, then poll compile_status.",
+                          s(function=st("function", True), request_id=st("stable unique logical request key; reuse on retries", True),
+                            revision=st("current function_brief revision; empty only for an absent definition"),
+                            action=st("patch | definition | recipes | diagnostics; default patch"),
+                            edits={k:v for k,v in edits.items() if k != "req"}, source=st("complete definition for action=definition"),
+                            recipes={k:v for k,v in recipes.items() if k != "req"}, apply=bo("apply recipe winner"), region_id=it("linked regional experiment"))),
+        "compile_status": ("Read durable operation state/result; does not restart it.", s(operation_id=st("operation ID", True), wait_ms=it("wait for a state change up to10000ms; default5000"))),
+        "record_region": ("Record one revision-bound target region/hypothesis and prior negative findings; attach to compile_start.",
+                          s(function=st("function", True), revision=st("current revision", True),
+                            start={**it("inclusive target instruction offset"), "req":True}, end={**it("inclusive last target instruction offset"), "req":True},
+                            hypothesis=st("one concrete hypothesis", True), evidence=st("target evidence and failed prior ideas", True),
+                            outcome=st("planned | improved | unchanged | regressed | falsified | recovered | blocked"), findings=st("findings/limitations"))),
+        "region_history": ("Read persistent regional hypotheses and measured outcomes.", s(function=st("function", True), limit=it("1–20"), before=it("exclusive regional record ID"))),
+        "compare_region": ("Read trial block differences inside/outside the selected region; advisory only.", s(function=st("function", True), region_id={**it("regional ID"), "req":True})),
+        "check_integer_behavior": ("Compare supplied prefix integer models on explicit boundary cases, not execution of C/target. Ops add/sub/mul/and/or/xor/eq/lt/le/select and u8/u16/u32/u64/i8/i16/i32/i64 casts.",
+                                   s(function=st("function", True), region_id={**it("your regional ID"),"req":True},
+                                     target_model={"type":"array","items":{},"req":True}, candidate_model={"type":"array","items":{},"req":True},
+                                     cases={"type":"array","items":{"type":"object","additionalProperties":{"type":"integer"}},"maxItems":1024,"req":True})),
+        "save_recipe": ("Save a proposal with explicit prerequisites, build scope and recorded matched donors; never applies edits.",
+                        s(name=st("recipe name", True), prerequisites=st("required shapes/semantics", True), evidence=st("observations and exceptions", True),
+                          donors={"type":"array","items":{"type":"string"},"maxItems":8,"req":True}, edits=edits.copy())),
+        "recipe_candidates": ("Read proposals fitting current build/source and recorded donors; check prerequisites then judge applications.", s(function=st("function", True),limit=it("1–8"))),
+        "function_brief": ("Compact current definition and revision; get_function has assembly and notes.",
+                           s(function=st("function", True))),
+        "compile_patch": ("Apply exact replacements against a revision, judged normally; last_diff has full output.",
+                          s(function=st("function", True), revision=st("function_brief revision", True), edits=edits.copy())),
+        "try_recipes": ("Preview up to eight named patch sets against one baseline; optionally apply a strictly better winner.",
+                        s(function=st("function", True), revision=st("function_brief revision", True),
+                          recipes=recipes, apply=bo("keep the strictly better winner; default false"))),
         "project_info": ("Which game, compiler and progress.", s()),
         "claim_function": ("Claim the next function (or one by name/address). Returns assembly, data, best attempt, "
                            "notes and a draft. count > 1: a batch of small functions to judge together.",
@@ -370,6 +470,23 @@ def api_tool_schemas(fork: bool = False) -> list[dict]:
         "compile_and_diff": ("Compile C for the function, link it at its address and diff against the ROM. "
                              "Score 0 = matched. Several functions: names comma-separated, all definitions in source.",
                              s(function=st("function name, or several: a, b, c", True), source=st("C source", True))),
+        "inspect_blocks": ("List target CFG blocks; offset selects localized register/flag/stack facts and mismatches.",
+                           s(function=st("function", True), offset=it("optional byte offset within target function"),
+                             start=it("first block for pagination"), limit=it("up to 32 blocks"),
+                             instruction_limit=it("maximum instructions in a selected block, up to 160"))),
+        "request_specialist": ("Ask an existing idle helper one evidenced blocker; keep sole source ownership.",
+                               s(function=st("function", True), category=st("control_flow | layout | codegen | references", True),
+                                 question=st("specific unresolved question", True), evidence=st("instruction/block evidence and tried hypotheses", True))),
+        "specialist_status": ("Read advisory findings and proposed owner recipes, or cancel your outstanding request.",
+                              s(function=st("function", True), request_id=it("optional request ID"), cancel=bo("cancel your own request"))),
+        "specialist_brief": ("Assigned specialist question and shared experiment results.", s(request_id={**it("assigned request ID"), "req": True})),
+        "report_specialist": ("Report advisory findings and named exact-edit recipes; no source edits or compilation.",
+                              s(request_id={**it("assigned request ID"), "req": True}, findings=st("evidence, negative results and uncertainty", True),
+                                proposals={"type":"array", "maxItems":4, "items":recipes["items"]})),
+        "suggest_recipes": ("Read existing mismatch evidence to choose scoped compiler recipes; no builds.", s(function=st("function", True))),
+        "experiment_history": ("Persistent attempts, source changes and historical scores across agents; no verdict reuse.",
+                               s(function=st("function", True), limit=it("entries, 1-20; default 6"),
+                                 before=it("exclusive attempt ID for older entries; default 0"))),
         "last_diff": ("Every differing row of your last compile_and_diff of a function (its result cuts long diffs). "
                       "Costs no compile.", s(function=st("function", True), context=it("equal rows around each difference"))),
         "release_function": ("Give up a function with notes for the next agent, once compile_and_diff says to move "
@@ -386,6 +503,12 @@ def api_tool_schemas(fork: bool = False) -> list[dict]:
                           s(old=st("current name", True), new=st("new name", True), message=st("why"))),
         "split_function": ("Split a merged function at an address.",
                            s(function=st("function", True), at=st("address like 0x80001234", True), new_name=st("name"))),
+        "report_boundary": ("Report that a function really ends earlier: what follows is padding, leftovers or data "
+                            "(PC projects: or another function merged with it). ROM: the user approves; PC: agents of "
+                            "two models agree and the game still builds byte for byte.",
+                            s(function=st("function", True), end=st("where it really ends: an address (PC: or +offset)",
+                                                                     True),
+                              reason=st("what follows and how you can tell", True))),
         "read_data": ("Hex dump of the original's data at an address or symbol.", s(what=st("address or symbol", True),
                                                                                     length=it("bytes, up to 512"))),
         "get_class": ("C++ class layout found in the game's code: fields by offset and virtual functions by slot. "
@@ -393,8 +516,8 @@ def api_tool_schemas(fork: bool = False) -> list[dict]:
                       s(what=st("vtable address, or a virtual function / constructor"))),
         "guess_struct": ("The likely struct behind a function's pointer, as C with offsets, from every function the same "
                          "pointer reaches; where else it flows; the type matched code already uses.",
-                         s(function=st("function", True), argument=st("arg0-arg3, return, or a global; +0x14 follows "
-                                                                       "the pointer at 0x14"))),
+                         s(function=st("function", True), argument=st("arg0-arg3, this (PC), return, or a global; "
+                                                                       "+0x14 follows the pointer at 0x14"))),
         "redraft": ("m2c's draft of a function made again with your declarations (a struct, a prototype) added to "
                     "the shared header's, which they replace where they declare the same names. Recorded nowhere.",
                     s(function=st("function", True), context=st("C declarations", True))),
@@ -402,13 +525,17 @@ def api_tool_schemas(fork: bool = False) -> list[dict]:
                          "the judge's survey of other compilers in the background; check_ranges=true looks at the "
                          "applied ranges again.", s(survey=bo("start the survey"), check_ranges=bo("check applied ranges"))),
         "list_functions": ("List functions by status.", s(status=st("open | matched | all"), limit=it("max rows"))),
-        "add_note": ("Leave a note on a function for the next agent on it.", s(text=st("note", True), function=st("function"))),
+        "add_note": ("Leave a note on a function for the next agent on it. Something every agent on this game should "
+                     "know goes through share_knowledge.",
+                     s(text=st("note", True), function=st("function", True))),
         "search_flags": ("Build the function's C with each flag variant of its compiler, ranked: for C that looks right "
                          "but won't match.", s(function=st("function", True), compiler=st("another compiler"),
                                                 source=st("C (default: the best attempt)"))),
         "claim_readable": ("Take the next matched function that isn't readable yet.", s()),
         "make_readable": ("A readable rewrite of a matched function (names, types, a comment); kept only if it still "
                           "matches byte for byte.", s(function=st("function", True), source=st("readable C", True))),
+        "tidy_done": ("The source file claim_readable gave you to tidy is done: say what you changed.",
+                      s(unit=st("the file claim_readable gave you", True), summary=st("what you changed", True))),
         "share_knowledge": ("Propose something every agent on this game should know, or back proposal #N "
                             "(supports=N). It counts once two different models agree. Not for compiler questions.",
                             s(text=st("what every agent should know"), supports=it("a proposal's number to back"))),
@@ -421,6 +548,33 @@ def api_tool_schemas(fork: bool = False) -> list[dict]:
                          s(function=st("function", True), compiler=st("toolchain id", True), flags=st("flags"),
                            source=st("the C (default: the best attempt)"))),
         "search_notes": ("Search notes.", s(query=st("text", True))),
+        "finish_near_matches": ("Bounded near-match finishing; apply=true preserves neighbors and keeps only strict matches. Source-tree projects only.",
+                                s(limit=it("up to 50 functions"), apply=bo("apply exact winners; default false"))),
+        "solve_tiny_functions": ("Audit tiny-function templates; apply=true judges and keeps only exact matches. Skips claims and ambiguous signatures.",
+                                 s(limit=it("up to 100 functions"), apply=bo("apply strict matches; default false"))),
+        "function_patterns": ("Read-only matched donor patterns with scoped source observations and exceptions.",
+                              s(function=st("function", True), limit=it("up to 8 donors; default 5"))),
+        "pattern_index_report": ("Matched index coverage and held-out retrieval proxy; not decompilation accuracy.",
+                                 s(sample=it("up to 40 held-out queries; default 10"))),
+        "find_code_blocks": ("Find operand-aware repeated fragments within other functions; read-only evidence, "
+                             "with target/donor offsets and bounded search coverage. Matched donors are prioritized.",
+                             s(function=st("function", True), limit=it("up to 10 findings; default 5"))),
+        "list_parts": ("A big function's parts (its target cut at blocks), which are marked in the C with "
+                       "/* part N */ ... /* end part N */ and who holds them. part=N: its assembly, rows and C.",
+                       s(function=st("function", True), part=it("optional part number"))),
+        "claim_part": ("Take one marked part of a big function beside whoever holds it; no part: the free one with the "
+                       "most differing rows.", s(function=st("function", True), part=it("optional part number"))),
+        "compile_part": ("Replace the C between one part's markers and judge the whole function; answers with that "
+                         "part's diff rows. While others work on it, a change making the score or their parts worse "
+                         "isn't kept.", s(function=st("function", True), part={**it("part number"), "req": True},
+                                          code=st("the part's C, without its markers", True))),
+        "release_part": ("Give back your part of a function with a note.", s(function=st("function", True),
+                                                                             notes=st("what you tried, what is left"))),
+        "compiler_survey": ("Survey other compilers per source file; switch only where enough functions match only with "
+                            "one and none is lost, documented in docs/build-settings.md (apply=true). Maintenance, slow.",
+                            s(apply=bo("switch the files that qualify; default false"), limit=it("files to survey; 0 = all"))),
+        "big_function_report": ("How functions of 400+ instructions are doing: tried, compiled, how far; compiles "
+                                "this week against last week.", s()),
         "find_similar": ("Functions that look like this one, matched ones first, with the best one's source.",
                          s(function=st("function", True), limit=it("how many"))),
         "guide": ("Decompilation know-how; no topic lists topics.", s(topic=st("topic"))),
@@ -433,6 +587,10 @@ def api_tool_schemas(fork: bool = False) -> list[dict]:
                                                        new=st("replacement", True), message=st("why", True))),
         "file_status": ("How far a source file (or a function's file) is from being linked: functions left, its data "
                         "next to the original's, why the last link failed.", s(path=st("file or function", True))),
+        "standins_for": ("Games built with link-time code generation: a starting harness for a unit (stand-ins for what "
+                         "its functions use elsewhere, a HarnessEntry calling each function as the original's call sites "
+                         "do, declarations), to write into harness/ with edit_file.",
+                         s(what=st("unit, source file or function", True))),
         "join_functions": ("Forks: two functions are one the game's analysis cut (a piece with no prologue using registers "
                            "the code before set, an epilogue alone, a switch's cases in the next symbol); joined once "
                            "agents of two models agree and the game still builds byte for byte.",
@@ -448,6 +606,6 @@ def api_tool_schemas(fork: bool = False) -> list[dict]:
         defs["compile_and_diff"] = ("Write one complete function definition into its source file, build it and diff "
                                     "with objdiff. 100% / score 0 = matched.",
                                     s(function=st("function name", True), source=st("the function definition", True)))
-    names = set(tools.tool_names(fork))
+    names = set(tools.tool_names(fork) if names is None else names)
     return [{"type": "function", "function": {"name": n, "description": d, "parameters": p}}
             for n, (d, p) in defs.items() if n in names]
