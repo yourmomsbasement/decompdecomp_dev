@@ -4342,17 +4342,62 @@ class ForkEngine:
                        if any(a < e and s < b for a, b in ranges for s, e in spans))
         if not files:
             raise NetworkError("no source file's code is in those ranges")
-        done, stayed = [], []
+        done, stayed, carved = [], [], []
         for f in files:
             try:
                 self.set_file_compiler_by_hand(slug, f, compiler or own)
                 done.append(f)
             except NetworkError as e:
-                stayed.append(str(e))
+                # the range is only part of the file, and the rest of it needs its own compiler: those functions
+                # get a file of their own (each split kept only if every match holds) and that file switches
+                try:
+                    part = self._carve(slug, console, f, ranges) if compiler and compiler != own else None
+                except NetworkError as why:
+                    part, e = None, NetworkError(f"{e}; giving the range a file of its own didn't work: {why}")
+                if part is None:
+                    stayed.append(str(e))
+                    continue
+                try:
+                    self.set_file_compiler_by_hand(slug, part, compiler)
+                    done.append(part)
+                    carved.append(f"{part} (out of {f})")
+                except NetworkError as e2:
+                    stayed.append(f"{e2} ({part} was split out of {f} for it, and stays split)")
         if not done:
             raise NetworkError("; ".join(stayed[:4]))
         said = f"{len(done)} source file{'s' if len(done) != 1 else ''} built with {consoles.compiler_name(compiler or own)}"
-        return said + (f"; {len(stayed)} stay as they were ({stayed[0]})" if stayed else "") + "."
+        return (said + (f", the range given a file of its own: {', '.join(carved)}" if carved else "")
+                + (f"; {len(stayed)} stay as they were ({stayed[0]})" if stayed else "") + ".")
+
+    def _carve(self, slug: str, console, source: str, ranges: list[list[int]]) -> str | None:
+        """The functions of `source` inside `ranges` in a file of their own, split off with split_file (at the first
+        of them, and again after the last when functions follow): the file they're in then, or None when that's not
+        a part of the file (none of its functions, all of them, or not one run of them). An agent's range for one
+        function at a file's end was refused: switching the whole file broke a neighbour that needs its compiler."""
+        _, fp, _ = self.get(slug)
+        names = {u.name for u in fp.units_for(source)}
+        addresses = {fn: a for (unit, fn), a in console.function_addresses(fp).items() if unit in names}
+        if not addresses:  # (consoles whose targets keep their addresses: the functions' own)
+            rows = self.net.store.all("SELECT name, vram FROM functions WHERE project_id=? AND unit IN (%s)"
+                                      % ",".join("?" * len(names)), self.get(slug)[0]["id"], *sorted(names))
+            addresses = {r["name"]: r["vram"] for r in rows if r["vram"] is not None}
+        order = sorted(addresses, key=addresses.get)
+        inside = [i for i, n in enumerate(order) if any(a <= addresses[n] < b for a, b in ranges)]
+        if not inside or len(inside) == len(order) or inside != list(range(inside[0], inside[-1] + 1)):
+            return None
+        first, after = order[inside[0]], (order[inside[-1] + 1] if inside[-1] + 1 < len(order) else None)
+        for at in ([first] if inside[0] else []) + ([after] if after else []):
+            said = self.split_file(None, slug, self._file_of(slug, console, at), at)
+            if not said.startswith("✅"):
+                raise NetworkError(said)
+        return self._file_of(slug, console, first)
+
+    def _file_of(self, slug: str, console, function: str) -> str:
+        """The source file a function's code is in now (after a split, a new one)."""
+        _, fp, _ = self.get(slug)
+        unit = next((u for (u, fn) in console.function_addresses(fp) if fn == function), None)
+        unit = unit or self._fn(slug, function)["unit"]
+        return fp.unit(unit).source
 
     def set_compiler_everywhere(self, slug: str, compiler: str, log=print) -> dict:
         """The Settings panel's compiler for the whole game, where each source file has one: every file switches,

@@ -546,6 +546,12 @@ class CompilerMixin:
             self.forks.set_compiler_ranges(slug, hit["ranges"], hit["toolchain"])
         elif apply and hit["toolchain"] and hit.get("ranges"):
             self.set_compiler_ranges(slug, hit["ranges"], hit["toolchain"], hit["flags"])
+        elif apply and hit["toolchain"] and self.fork_slug(slug):
+            # (set_compiler is a ROM project's: on a source tree it refused, and the button did nothing anyone saw)
+            raise NetworkError(f"this suggestion names no part of the game, so it would build every source file with "
+                               f"{consoles.compiler_name(hit['toolchain'])}: choose that in Settings → Compiler (each "
+                               f"file only where its matches hold), or give the file's address range there. Agents' "
+                               f"suggestions name the function whose file they mean from now on")
         elif apply and hit["toolchain"]:
             self.set_compiler(slug, hit["toolchain"], hit["flags"], guard=guard)
         self._update_cfg(slug, lambda cfg: next(s for s in cfg["suggestions"] if s["id"] == sid).__setitem__(

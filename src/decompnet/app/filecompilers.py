@@ -280,6 +280,12 @@ class FileCompilers:
         if tc is None:
             raise NetworkError(f"no compiler {compiler!r} for this game; its own: {', '.join(c.id for c in ours)}")
         spans = parse_ranges(ranges)
+        if not spans and not function:
+            # each file has its own compiler here: a suggestion that names neither a function nor ranges reads as
+            # the whole game's, which an agent rarely means ("unit text_00580B20 should be built with clang-3.8.1")
+            raise NetworkError("say which part of the game: function=<a function of the file> for its file, or "
+                               "ranges=\"0x...-0x...\". Each source file of this game has its own compiler, and the "
+                               "whole game's is the user's to choose in Settings")
         if not spans and function:  # the file the function is in
             fn = self.net.forks._fn(slug, function)
             source = self.net.forks._meta(fn).get("source")
